@@ -1,0 +1,169 @@
+name: Publish npm
+
+# 打 tag 时自动发布两个公开 npm 包。
+#
+# ## 关于 2FA 与令牌类型（2026-10-27 更新）
+#
+# npm 在 2025 收紧了令牌权限：新建 token 只能拿到 **Staged Publish** 类型，
+# 直接 `npm publish` 会报：
+#
+#     403 This token can only publish to a staging area.
+#
+# 这实际是更好的流程 —— CI 只负责「推到暂存区」，2FA 批准由人做：
+#
+#   1. CI（本工作流）：`npm stage publish` → 包进入 npm 暂存区
+#   2. 你（本地，一次性）：`npm stage list` 看 ID
+#                         `npm stage approve <stage-id>` 输 2FA 批准上线
+#
+# 2FA 始终掌握在你手里，而 CI 不需要交互输入 OTP。
+#
+# ## 需要的配置
+#
+#   1. npm 网站创建 Access Token（Staged Publish 类型即可）
+#   2. 存进 GitHub 仓库 Secrets，名字 `NPM_TOKEN`
+#
+# ## 触发条件
+#
+#   - 打 `v*` tag（如 v0.6.4）→ 发布 npm
+#   - 也支持手动触发（workflow_dispatch），方便补发
+#
+# ## 与 Release 工作流的关系
+#
+#   release-desktop.yml / release-gui.yml 负责编译产物 + 建 GitHub Release
+#   本工作流只负责 npm 包，两者互不干扰，都由同一个 tag 触发
+#
+# ## 幂等性
+#
+# npm 不允许覆盖已发布版本。所以本工作流会**先检查该版本是否已存在**，
+# 已存在就跳过，不报错 —— 这样重复跑不会失败。
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '只检查不发布（dry run）'
+        required: false
+        default: 'false'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          registry-url: 'https://registry.npmjs.org'
+
+      # ⚠️ Node 20 自带 npm 10，没有 `npm stage` 命令（需要 npm 11.6+）
+      # `npm stage publish` 是这个工作流的核心（令牌只支持暂存发布），
+      # 所以必须先升级 npm。
+      - name: 升级 npm（stage 命令需要 11.6+）
+        # ⚠️ 不要用 npm@latest —— 现在是 12.x，要求 Node ^22.22 || ^24.15 || >=26，
+        # 在本 job 的 Node 20 上会 EBADENGINE 直接失败。
+        # npm 11 支持 stage 且兼容 Node 20。
+        run: |
+          npm install -g npm@11
+          npm --version
+          npm stage --help > /dev/null && echo "npm stage 可用" 
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 校验 tag 与版本号一致
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          echo "tag 版本：$TAG_VERSION"
+          echo "package.json 版本：$PKG_VERSION"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::tag 与根 package.json 版本不一致（单一版本源政策）"
+            exit 1
+          fi
+
+      - name: 构建
+        run: npm run build
+
+      - name: 类型检查
+        run: npm run typecheck
+
+      - name: 单元测试
+        run: npm test
+
+      - name: 校验内置内核资产与最新构建一致
+        run: |
+          npm run build -w @cfpilot/worker-core
+          npm run build -w cfpilot
+
+          # ⚠️ 必须校验**三个**资产，且 control/dataplane 是部署真正需要的。
+          # 资产名变更（cfpilot-worker.js → worker.js）也必须同步到这里。
+          ASSETS="control.js dataplane.js worker.js"
+
+          # ── 不一致时的判定 ──
+          #
+          # BUILD_VERSION 里含 **git 短 hash**（形如 `42884b2-3e4e4b8c`）。
+          # CI 检出的是当前提交，而仓库里的资产是上一个提交构建的，
+          # 两者的 hash 必然不同 —— 这是设计使然，不是错误。
+          #
+          # 所以只把「**忽略版本串后仍有差异**」判定为真正的不一致
+          # （那才说明源码改了但忘了同步资产）。
+          for f in $ASSETS; do
+            P="packages/cli/assets/$f"
+
+            if [ ! -f "$P" ]; then
+              echo "::error::缺少内核资产 $P"
+              echo "修复：本地执行 npm run build -w @cfpilot/worker-core && npm run build -w cfpilot 后提交"
+              exit 1
+            fi
+
+            if git diff --exit-code -- "$P" > /dev/null; then
+              echo "✅ $f 与最新构建一致"
+              continue
+            fi
+
+            echo "检测到 $f 有差异，正在排除 BUILD_VERSION 的影响…"
+            # 把两边的版本串都替换成占位符再比
+            sed -E 's/"[0-9a-f]{7,10}-[0-9a-f]{4,16}"/"<BUILD>"/g' "$P" > /tmp/committed.norm.js
+            sed -E 's/"[0-9a-f]{7,10}-[0-9a-f]{4,16}"/"<BUILD>"/g' \
+              "packages/worker-core/dist/$f" > /tmp/fresh.norm.js
+
+            if diff -q /tmp/committed.norm.js /tmp/fresh.norm.js > /dev/null; then
+              echo "✅ $f 除版本串外完全一致（版本串含 git hash，CI 上必然不同，属正常）"
+              continue
+            fi
+
+            echo "::error::内置内核资产 $f 与源码不一致（排除版本串后仍有差异）"
+            diff -u /tmp/committed.norm.js /tmp/fresh.norm.js | head -60
+            echo ""
+            echo "修复：本地执行 npm run build -w @cfpilot/worker-core && npm run build -w cfpilot 后提交"
+            exit 1
+          done
+      - name: 发布 cfpilot 与 cfpilot-mesh
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_USE_STAGE: '1'
+        run: |
+          node scripts/publish-npm.mjs cfpilot
+          node scripts/publish-npm.mjs cfpilot-mesh
+
+      - name: 提示后续操作
+        # stage 发布后包还没上线，需要人工批准，所以这里不做版本校验
+        # （校验会在本地批准后由维护者跑 npm run verify:npm 完成）
+        if: always()
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "包已推送到 npm 暂存区。"
+          echo ""
+          echo "接下来在你本地执行（需要 2FA）："
+          echo "  npm stage list                    # 查看待批准的包"
+          echo "  npm stage approve <stage-id>       # 批准上线"
+          echo "  npm run verify:npm                # 确认版本已上线"
+          echo "=========================================="
+          echo "" 

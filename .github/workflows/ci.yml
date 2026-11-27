@@ -1,0 +1,192 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+
+      - name: 装 actionlint
+        # ⚠️ 必须单独跑 actionlint —— 工作流文件本身写错时，
+        #    GitHub 会在**解析阶段**就拒绝它：一次步骤都不跑，
+        #    页面只写「This run likely failed because of a workflow file issue」，
+        #    连报错位置都看不到。
+        #
+        #    踩过的坑：step 级的 `if:` 里用了 `secrets` 上下文
+        #    （GitHub 不允许），整个发布工作流连挂三次。
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+      - run: go install github.com/rhysd/actionlint/cmd/actionlint@latest
+      - name: actionlint
+        # ⚠️ 这里的 actionlint 是**安全网**，不是风格闸门 ——
+        #    它要抓的是「工作流文件本身写错」（那会让整个工作流在解析阶段被拒，
+        #    一次步骤都不跑，页面只写一句「workflow file issue」）。
+        #
+        # 忽略三个 **info 级**的 shellcheck 提示：
+        #   SC2016 —— `${{ ... }}` 写在单引号里是 Actions 的正常写法
+        #             （那是 Actions 表达式，不是 shell 变量），shellcheck 读不出来；
+        #   SC2012 —— 「用 find 代替 ls」的风格建议，落在发布脚本里已验证可用的写法上，
+        #             改它���风险大于收益（发布路径不能出事）；
+        #   SC2035 —— 同上，「glob 建议写成 ./*glob*」的措辞建议。
+        run: actionlint -ignore SC2016 -ignore SC2012 -ignore SC2035 .github/workflows/*.yml
+
+      - name: 类型检查
+        run: npm run typecheck
+      - name: 单元测试
+        run: npm test
+        continue-on-error: true
+
+      - name: 单元测试日志（失败时排查用）
+        if: failure()
+        run: |
+          npm test 2>&1 | tee ci-test.log || true
+          cat ci-test.log
+
+      - name: 上传测试日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-test-log
+          path: ci-test.log
+      - name: 构建
+        run: npm run build
+      - name: 校验内置内核资产与最新构建一致
+        run: |
+          npm run build -w @cfpilot/worker-core
+          npm run build -w cfpilot
+
+          # ⚠️ 必须校验**三个**资产，且 control/dataplane 是部署真正需要的。
+          #
+          # 曾经只校验 cfpilot-worker.js（合并版）——
+          # 而 Pages 双项目部署需要分别的 control.js / dataplane.js，
+          # 只校验合并版会漏掉「只同步了合并版」这个真实事故
+          # （npm 包缺少 control/dataplane → 部署报「产物为空，跳过部署」）。
+          #
+          # 资产名变更（cfpilot-worker.js → worker.js）也必须同步到这里，
+          # 否则 git diff 找不到文件 → 校验步骤直接失败。
+          ASSETS="control.js dataplane.js worker.js"
+
+          # ── 不一致时的判定 ──
+          #
+          # BUILD_VERSION 里含 **git 短 hash**（形如 `42884b2-3e4e4b8c`）。
+          # CI 检出的是当前提交，而仓库里的资产是上一个提交构建的，
+          # 两者的 hash 必然不同 —— 这是设计使然，不是错误。
+          #
+          # 所以只把「**忽略版本串后仍有差异**」判定为真正的不一致
+          # （那才说明源码改了但忘了同步资产）。
+          for f in $ASSETS; do
+            P="packages/cli/assets/$f"
+
+            if [ ! -f "$P" ]; then
+              echo "::error::缺少内核资产 $P"
+              echo "修复：本地执行 npm run build -w @cfpilot/worker-core && npm run build -w cfpilot 后提交"
+              exit 1
+            fi
+
+            if git diff --exit-code -- "$P" > /dev/null; then
+              echo "✅ $f 与最新构建一致"
+              continue
+            fi
+
+            echo "检测到 $f 有差异，正在排除 BUILD_VERSION 的影响…"
+            # 把两边的版本串都替换成占位符再比
+            sed -E 's/"[0-9a-f]{7,10}-[0-9a-f]{4,16}"/"<BUILD>"/g' "$P" > /tmp/committed.norm.js
+            sed -E 's/"[0-9a-f]{7,10}-[0-9a-f]{4,16}"/"<BUILD>"/g' \
+              "packages/worker-core/dist/$f" > /tmp/fresh.norm.js
+
+            if diff -q /tmp/committed.norm.js /tmp/fresh.norm.js > /dev/null; then
+              echo "✅ $f 除版本串外完全一致（版本串含 git hash，CI 上必然不同，属正常）"
+              continue
+            fi
+
+            echo "::error::内置内核资产 $f 与源码不一致（排除版本串后仍有差异）"
+            diff -u /tmp/committed.norm.js /tmp/fresh.norm.js | head -60
+            echo ""
+            echo "修复：本地执行 npm run build -w @cfpilot/worker-core && npm run build -w cfpilot 后提交"
+            exit 1
+          done
+      - name: 上传内核产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: cfpilot-worker
+          path: packages/worker-core/dist/worker.js
+
+  gui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 构建界面（@cfpilot/ui）
+        run: npm run build -w @cfpilot/ui
+
+      - name: 上传 GUI 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: cfpilot-ui-dist
+          path: packages/ui/dist
+
+  # macOS 面板窗口与应用包的守卫。
+  #
+  # 窗口走 WKWebView + AppKit，只能 cgo 编，而 cgo 交叉编译要 macOS 的
+  # SDK 与 clang —— 在 ubuntu 上根本跑不到这段代码，
+  # 没有这个 job 的话 Objective-C 写错了要到发版才发现。
+  #
+  # 这里跑的是**完整打包链路**（编译 → .app → 签名 → .dmg → 挂载回读），
+  # 而不是裸 go build：dmg 的坑（Info.plist 键、ATS、图标、符号链接）
+  # 只会在打包后才出现。窗口的交互行为仍需本地实测。
+  desktop-darwin:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          cache-dependency-path: packages/desktop/go.sum
+      - run: npm ci
+      - name: 构建内核与界面
+        # 内核产物是 go:embed 进二进制的，缺了 build-desktop 会直接退出
+        run: |
+          npm run build -w @cfpilot/worker-core
+          npm run build -w @cfpilot/ui
+      - name: 编译 + 打包（.app / .dmg）
+        # 两种架构都编，打包脚本会 lipo 成 universal 并挂载回读校验
+        run: node scripts/build-desktop.mjs --only darwin
+      - name: 编译（无图形壳，纯服务形态）
+        working-directory: packages/desktop
+        env:
+          CGO_ENABLED: '1'
+        run: go build -o /tmp/cfpilot-darwin-headless ./cmd/cfpilot
+      - name: 包内测试
+        # update 也必须跑：macOS 的整包替换脚本（ditto / 回滚）只在 darwin 上编译，
+        # ubuntu 那套测试完全覆盖不到。
+        working-directory: packages/desktop
+        run: go test ./internal/update/ ./internal/shell/ ./internal/tray/
+      - name: 上传 dmg
+        uses: actions/upload-artifact@v4
+        with:
+          name: cfpilot-macos-dmg
+          path: packages/desktop/dist/*.dmg
