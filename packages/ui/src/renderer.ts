@@ -124,6 +124,7 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
     // 于是滚动没被启用 —— 用户切到这一页看到的仍然是一截被截断的文本。
     if (name === 'deploy') {
       refreshMarquees()
+      void refreshDeployZones()
     }
     // 组网页：切回时重算拓扑画布尺寸；离开时停动画
     if (name === 'mesh' && onMeshPageShow) {
@@ -131,6 +132,52 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
     } else if (name !== 'mesh' && onMeshPageHide) {
       onMeshPageHide()
     }
+  }
+
+  /** 自动读取当前 Cloudflare 账号的域名列表（复用盲中继已验证的只读接口）。 */
+  async function refreshDeployZones(): Promise<void> {
+    const sel = document.getElementById('deployDomainZone') as HTMLSelectElement | null
+    if (!sel) return
+    const previous = sel.value
+    sel.disabled = true
+    sel.replaceChildren(new Option('正在读取域名列表…', ''))
+    try {
+      const res = await window.cfpilot.listEdgeZones()
+      const zones = (res && res.zones) || []
+      sel.replaceChildren()
+      if (!zones.length) {
+        sel.add(new Option('账号下没有可用域名', ''))
+      } else {
+        sel.add(new Option('— 请选择域名 —', ''))
+        for (const zone of zones) {
+          const option = new Option(zone.name, zone.id)
+          option.dataset.zoneName = zone.name
+          sel.add(option)
+        }
+        if (zones.some((zone) => zone.id === previous)) sel.value = previous
+      }
+    } catch (err) {
+      sel.replaceChildren(new Option('域名列表读取失败，请检查 Token 权限', ''))
+      log('读取 Cloudflare 域名列表失败：' + String(err), 'warn')
+    } finally {
+      sel.disabled = false
+      renderDeployDomainPreview()
+    }
+  }
+
+  function renderDeployDomainPreview(): void {
+    const sel = document.getElementById('deployDomainZone') as HTMLSelectElement | null
+    const prefix = (document.getElementById('deployDomainPrefix') as HTMLInputElement | null)?.value.trim() || ''
+    const preview = document.getElementById('deployDomainPreview')
+    if (!preview) return
+    const zoneName = sel?.selectedOptions[0]?.dataset.zoneName || ''
+    if (!zoneName) {
+      preview.textContent = prefix
+        ? '请先从域名列表中选择一个域名；前缀将自动拼接到域名前面。'
+        : '选择域名后，部署时自动绑定自定义域名。'
+      return
+    }
+    preview.textContent = '部署时将自动绑定：https://' + (prefix ? prefix + '.' : '') + zoneName
   }
 
   /** 重新计算运行状态三行的横向滚动（页面可见时才有意义）。 */
@@ -1416,6 +1463,11 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
   }
 
   function bindDeploy(): void {
+    const domainZone = document.getElementById('deployDomainZone') as HTMLSelectElement | null
+    const domainPrefix = document.getElementById('deployDomainPrefix') as HTMLInputElement | null
+    domainZone?.addEventListener('change', renderDeployDomainPreview)
+    domainPrefix?.addEventListener('input', renderDeployDomainPreview)
+
     // 数据面形态：切换时更新说明文案与「自定义域名」输入框
     document.querySelectorAll('input[name="dataPlane"]').forEach((el) => {
       el.addEventListener('change', () => {
@@ -1548,8 +1600,11 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
             // 数据面形态：始终发送当前选中值。
             // 后端只有在「与清单不一致」时才当成形态切换（并自动清理旧数据面）。
             dataPlaneMode: readDataPlane(),
-            // 节点域名：只写进控制面 DATA_HOST，工具不绑定（要去 Worker 的「域」标签页自己加）
+            // 节点域名：只写进控制面 DATA_HOST。
             dataHost: $('dataHost').value.trim(),
+            // 可选自定义域名：后端按所选 Zone 的真实名称拼接并在部署后绑定。
+            customDomainZoneId: (document.getElementById('deployDomainZone') as HTMLSelectElement | null)?.value || '',
+            customDomainPrefix: (document.getElementById('deployDomainPrefix') as HTMLInputElement | null)?.value.trim() || '',
             // 本次部署要设的面板密码（留空 = 随机 / 沿用清单）
             panelPassword: deployPw,
           },
