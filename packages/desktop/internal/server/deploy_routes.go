@@ -880,16 +880,61 @@ func (s *Server) handleDeployCredentials(w http.ResponseWriter, r *http.Request)
 
 	client := s.newCFClient(profile.CfToken)
 	bindCtx, cancelBind := context.WithTimeout(r.Context(), 18*time.Second)
-	if bound, ok := detectEdgeTunnelBindings(bindCtx, client, profile.AccountID)[kvID]; ok {
+	bound, ok := detectEdgeTunnelBindings(bindCtx, client, profile.AccountID)[kvID]
+	if !ok {
 		cancelBind()
 		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":true,"panelUrl":bound.URL,"panelPath":"/admin",
-			"panelPassword":bound.AdminPassword,"uuid":"","wsPath":"",
-			"dataSubdomain":bound.URL,"build":"EdgeTunnel",
+			"ok": false,
+			"error": "当前 KV 未检测到 EdgeTunnel 实例，或 ADMIN 变量无法读取。请确认实例已部署，并将 ADMIN 设置为普通文本变量。",
 		})
 		return
 	}
+
+	// 自定义域名必须以 Cloudflare 当前绑定为准，不能依赖本地部署清单。
+	// Worker / Pages 使用各自的域名列表接口；接口失败与确实未绑定分开返回。
+	customDomain := ""
+	customDomainStatus := "unbound"
+	if bound.Mode == "workers" {
+		domains, domainErr := client.ListWorkerDomains(bindCtx, profile.AccountID)
+		if domainErr != nil {
+			customDomainStatus = "error"
+		} else {
+			for _, domain := range domains {
+				if strings.EqualFold(strings.TrimSpace(domain.Service), strings.TrimSpace(bound.Project)) &&
+					domain.Enabled && strings.TrimSpace(domain.Hostname) != "" {
+					customDomain = "https://" + strings.TrimSpace(domain.Hostname)
+					customDomainStatus = "bound"
+					break
+				}
+			}
+		}
+	} else if bound.Mode == "pages" {
+		domains, domainErr := client.ListPagesDomains(bindCtx, profile.AccountID, bound.Project)
+		if domainErr != nil {
+			customDomainStatus = "error"
+		} else {
+			for _, domain := range domains {
+				if strings.TrimSpace(domain.Name) != "" {
+					customDomain = "https://" + strings.TrimSpace(domain.Name)
+					customDomainStatus = "bound"
+					break
+				}
+			}
+		}
+	} else {
+		customDomainStatus = "error"
+	}
 	cancelBind()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true,
+		"panelUrl": bound.URL,
+		"panelPath": "/admin",
+		"panelPassword": bound.AdminPassword,
+		"panelCustomUrl": customDomain,
+		"customDomainStatus": customDomainStatus,
+		"dataSubdomain": bound.URL,
+		"build": "EdgeTunnel",
+	})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": false,
 		"error": "当前 KV 未检测到 EdgeTunnel 实例，或 ADMIN 变量无法读取。请确认实例已部署，并将 ADMIN 设置为普通文本变量。",
