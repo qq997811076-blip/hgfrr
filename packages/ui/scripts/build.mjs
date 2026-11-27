@@ -69,51 +69,24 @@ const js = readFileSync(join(outDir, 'renderer.js'), 'utf8')
 const html = readFileSync(join(outDir, 'index.html'), 'utf8')
 
 const checks = [
-  ['renderer.js 引用 window.cfpilot', js.includes('cfpilot')],
-  ['renderer.js 有回填逻辑', js.includes('pushScanResults') || js.includes('增量回填')],
-  ['index.html 有增量/覆盖回填两个按钮', html.includes('btnPushAppend') && html.includes('btnPushReplace')],
-  ['index.html 有网络环境弹窗', html.includes('envModal')],
+  // 精简后的界面只保留「凭据」和「部署」两个主页面。
+  ['renderer.js 引用 CFPilot 核心对象', js.includes('cfpilot')],
+  ['renderer.js 有代理部署入口', js.includes('btnDeploy')],
+  ['index.html 有凭据导航', html.includes('data-page="cred"')],
+  ['index.html 有部署导航', html.includes('data-page="deploy"')],
+  ['index.html 有凭据页面', html.includes('id="page-cred"')],
+  ['index.html 有部署页面', html.includes('id="page-deploy"')],
+  ['index.html 有代理实例部署面板', html.includes('id="proxyPanel"')],
+  ['index.html 有凭据面板信息区域', html.includes('id="credPanelUrl"')],
   ['index.html 无 adapter 注入（应保持纯净）', !html.includes('adapter.js')],
-
-  // 拓扑 IP 列表 / IPv6 位置 / 点击复制是 0.50.0 之后的关键 UI 改动。
-  // 之前只重建了 renderer.ts 却没重建 dist，装了新包界面完全不变；这里做硬断言，
-  // 让任何后续构建只要漏掉这些元素就直接失败。
-  ['index.html 有拓扑 IP 列表容器', html.includes('id="topoIpList"')],
-  ['index.html 有拓扑 IPv6 容器', html.includes('id="topoIpv6"')],
-  ['index.html 有点击复制样式', html.includes('copy-ip')],
-  ['renderer.js 有拓扑 IP 列表逻辑', js.includes('topoIpList')],
-  ['renderer.js 有拓扑 IPv6 渲染逻辑', js.includes('topoIpv6')],
-  ['renderer.js 有 IP 点击复制逻辑', js.includes('copy-ip')],
-
-  // 命名网络档案：创建/修改/删除 + 当前网络选择框。
-  ['index.html 有当前网络选择框', html.includes('id="meshProfileSelect"')],
-  ['index.html 有配置名称输入框', html.includes('id="meshProfileName"')],
-  ['index.html 配置名称改为网络配置名称', html.includes('>网络配置名称 ⓘ</label>')],
-  ['index.html 配置名称有悬浮说明', html.includes('data-tip="本机档案名，不是组网网络名"')],
-  ['index.html 有创建网络按钮', html.includes('id="btnMeshProfileCreate"')],
-  ['index.html 有修改网络按钮', html.includes('id="btnMeshProfileEdit"')],
-  ['index.html 有删除网络按钮', html.includes('id="btnMeshProfileDelete"')],
-  ['renderer.js 有网络档案逻辑', js.includes('cfpilot-mesh-profiles')],
-
-  // 定时任务清单：编辑只针对**单条**任务。
-  //
-  // 多选后统一编辑本身是错的 —— 各任务设置可能不同，一个字段填什么值
-  // 要套到哪些任务上说不清。所以工具栏只留「刷新 / 删除所选」，
-  // 编辑入口是每行末尾的「编辑」按钮。
-  ['index.html 任务表无「编辑所选」', !html.includes('btnTaskEdit')],
-  ['index.html 任务表无「保存应用」', !html.includes('btnTaskSave')],
-  ['renderer.js 无「编辑所选」引用', !js.includes('btnTaskEdit')],
-  ['renderer.js 有行内「编辑」按钮', js.includes('data-task-edit')],
-
-  // 数据源页：完整优选会写 KV 且耗时 1–3 分钟，入口已撤掉。
-  ['index.html 无「一键完整优选」按钮', !html.includes('btnSrcQuick')],
-  ['renderer.js 无「一键完整优选」引用', !js.includes('btnSrcQuick')],
-
-  // 可拖曳调高的表格容器（任务表 + 数据源表）
-  ['index.html 任务表有拖曳手柄', html.includes('data-resize="taskTableScroll"')],
-  ['index.html 数据源表有拖曳手柄', html.includes('data-resize="srcSourcesScroll"')],
-  ['index.html 有拖曳手柄样式', html.includes('.table-resizer')],
-  ['renderer.js 绑定了拖曳手柄', js.includes('pointerdown')],
+  // 已移除的独立页面不能重新出现在页面结构中。
+  ['index.html 无组网页面', !html.includes('id="page-mesh"')],
+  ['index.html 无优选页面', !html.includes('id="page-scan"')],
+  ['index.html 无数据源页面', !html.includes('id="page-sources"')],
+  ['index.html 无说明页面', !html.includes('id="page-about"')],
+  ['index.html 无独立日志页面', !html.includes('id="page-logs"')],
+  // 部署页只保留代理实例部署，不再显示盲中继子页面。
+  ['index.html 无盲中继面板', !html.includes('id="edgePanel"')],
 ]
 
 let bad = 0
