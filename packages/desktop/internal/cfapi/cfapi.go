@@ -653,11 +653,12 @@ func (c *Client) CreatePagesProjectConfigured(ctx context.Context, accountID, na
 	type productionConfig struct {
 		EnvVars map[string]PageVar `json:"env_vars,omitempty"`
 		KVNamespaces map[string]kvBinding `json:"kv_namespaces,omitempty"`
+		CompatibilityDate string `json:"compatibility_date,omitempty"`
 	}
 	body := map[string]any{
 		"name":name,
 		"production_branch":productionBranch,
-		"deployment_configs":map[string]any{"production":productionConfig{EnvVars:vars,KVNamespaces:func() map[string]kvBinding {
+		"deployment_configs":map[string]any{"production":productionConfig{EnvVars:vars,CompatibilityDate:"2025-11-04",KVNamespaces:func() map[string]kvBinding {
 			out:=map[string]kvBinding{}
 			for k,v:=range bindings { out[k]=kvBinding{NamespaceID:v} }
 			return out
@@ -744,6 +745,22 @@ func (c *Client) ConfigurePages(
 	}
 	return c.doJSON(ctx, http.MethodPatch,
 		fmt.Sprintf("/accounts/%s/pages/projects/%s", accountID, url.PathEscape(name)), &p, nil)
+}
+
+// ConfigureEdgeTunnelPages 同步设置 EdgeTunnel 的 Pages 生产变量、KV 绑定和运行时兼容日期。
+func (c *Client) ConfigureEdgeTunnelPages(ctx context.Context, accountID, name string, envVars map[string]PageVar, bindings map[string]string) error {
+	type kvBinding struct { NamespaceID string `json:"namespace_id"` }
+	type production struct {
+		EnvVars map[string]PageVar `json:"env_vars,omitempty"`
+		KVNamespaces map[string]kvBinding `json:"kv_namespaces,omitempty"`
+		CompatibilityDate string `json:"compatibility_date"`
+	}
+	kv := make(map[string]kvBinding,len(bindings))
+	for name,id := range bindings { kv[name]=kvBinding{NamespaceID:id} }
+	body := map[string]any{"deployment_configs":map[string]any{"production":production{
+		EnvVars:envVars,KVNamespaces:kv,CompatibilityDate:"2025-11-04",
+	}}}
+	return c.doJSON(ctx,http.MethodPatch,fmt.Sprintf("/accounts/%s/pages/projects/%s",accountID,url.PathEscape(name)),body,nil)
 }
 
 // PageVar 是 Pages 环境变量。
