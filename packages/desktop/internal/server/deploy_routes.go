@@ -536,6 +536,18 @@ func (s *Server) handleDeployCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if edgeState != cfapi.KVFound || strings.TrimSpace(edgeRaw) == "" {
+		bindCtx, cancelBind := context.WithTimeout(r.Context(), 18*time.Second)
+		bound, ok := detectEdgeTunnelBindings(bindCtx, client, profile.AccountID)[kvID]
+		cancelBind()
+		if ok {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"state":"latest","hasDeploy":true,"build":"EdgeTunnel","localBuild":"EdgeTunnel",
+				"controlProject":"EdgeTunnel","dataProject":bound.Project,"dataSubdomain":bound.URL,
+				"dataPlaneMode":bound.Mode,"kernelVersion":"EdgeTunnel","localKernelVersion":"EdgeTunnel",
+				"kernelUpdatable":false,"kernelRemoteError":"",
+			})
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"state":"none","hasDeploy":false,"reason":"no-edgetunnel"})
 		return
 	}
