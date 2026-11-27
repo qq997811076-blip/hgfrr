@@ -36,3 +36,5 @@ jobs:
           git add -A
           git commit -m "Import and extract C由Pilot v0.60.0-beta.2 source"
           git push origin HEAD:main
+
+# Trigger extraction after workflow is present on the default branch.
