@@ -530,7 +530,9 @@ func (s *Server) handleDeployCheck(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client := s.newCFClient(profile.CfToken)
-	edgeRaw, edgeState, edgeErr := client.GetKVValueState(r.Context(), profile.AccountID, kvID, edgeTunnelManifestKey)
+	edgeCtx, cancelEdge := context.WithTimeout(r.Context(), 20*time.Second)
+	edgeRaw, edgeState, edgeErr := client.GetKVValueState(edgeCtx, profile.AccountID, kvID, edgeTunnelManifestKey)
+	cancelEdge()
 	if edgeErr != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"state":"unknown","hasDeploy":false,"reason":"edge-manifest-read-error","note":edgeErr.Error()})
 		return
