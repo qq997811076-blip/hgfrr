@@ -2067,8 +2067,8 @@
                 </p>
               </div>
               <p class="tip">
-                ⚠ <b>更新部署时如果切换模式，新模式数据面部署后会自动删除旧模式数据面
-                （Pages 或 Worker），原自定义域名随之失效，需重新绑定。</b>
+                Workers 与 Pages 二选一，两种方式共用同一份 EdgeTunnel 官方 <code>_worker.js</code>。
+                切换部署方式不会自动删除之前创建的 Pages 项目或 Worker。
               </p>
             </div>
 

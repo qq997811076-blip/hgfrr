@@ -1324,7 +1324,9 @@ var errNoArtifacts = errors.New("找不到内核产物")
 
 // startEdgeTunnelDeploy 通过 Cloudflare API 部署 EdgeTunnel 官方单 Worker 核心。
 func (s *Server) startEdgeTunnelDeploy(w http.ResponseWriter, req deployRequest, profile *store.Profile) {
-	client := s.newCFClient(profile.CfToken)
+	// EdgeTunnel 官方脚本约 5 MB，Pages 还要封装为嵌套 Worker Bundle；
+	// 部署专用客户端放宽单请求超时，避免跨境链路上传时被默认 30 秒截断。
+	client := cfapi.New(cfapi.Options{Token: profile.CfToken, APIBase: s.cfBase, TimeoutMs: 120000})
 	kvID := resolveKVNamespaceID(req.KVNamespaceID, profile.KVNamespaceID)
 	kvTitle := ""
 	if kvID == "" {
