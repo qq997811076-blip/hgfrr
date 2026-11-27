@@ -367,11 +367,6 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
   let kvOptions: Array<{
     id: string
     title: string
-    ownership: 'instance' | 'foreign' | 'cfpilot' | 'empty'
-    controlProject?: string
-    dataProject?: string
-    at?: string
-    build?: string
   }> = []
 
   async function refreshCredState(): Promise<void> {
@@ -433,18 +428,8 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
     for (const item of kvOptions) {
       const opt = document.createElement('option')
       opt.value = item.id
-      if (item.ownership === 'instance') {
-        opt.textContent = `● ${item.title} — EdgeTunnel ${item.dataProject}（${item.at ?? ''}）`
-      } else if (item.ownership === 'foreign') {
-        // 被其他项目占用的命名空间：直接禁用，不给选中的机会。
-        // 服务端 assertKvOwnership 也会硬拒绝，这里是第一道防线。
-        opt.textContent = `✕ ${item.title} — 已被其他项目占用（不可用）`
-        opt.disabled = true
-      } else if (item.ownership === 'cfpilot') {
-        opt.textContent = `○ ${item.title} — 含 CFPilot 残留配置`
-      } else {
-        opt.textContent = `○ ${item.title} — 空命名空间`
-      }
+      // 不检查 KV 与项目的归属关系：账号下的命名空间均可选择。
+      opt.textContent = item.title
       select.appendChild(opt)
     }
     if (selectedId) select.value = selectedId
@@ -465,19 +450,8 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
         : '选择账户后会自动检测账号与实例；检测到已部署实例会自动选中对应的 KV。'
       return
     }
-    if (item.ownership === 'instance') {
-      hint.textContent =
-        `EdgeTunnel 项目 ${item.dataProject}，部署于 ${item.at || '未知时间'}。` + (kvGuidance ? ' ' + kvGuidance : '')
-    } else if (item.ownership === 'foreign') {
-      hint.textContent =
-        '此命名空间已被其他项目占用，不能用于 EdgeTunnel。请到「部署」页新建一个 KV 实例。'
-    } else if (item.ownership === 'cfpilot') {
-      hint.textContent =
-        '此命名空间含 CFPilot 的 CONFIG 键但没有部署清单（残留配置）。' +
-        '部署会覆盖它，除非你确实知道自己在做什么。'
-    } else {
-      hint.textContent = '空命名空间，可用于部署新实例。'
-    }
+    hint.textContent = `已选择 KV 命名空间：${item.title}。部署时将直接使用该命名空间。` +
+      (kvGuidance ? ' ' + kvGuidance : '')
     // 换了 KV 之后，之前那次检测结果就不适用了 —— 清掉，回到本地留档显示。
     deployChecked = null
     autoDeployLabel = '开始部署'
@@ -1591,7 +1565,6 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
           {
             mode,
             force: $('optForce').checked,
-            forceKv: $('optForceKv').checked,
             newCredentials: $('optNewCred').checked,
             controlProject: $('controlProject').value.trim(),
             dataProject: $('dataProject').value.trim(),
