@@ -151,8 +151,8 @@ func (s *Server) handleEdgeTunnelDeploy(w http.ResponseWriter, req deployRequest
 	} else if isBoundInstance && !strings.EqualFold(req.Mode,"fresh") { project = boundInstance.Project }
 	if project == "" { project = "edgetunnel-" + shortRandom(6) }
 	admin := strings.TrimSpace(req.PanelPassword)
-	if admin == "" && hasManifest && !strings.EqualFold(req.Mode,"fresh") {
-		admin = old.AdminPassword
+	if admin == "" && isBoundInstance && !strings.EqualFold(req.Mode,"fresh") {
+		admin = boundInstance.AdminPassword
 	}
 	if admin == "" { admin = edgeTunnelRandomPassword() }
 
