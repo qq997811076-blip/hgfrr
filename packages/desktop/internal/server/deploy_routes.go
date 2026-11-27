@@ -935,10 +935,6 @@ func (s *Server) handleDeployCredentials(w http.ResponseWriter, r *http.Request)
 		"dataSubdomain": bound.URL,
 		"build": "EdgeTunnel",
 	})
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": false,
-		"error": "当前 KV 未检测到 EdgeTunnel 实例，或 ADMIN 变量无法读取。请确认实例已部署，并将 ADMIN 设置为普通文本变量。",
-	})
 }
 
 // logSummary 打印部署完成后的凭据汇总。
