@@ -641,6 +641,37 @@ func (c *Client) CreatePagesProject(ctx context.Context, accountID, name, produc
 	return &out, nil
 }
 
+// CreatePagesProjectWithRuntimeBindings 创建带有生产环境变量与 KV 绑定的 Pages 项目。
+//
+// 通过创建请求一次性提交配置，避免创建后再 PATCH（PATCH 会额外触发部署）。
+func (c *Client) CreatePagesProjectWithRuntimeBindings(
+	ctx context.Context, accountID, name, productionBranch, admin, kvID string,
+) (*PagesProject, error) {
+	if productionBranch == "" {
+		productionBranch = "main"
+	}
+	payload := map[string]any{
+		"name": name,
+		"production_branch": productionBranch,
+		"deployment_configs": map[string]any{
+			"production": map[string]any{
+				"env_vars": map[string]PageVar{
+					"ADMIN": {Type: "plain_text", Value: admin},
+				},
+				"kv_namespaces": map[string]any{
+					"KV": map[string]string{"namespace_id": kvID},
+				},
+			},
+		},
+	}
+	var out PagesProject
+	if err := c.doJSON(ctx, http.MethodPost,
+		fmt.Sprintf("/accounts/%s/pages/projects", accountID), payload, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // DeletePagesProject 删除 Pages 项目。
 func (c *Client) DeletePagesProject(ctx context.Context, accountID, name string) error {
 	return c.doJSON(ctx, http.MethodDelete,

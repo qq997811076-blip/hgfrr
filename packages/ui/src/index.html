@@ -2047,18 +2047,8 @@
             </div>
 
             <div class="field">
-              <label>数据面部署模式</label>
-              <!--
-                两段模式说明同样移进 title 气泡（文案是产品口径，原样保留）：
-                  Pages   —— 深度集成 Git (GitHub/GitLab)，自动构建便利，开放流量，
-                             适合静态网站和无自有域名部署；*.pages.dev 域名直连可访问，
-                             无需配置自定义域名！
-                  Workers —— 极致的动态与边缘控制，适合 API、代理、鉴权、重定向、
-                             SSR 渲染以及结合 D1、R2、KV 等全栈后端部署；
-                             *.workers.dev 域名直连无法访问，请登录 cloudflare 控制台配置自定义域名！
-                ⚠ 切换模式的警告**必须留在明文**：它是会丢域名的破坏性后果，
-                  悬浮气泡容易被漏看。
-              -->
+              <label>部署方式</label>
+              <!-- EdgeTunnel 使用同一份官方 _worker.js，以下仅选择部署到 Workers 或 Pages。 -->
               <div class="radios">
                 <label class="chk" title="使用 EdgeTunnel 官方 _worker.js，自动打包为 Pages Advanced Mode Worker Bundle 并部署到 Pages，访问地址为 *.pages.dev。"><input type="radio" name="dataPlane" value="pages" checked /> EdgeTunnel Pages 部署</label>
                 <label class="chk" title="使用同一份 EdgeTunnel 官方 _worker.js，直接上传为 Cloudflare Worker，自动开启 workers.dev。"><input type="radio" name="dataPlane" value="workers" /> EdgeTunnel Workers 部署</label>

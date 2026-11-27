@@ -179,11 +179,8 @@ type deployRequest struct {
 
 	// DataHost 是 Workers 数据面的节点域名（写进控制面 DATA_HOST，工具不绑定）
 	DataHost string `json:"dataHost"`
-	// DataPlaneMode 是数据面部署形态：pages / workers。
-	//
-	// 留空 = 沿用部署清单里记录的形态（没有清单则 pages）。
-	// 界面**总是**发送当前选中的值，并在读取部署状态时把清单里的形态回填到
-	// 单选框 —— 否则「一个 Workers 实例被顺手更新一次」就会被悄悄改成 Pages。
+	// DataPlaneMode 在 EdgeTunnel 部署中表示部署目标：pages / workers。
+	// 留空时默认 Pages。
 	DataPlaneMode string `json:"dataPlaneMode"`
 
 	// KVNamespaceID 可选，留空用当前账户里保存的

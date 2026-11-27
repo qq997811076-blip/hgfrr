@@ -168,7 +168,7 @@ func DeployEdgeTunnelPages(ctx context.Context, client *cfapi.Client, accountID,
 	}
 	if project == nil {
 		log("正在创建 Cloudflare Pages 项目 " + name + "…")
-		project, err = client.CreatePagesProject(ctx, accountID, name, "main")
+		project, err = client.CreatePagesProjectWithRuntimeBindings(ctx, accountID, name, "main", admin, kvID)
 		if err != nil {
 			return nil, fmt.Errorf("创建 EdgeTunnel Pages 项目失败：%w", err)
 		}
@@ -188,7 +188,7 @@ func DeployEdgeTunnelPages(ctx context.Context, client *cfapi.Client, accountID,
 			"text": admin,
 		},
 	}
-	log(fmt.Sprintf("EdgeTunnel 官方核心已获取（%.2f MB），正在打包并上传 Pages 项目 %s…", float64(len(script))/(1024*1024), name))
+	log(fmt.Sprintf("EdgeTunnel 官方核心已获取（%.2f MB），正在封装为 Pages Worker Bundle 并上传项目 %s…", float64(len(script))/(1024*1024), name))
 	if _, err := client.DeployPagesWorker(ctx, cfapi.PagesDeployOptions{
 		AccountID: accountID,
 		Project: name,
