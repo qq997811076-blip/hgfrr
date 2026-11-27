@@ -901,7 +901,7 @@ func (s *Server) handleDeployCredentials(w http.ResponseWriter, r *http.Request)
 		} else {
 			for _, domain := range domains {
 				if strings.EqualFold(strings.TrimSpace(domain.Service), strings.TrimSpace(bound.Project)) &&
-					domain.Enabled && strings.TrimSpace(domain.Hostname) != "" {
+					strings.TrimSpace(domain.Hostname) != "" {
 					customDomain = "https://" + strings.TrimSpace(domain.Hostname)
 					customDomainStatus = "bound"
 					break
