@@ -33,7 +33,7 @@ jobs:
           rm -f .github/workflows/unpack-cfpilot.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
+          git add -f -A
           git reset -- .github/workflows
           git commit -m "Import and extract C由Pilot v0.60.0-beta.2 source"
           git push origin HEAD:main
