@@ -1821,12 +1821,6 @@
                 <p class="kv-row" style="margin: 0 0 6px">
                   <span class="k">面板密码</span><span class="v" id="credPanelPw">—</span>
                 </p>
-                <p class="kv-row" style="margin: 0 0 6px">
-                  <span class="k">UUID</span><span class="v" id="credUuid">—</span>
-                </p>
-                <p class="kv-row" style="margin: 0">
-                  <span class="k">WS 路径</span><span class="v" id="credWsPath">—</span>
-                </p>
                 <div class="btn-row" style="margin-top:10px">
                   <button class="btn btn-ghost" id="btnCopyCreds">复制全部</button>
                 </div>
@@ -1841,9 +1835,6 @@
 
           <div class="card">
             <h2><span class="dot"></span>🚀 部署 / 更新</h2>
-            <p class="desc">
-              双项目：控制面（面板 + 订阅 + 探针）+ 数据面（代理入站），共用同一个 KV。
-            </p>
 
             <div class="field">
               <label>本次操作</label>
@@ -1875,10 +1866,6 @@
                 <label class="chk" title="将 EdgeTunnel 的 _worker.js 自动打包为 Pages 部署文件并发布到 *.pages.dev。"><input type="radio" name="dataPlane" value="pages" checked /> Pages 部署（默认）</label>
                 <label class="chk" title="将同一份 EdgeTunnel _worker.js 直接上传为 Cloudflare Worker，并绑定 KV 与 ADMIN。"><input type="radio" name="dataPlane" value="workers" /> Workers 部署</label>
               </div>
-              <p class="tip">
-                ⚠ <b>更新部署时如果切换模式，新模式数据面部署后会自动删除旧模式数据面
-                （Pages 或 Worker），原自定义域名随之失效，需重新绑定。</b>
-              </p>
             </div>
 
             <div class="row" id="deployCustomDomainFields">
