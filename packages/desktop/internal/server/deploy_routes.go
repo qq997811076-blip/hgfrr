@@ -1290,7 +1290,7 @@ func (s *Server) handleKvList(w http.ResponseWriter, r *http.Request) {
 	}
 	// 把实例信息记到本地：部署页显示「KV 名称 · 控制面 / 数据面」时不用再调 Token。
 	s.rememberInstances(known)
-	s.logf(fmt.Sprintf("找到 %d 个 KV 命名空间，其中 %d 个是 CFPilot 实例", len(options), instanceCount))
+	s.logf(fmt.Sprintf("找到 %d 个 KV 命名空间，其中 %d 个是 EdgeTunnel 实例", len(options), instanceCount))
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"options":   options,
@@ -1331,7 +1331,7 @@ func (s *Server) handleKvCreate(w http.ResponseWriter, r *http.Request) {
 
 	title := strings.TrimSpace(req.Title)
 	if title == "" {
-		title = "cfpilot-gui-" + shortRandom(8)
+		title = "edgetunnel-kv-" + shortRandom(8)
 	}
 
 	client := s.newCFClient(profile.CfToken)
