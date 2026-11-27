@@ -8468,7 +8468,6 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
   }
 
   document.addEventListener('DOMContentLoaded', async () => {
-    bindSourcesPage()
     document.getElementById('nav')!.addEventListener('click', (e) => {
       const btn = (e.target as HTMLElement).closest('button[data-page]') as HTMLElement | null
       if (btn) switchPage(btn.dataset.page!)
@@ -8665,34 +8664,13 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
     safeBind('运行时状态', bindRuntime)
     safeBind('凭据', bindCredentials)
     safeBind('部署', bindDeploy)
-    safeBind('部署页签', bindDeploySubtabs)
-    safeBind('盲中继/云监测台', bindEdge)
-    safeBind('组网', bindMesh)
-    safeBind('链式代理', bindChain)
-    safeBind('优选', bindScan)
-    safeBind('优选页签', bindScanSubtabs)
-    safeBind('定时优选任务', bindScheduledTasks)
-    safeBind('表格拖曳', bindTableResizers)
-    safeBind('候选来源', bindCandidateSource)
-    safeBind('反代优选', bindRelay)
-    safeBind('优选历史', bindHistory)
-    safeBind('实验性设置', bindExperimental)
-    safeBind('自适应对照', bindAdaptiveEffect)
-    safeBind('用量', bindUsage)
-    safeBind('日志', bindLogs)
-    safeBind('更新', bindUpdater)
     safeBind('回填', bindPush)
 
     // 切到「日志」页时自动加载一次。
     //
     // 赋值给前面声明的可空引用（与 autoCheckOnAbout 同一套做法）：
     // switchPage 定义在前面，这里赋的值它能直接用。
-    autoLoadLogs = () => {
-      // 已经加载过就不重复拉 —— 用户可能正在读日志内容，
-      // 每次切页都重拉会把滚动位置顶回底部。
-      if (logsLoaded) return
-      void loadLogs()
-    }
+    // 独立日志页已移除；底部实时日志面板仍保留用于显示部署输出。
 
     /**
      * 托盘菜单跳转。
@@ -8704,7 +8682,7 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
      */
     const pageParam = new URLSearchParams(location.search).get('page')
     if (pageParam) {
-      const valid = ['cred', 'deploy', 'scan', 'sources', 'about', 'logs']
+      const valid = ['cred', 'deploy']
       if (valid.includes(pageParam)) {
         switchPage(pageParam)
         log('已跳转到「' + pageParam + '」页')
@@ -8716,10 +8694,6 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
     await runStep('KV 选项', () => {
       renderKvOptions()
     })
-    // 国家选择器：不 await，避免拖慢界面；加载失败也不影响优选
-    void runStep('国家选择器', initCountryControls)
-    // 若后台正在跑优选（如刷新页面、关闭重开窗口或托盘一键优选），启动时自动恢复进度条
-    void runStep('优选进度状态', restoreScanProgressFromServer)
 
     log('CFPilot GUI 已就绪')
     log('凭据只保存在本机，不会上传')
