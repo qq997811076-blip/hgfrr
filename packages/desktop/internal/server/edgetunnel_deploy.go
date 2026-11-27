@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"time"
 
@@ -157,4 +158,34 @@ func (s *Server) handleEdgeTunnelDeploy(w http.ResponseWriter, req deployRequest
 		"kvNamespaceId":kvID,"kvTitle":kvTitle,"url":publicURL,
 	}
 	s.events.publish("deploy-status",map[string]any{"ok":true,"result":result})
+}
+
+func (s *Server) startEdgeTunnelDeploy(w http.ResponseWriter, req deployRequest, profile *store.Profile) {
+	s.deploy.mu.Lock()
+	if s.deploy.running {
+		s.deploy.mu.Unlock()
+		writeJSON(w, http.StatusConflict, map[string]any{"error":"已有部署正在进行，请等待完成"})
+		return
+	}
+	s.deploy.running = true
+	s.deploy.mu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]any{"started":true,"note":"EdgeTunnel 部署已开始，进度会通过日志推送"})
+	go func() {
+		defer func() {
+			s.deploy.mu.Lock()
+			s.deploy.running = false
+			s.deploy.mu.Unlock()
+		}()
+		rec := httptest.NewRecorder()
+		s.handleEdgeTunnelDeploy(rec, req, profile)
+		if rec.Code < 200 || rec.Code >= 300 {
+			var payload map[string]any
+			_ = json.Unmarshal(rec.Body.Bytes(), &payload)
+			msg, _ := payload["error"].(string)
+			if msg == "" { msg = fmt.Sprintf("EdgeTunnel 部署失败（HTTP %d）",rec.Code) }
+			s.logLevel(msg,"err")
+			s.events.publish("deploy-status",map[string]any{"ok":false,"error":msg})
+		}
+	}()
 }
