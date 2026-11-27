@@ -36,6 +36,7 @@ type edgeTunnelBinding struct {
 	Project string
 	Mode string
 	URL string
+	AdminPassword string
 }
 
 func detectEdgeTunnelBindings(ctx context.Context, client *cfapi.Client, accountID string) map[string]edgeTunnelBinding {
@@ -46,19 +47,22 @@ func detectEdgeTunnelBindings(ctx context.Context, client *cfapi.Client, account
 		for _, name := range scripts {
 			bindings, err := client.GetWorkerScriptSettings(ctx, accountID, name)
 			if err != nil { continue }
-			kvID, hasAdmin := "", false
+			kvID, hasAdmin, adminPassword := "", false, ""
 			for _, b := range bindings {
 				bindingName, _ := b["name"].(string)
 				bindingType, _ := b["type"].(string)
 				if bindingName == "KV" && bindingType == "kv_namespace" {
 					kvID, _ = b["namespace_id"].(string)
 				}
-				if bindingName == "ADMIN" { hasAdmin = true }
+				if bindingName == "ADMIN" {
+					hasAdmin = true
+					adminPassword, _ = b["text"].(string)
+				}
 			}
 			if kvID != "" && hasAdmin {
 				host := name + ".workers.dev"
 				if sub != "" { host = name + "." + sub + ".workers.dev" }
-				found[kvID] = edgeTunnelBinding{Project:name,Mode:"workers",URL:"https://"+host}
+				found[kvID] = edgeTunnelBinding{Project:name,Mode:"workers",URL:"https://"+host,AdminPassword:adminPassword}
 			}
 		}
 	}
@@ -71,7 +75,7 @@ func detectEdgeTunnelBindings(ctx context.Context, client *cfapi.Client, account
 			if kv.NamespaceID != "" && hasAdmin {
 				host := strings.TrimSpace(project.Subdomain)
 				if host == "" { host = project.Name + ".pages.dev" }
-				found[kv.NamespaceID] = edgeTunnelBinding{Project:project.Name,Mode:"pages",URL:"https://"+host}
+				found[kv.NamespaceID] = edgeTunnelBinding{Project:project.Name,Mode:"pages",URL:"https://"+host,AdminPassword:production.EnvVars["ADMIN"].Value}
 			}
 		}
 	}
@@ -159,7 +163,7 @@ func (s *Server) handleEdgeTunnelDeploy(w http.ResponseWriter, req deployRequest
 			{"type":"plain_text","name":"ADMIN","text":admin},
 		}
 		s.logLevel("正在上传 EdgeTunnel Worker…","info")
-		if err := client.UploadWorkerScript(ctx,profile.AccountID,project,script,bindings,"2026-11-01"); err != nil {
+		if err := client.UploadWorkerScript(ctx,profile.AccountID,project,script,bindings,"2025-11-04"); err != nil {
 			writeJSON(w,http.StatusBadGateway,map[string]any{"error":"上传 EdgeTunnel Worker 失败："+err.Error()}); return
 		}
 		sub,_ := client.GetWorkersSubdomain(ctx,profile.AccountID)
