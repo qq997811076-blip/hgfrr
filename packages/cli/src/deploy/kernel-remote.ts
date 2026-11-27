@@ -1,0 +1,943 @@
+/**
+ * 内核产物的远程获取（GitHub Releases）与本地回退。
+ *
+ * ## 为什么需要远程内核
+ *
+ * 内核产物（control.js / dataplane.js）原先**内置在 npm 包里**
+ * （`packages/cli/assets/`），于是**部署用的代码被应用版本绑死**：
+ * 用户没升级 npm 包，就只能部署旧内核。
+ *
+ * 现在每个 Release 都会发布两个内核资产：
+ *
+ *   cfpilot-kernel-control.js
+ *   cfpilot-kernel-dataplane.js
+ *
+ * 部署前先查一下远程有没有更新的内核，有就用远程的 ——
+ * 应用版本与内核版本从此解耦。
+ *
+ * ## 零第三方依赖（铁律）
+ *
+ * `packages/cli` 是 npm 包（`cfpilot`），必须能被 `npx -y` 秒级拉起，
+ * 因此这里**只用 Node 内置模块**（node:fs / node:path / node:os）与
+ * 全局 fetch（Node 18+ 自带），不引入任何第三方运行时依赖。
+ *
+ * ## 网络失败不抛错
+ *
+ * 查不到远程 / 下载失败 / GitHub 不可达，都是**正常情况**（离线、限流、
+ * 仓库还没发新版），一律回退到**本地内置产物**继续部署，
+ * 只在返回值里把 `source` 标成「内置 x.y.z」，让调用方能提示用户。
+ *
+ * ## 完整性校验（供应链）
+ *
+ * 远程产物最终会被上传到**用户的 Cloudflare 账号**里运行，
+ * 所以「下载成功」不等于「可以部署」：
+ *
+ *   1. Release 里同时发布 `cfpilot-kernel-SHA256SUMS`；
+ *   2. 本模块从**官方 GitHub 地址**（不走镜像）取这份清单；
+ *   3. 下载产物（允许走镜像）后必须与清单逐字节匹配；
+ *   4. 缓存命中也要重新算摘要 —— 缓存文件同样可能被篡改或写坏；
+ *   5. 清单取不到 / 摘要不匹配 → **拒绝远程内核**，回退本地内置产物。
+ *
+ * ⚠️ 为什么不从镜像取清单：镜像若能替换产物，就能一并替换清单，
+ * 校验形同虚设。宁可回退内置（安全但旧），也不把未校验的代码部署出去。
+ */
+import { createHash } from 'node:crypto'
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+import { compareSemver } from '../shared/version-util'
+import { describeProxy } from '../shared/proxy'
+import {
+  RELEASES_WEB,
+  apiSources,
+  downloadSources,
+  fetchLatestVersionWithoutApi,
+} from '../shared/github-mirrors'
+
+/** 控制面内核产物在 Release 里的附件名。 */
+export const CONTROL_ASSET_NAME = 'cfpilot-kernel-control.js'
+/** 数据面内核产物在 Release 里的附件名。 */
+export const DATA_ASSET_NAME = 'cfpilot-kernel-dataplane.js'
+/** 内核产物摘要清单在 Release 里的附件名（sha256sum 格式）。 */
+export const CHECKSUMS_ASSET_NAME = 'cfpilot-kernel-SHA256SUMS'
+
+/** GitHub 仓库。 */
+const REPO = 'xmwengxing/CFPilot'
+
+/** GitHub Releases API（可被环境变量覆盖，测试用）。 */
+const RELEASES_API =
+  process.env.CFPILOT_KERNEL_API_BASE ?? `https://api.github.com/repos/${REPO}/releases`
+
+/** 远程查询 / 下载的默认超时时间（毫秒）。 */
+const DEFAULT_TIMEOUT_MS = 20_000
+
+/** 单个内核产物的字节数上限（10MB）。 */
+const MAX_ASSET_BYTES = 10 * 1024 * 1024
+
+/** 缓存根目录的环境变量（测试用）。 */
+const CACHE_DIR_ENV = 'CFPILOT_KERNEL_CACHE_DIR'
+/** 本地内置内核目录的环境变量（测试 / 开发用）。 */
+const LOCAL_DIR_ENV = 'CFPILOT_KERNEL_DIR'
+/** 关闭远程内核获取的环境变量（设为 0 / false / off 即关闭）。 */
+const REMOTE_OFF_ENV = 'CFPILOT_KERNEL_REMOTE'
+
+/**
+ * 构建指纹的正则。
+ *
+ * 产物里的形式：`var BUILD_VERSION = "a946dfa-1f2e3d4c"`。
+ * 早期格式是纯数字时间戳（`202610251200`），一并兼容。
+ */
+const BUILD_RE = /["']([0-9a-f]{7,10}-(?:[0-9a-f]{4,16}|[0-9]{12}))["']/
+const BUILD_NUMERIC_RE = /["'](\d{10,14})["']/
+
+/** 远程可用内核的信息。 */
+export interface RemoteKernelInfo {
+  /** 内核版本（semver，如 "0.7.6"） */
+  version: string
+  /** 控制面产物下载地址 */
+  controlUrl: string
+  /** 数据面产物下载地址 */
+  dataUrl: string
+  /** 摘要清单地址（空串 = 该发行版没有清单，下载后无法校验） */
+  checksumsUrl: string
+}
+
+/** 实际用于部署的内核。 */
+export interface KernelBundle {
+  /** 控制面产物源码 */
+  control: string
+  /** 数据面产物源码 */
+  data: string
+  /** 内核版本（semver） */
+  version: string
+  /** 来源说明（"远程 0.7.6" / "内置 0.7.5"） */
+  source: string
+}
+
+/* ------------------------------------------------------------------ */
+/* GitHub Releases                                                     */
+/* ------------------------------------------------------------------ */
+
+interface GitHubAsset {
+  name: string
+  browser_download_url: string
+}
+
+interface GitHubRelease {
+  tag_name: string
+  draft?: boolean
+  prerelease?: boolean
+  assets?: GitHubAsset[]
+}
+
+/**
+ * 从 tag 里提取版本号（不含前缀）。
+ *
+ * 接受的 tag 形态（与 Go 版 isReleaseTag 保持一致）：
+ *   v         —— 当前正式（release-desktop.yml 的 tag_name）
+ *   desktop-v —— Go 版工作流触发用
+ *   gui-v     —— Electron 时代过渡
+ *
+ * 不是合法 semver 时返回空串。
+ */
+export function versionFromTag(tag: string): string {
+  const text = tag.trim()
+  for (const prefix of ['desktop-v', 'gui-v', 'v']) {
+    if (text.startsWith(prefix)) {
+      const rest = text.slice(prefix.length)
+      // ⚠️ 必须**锚定整段**（审计 D6）：旧实现只判前缀 `^\d+\.\d+\.\d+`，
+      // 会把 `1.2.3-rc1/../../evil` 的剩余串整体当版本号返回，
+      // 后续 cacheDir(version) 据此建目录 → 路径穿越写到缓存根之外。
+      // 现在只接受纯 semver（可带 -prerelease / +build），拒绝任何尾随垃圾。
+      const m = /^(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)$/.exec(rest)
+      return m ? m[1]! : ''
+    }
+  }
+  return ''
+}
+
+/**
+ * 发行版 tag 是否可安全用于构造官方下载路径（审计 D6 防御纵深）。
+ *
+ * 只允许 `v / desktop-v / gui-v` 前缀 + 纯 semver；拒绝路径分隔符、空白等
+ * 可能越出 `releases/download/<tag>/` 路径的字符。
+ */
+function isSafeReleaseTag(tag: string): boolean {
+  return /^(?:desktop-v|gui-v|v)\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(tag)
+}
+
+/**
+ * 按**官方模板**构造资产下载地址（审计 D1/C2）。
+ *
+ * 仓库基址硬编码（RELEASES_WEB），tag 已通过 isSafeReleaseTag 校验。
+ * 镜像 API 响应只用于**发现版本号**，绝不取其中的 browser_download_url ——
+ * 那份 URL 可被恶意镜像指向攻击者服务器，使「清单 + 产物」摘要自洽、校验整体失效。
+ */
+function officialAssetUrl(tag: string, assetName: string): string {
+  return `${RELEASES_WEB}/download/${tag}/${assetName}`
+}
+
+/**
+ * 查询最新 Release 里的内核资产；查不到返回 null（**不要抛错**）。
+ *
+ * 「最新」的定义：**版本号最高的、且同时带两个内核资产的发行版**。
+ *
+ * 跳过 draft 与 prerelease —— 预发布版不该被当成正式内核发出去。
+ */
+export async function fetchRemoteKernelInfo(
+  options: { timeoutMs?: number } = {}
+): Promise<RemoteKernelInfo | null> {
+  // 显式关闭远程（受限网络 / 离线环境 / 自动化流水线）
+  if (isRemoteDisabled()) return null
+
+  const releases = await fetchReleasesWithFallback(options.timeoutMs ?? DEFAULT_TIMEOUT_MS)
+  if (releases.length === 0) {
+    // 连 API 与免 API 通道都拿不到 —— 按「查不到」处理
+    return null
+  }
+
+  // 按版本降序排列（同版本时以先出现者为准）
+  const sorted = releases
+    .filter((release) => !release.draft && !release.prerelease)
+    .map((release) => ({ release, version: versionFromTag(release.tag_name) }))
+    .filter((item) => item.version !== '')
+    .sort((a, b) => compareSemver(b.version, a.version))
+
+  for (const item of sorted) {
+    const assets = item.release.assets ?? []
+    // 资产列表只用于判断「该发行版是否带内核产物」。
+    // ⚠️ 绝不取其中的 browser_download_url（审计 D1/C2）：release 列表可能来自
+    // 被镜像接管的 API 响应，URL 可被指向攻击者服务器，使清单与产物摘要自洽、
+    // 供应链校验整体失效。下载地址一律按官方模板构造（见 officialAssetUrl）。
+    if (!hasAsset(assets, CONTROL_ASSET_NAME) || !hasAsset(assets, DATA_ASSET_NAME)) {
+      // 这个发行版没带完整的内核资产，跳过
+      continue
+    }
+    const tag = item.release.tag_name.trim()
+    // 版本号已由 versionFromTag 锚定校验；这里再显式拒绝路径分隔符等（审计 D6）。
+    if (!isSafeReleaseTag(tag)) continue
+    return {
+      version: item.version,
+      controlUrl: officialAssetUrl(tag, CONTROL_ASSET_NAME),
+      dataUrl: officialAssetUrl(tag, DATA_ASSET_NAME),
+      checksumsUrl: officialAssetUrl(tag, CHECKSUMS_ASSET_NAME),
+    }
+  }
+  return null
+}
+
+/**
+ * 查 Release 列表，带**镜像回退**。
+ *
+ * ## 三级通道
+ *
+ *  1. 直连 `api.github.com`
+ *  2. 镜像代理的 `api.github.com`（实测多数镜像的 API 通道不通，但有的能用）
+ *  3. **免 API 通道**：只用 `github.com` 的 URL
+ *     （`releases/latest` 的 302 里带版本号）——
+ *     这条最可靠，因为**任何下载镜像都能代理 github.com**。
+ *
+ * 第 3 条拿不到「全部资产列表」，只能按命名约定构造已知资产名的 URL。
+ * 对本项目够用：内核两个产物的名字是**固定名**。
+ *
+ * @returns 拿到的发行版列表；全失败返回空数组
+ */
+async function fetchReleasesWithFallback(timeoutMs: number): Promise<GitHubRelease[]> {
+  // ---- 通道 1 + 2：API（含镜像）----
+  const apiUrl = `${RELEASES_API}?per_page=20`
+  for (const source of apiSources(apiUrl)) {
+    try {
+      const response = await fetch(source.url, {
+        headers: {
+          Accept: 'application/vnd.github+json',
+          'User-Agent': 'CFPilot-CLI',
+        },
+        signal: AbortSignal.timeout(timeoutMs),
+      })
+      if (!response.ok) continue
+      const payload: unknown = await response.json()
+      if (!Array.isArray(payload)) continue
+      const releases = payload.filter(isGitHubRelease)
+      if (releases.length > 0) return releases
+    } catch {
+      // 试下一个源
+    }
+  }
+
+  // ---- 通道 3：免 API ----
+  const version = await fetchLatestVersionWithoutApi(timeoutMs)
+  if (!version) return []
+
+  // 按固定名构造两个内核资产的 URL
+  const controlUrl = `${RELEASES_WEB}/latest/download/${CONTROL_ASSET_NAME}`
+  const dataUrl = `${RELEASES_WEB}/latest/download/${DATA_ASSET_NAME}`
+  const pseudo: GitHubRelease = {
+    tag_name: `v${version}`,
+    draft: false,
+    prerelease: false,
+    assets: [
+      { name: CONTROL_ASSET_NAME, browser_download_url: controlUrl },
+      { name: DATA_ASSET_NAME, browser_download_url: dataUrl },
+      {
+        name: CHECKSUMS_ASSET_NAME,
+        browser_download_url: `${RELEASES_WEB}/latest/download/${CHECKSUMS_ASSET_NAME}`,
+      },
+    ],
+  }
+  return [pseudo]
+}
+
+/** 附件列表里是否带指定名字的资产。
+ *
+ * ⚠️ 只判**存在**，不取其中的 browser_download_url（审计 D1/C2）：
+ * 下载地址一律按官方模板构造，镜像 API 响应只用于发现版本与资产有无。
+ * 附件名比较统一忽略大小写（摘要清单的名字里带大写 SHA256）。
+ */
+function hasAsset(assets: GitHubAsset[], name: string): boolean {
+  const want = name.trim().toLowerCase()
+  return assets.some((asset) => asset.name.trim().toLowerCase() === want)
+}
+
+/**
+ * 远程内核是否被显式关闭。
+ *
+ * 受限网络 / 离线环境里，每次部署都去连 GitHub 会平白拖慢；
+ * 设 `CFPILOT_KERNEL_REMOTE=0` 即可只用内置内核。
+ */
+function isRemoteDisabled(): boolean {
+  const raw = process.env[REMOTE_OFF_ENV]?.trim().toLowerCase()
+  if (!raw) return false
+  return ['0', 'false', 'no', 'off'].includes(raw)
+}
+
+/** 收窄 GitHub Releases 的响应项。 */
+function isGitHubRelease(value: unknown): value is GitHubRelease {
+  if (typeof value !== 'object' || value === null) return false
+  const item = value as Record<string, unknown>
+  if (typeof item.tag_name !== 'string') return false
+  if (item.assets !== undefined && !Array.isArray(item.assets)) return false
+  return true
+}
+
+/* ------------------------------------------------------------------ */
+/* 下载与缓存                                                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 下载单个内核产物。
+ *
+ * 带 20 秒超时与 10MB 大小上限（防止下到 HTML 错误页或垃圾数据）。
+ */
+async function downloadAsset(
+  url: string,
+  timeoutMs: number,
+  options: { allowMirrors?: boolean } = {}
+): Promise<string> {
+  if (!url.trim()) throw new Error('下载地址为空')
+
+  // 直连 + 各镜像（国内直连 GitHub 经常超时）
+  //
+  // ⚠️ 校验清单**不能**走镜像：镜像若能替换产物，就能一并替换清单，
+  // 校验形同虚设（见文件头「完整性校验」）。
+  const sources =
+    options.allowMirrors === false ? [{ name: 'GitHub', url }] : downloadSources(url)
+  const errors: string[] = []
+  for (const source of sources) {
+    try {
+      const response = await fetch(source.url, {
+        headers: { 'User-Agent': 'CFPilot-CLI' },
+        signal: AbortSignal.timeout(timeoutMs),
+      })
+      if (!response.ok) {
+        errors.push(`${source.name}: HTTP ${response.status}`)
+        continue
+      }
+
+      // 先看 Content-Length，能提前拒掉明显超限的
+      const declared = response.headers.get('content-length')
+      if (declared) {
+        const size = Number(declared)
+        if (Number.isFinite(size) && size > MAX_ASSET_BYTES) {
+          errors.push(`${source.name}: 超过 ${MAX_ASSET_BYTES} 字节上限`)
+          continue
+        }
+      }
+
+      return await readBodyWithLimit(response)
+    } catch (err) {
+      errors.push(`${source.name}: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+  throw new Error(`所有下载源均失败 —— ${errors.join('；')}`)
+}
+
+/**
+ * 读取响应体，超过上限就中断。
+ *
+ * 不能直接 `res.text()`：那是**先下完再判断**，一个超大文件能把内存吃光。
+ */
+async function readBodyWithLimit(response: Response): Promise<string> {
+  const body = response.body
+  if (!body) {
+    const text = await response.text()
+    if (Buffer.byteLength(text) > MAX_ASSET_BYTES) {
+      throw new Error(`内核产物超过 ${MAX_ASSET_BYTES} 字节上限，疑似异常内容`)
+    }
+    return text
+  }
+
+  const reader = body.getReader()
+  const decoder = new TextDecoder()
+  let total = 0
+  let out = ''
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (!value) continue
+      const chunk = value as Uint8Array
+      total += chunk.byteLength
+      if (total > MAX_ASSET_BYTES) {
+        await reader.cancel().catch(() => undefined)
+        throw new Error(`内核产物超过 ${MAX_ASSET_BYTES} 字节上限，疑似异常内容`)
+      }
+      // stream: true 让跨 chunk 的多字节字符不被截断
+      out += decoder.decode(chunk, { stream: true })
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  out += decoder.decode()
+  return out
+}
+
+/** 产物名 → Release 附件名（缓存里存的是短名） */
+const ASSET_BY_SHORT_NAME: Record<string, string> = {
+  'control.js': CONTROL_ASSET_NAME,
+  'dataplane.js': DATA_ASSET_NAME,
+}
+
+/** 计算字符串的 SHA-256（小写十六进制） */
+function sha256Hex(content: string): string {
+  return createHash('sha256').update(content, 'utf8').digest('hex')
+}
+
+/**
+ * 解析 sha256sum 格式的清单。
+ *
+ * 接受：
+ *   <64 位十六进制>␣␣<文件名>
+ *   <64 位十六进制>␣*<文件名>   （二进制模式标记）
+ *   # 开头的注释与空行
+ *
+ * 其他行直接忽略 —— 清单是机器生成的，格式不对的行不该阻断正常条目。
+ */
+function parseChecksums(text: string): Map<string, string> {
+  const out = new Map<string, string>()
+  for (const raw of text.split('\n')) {
+    const line = raw.trim()
+    if (!line || line.startsWith('#')) continue
+    const match = /^([0-9a-fA-F]{64})\s+\*?(.+)$/.exec(line)
+    if (!match) continue
+    out.set(match[2]!.trim().toLowerCase(), match[1]!.toLowerCase())
+  }
+  return out
+}
+
+/**
+ * 从官方地址取校验清单（**不走镜像**）。
+ *
+ * 取不到 / 缺条目都抛错 —— 调用方据此回退本地内置内核。
+ */
+async function downloadChecksums(
+  info: RemoteKernelInfo,
+  timeoutMs: number
+): Promise<{ text: string; map: Map<string, string> }> {
+  if (!info.checksumsUrl.trim()) {
+    throw new Error(
+      `Release ${info.version} 未发布 ${CHECKSUMS_ASSET_NAME}，无法校验内核完整性`
+    )
+  }
+  const text = await downloadAsset(info.checksumsUrl, timeoutMs, { allowMirrors: false })
+  const map = parseChecksums(text)
+  for (const name of [CONTROL_ASSET_NAME, DATA_ASSET_NAME]) {
+    if (!map.has(name.toLowerCase())) {
+      throw new Error(`内核校验清单缺少 ${name} 的摘要`)
+    }
+  }
+  return { text, map }
+}
+
+/** 校验一份产物；不匹配时抛错（附期望值 / 实际值的前缀，便于排查） */
+function verifyAsset(shortName: string, content: string, map: Map<string, string>): void {
+  const assetName = ASSET_BY_SHORT_NAME[shortName]
+  if (!assetName) throw new Error(`未知内核产物：${shortName}`)
+  const expected = map.get(assetName.toLowerCase())
+  if (!expected) throw new Error(`校验清单缺少 ${assetName} 的摘要`)
+  const actual = sha256Hex(content)
+  if (actual !== expected) {
+    throw new Error(
+      `内核产物 ${assetName} 摘要不匹配（期望 ${expected.slice(0, 12)}…，实际 ${actual.slice(0, 12)}…）—— 已拒绝使用`
+    )
+  }
+}
+
+/** 缓存根目录。 */
+function cacheRoot(): string {
+  const override = process.env[CACHE_DIR_ENV]?.trim()
+  if (override) return override
+  return join(homedir(), '.cfpilot', 'kernel')
+}
+
+/** 某个版本的内核缓存目录。 */
+function cacheDir(version: string): string {
+  return join(cacheRoot(), version)
+}
+
+/** 读缓存文件；没有或为空时返回 null。 */
+async function readCached(path: string): Promise<string | null> {
+  try {
+    const text = await readFile(path, 'utf8')
+    return text.length > 0 ? text : null
+  } catch {
+    return null
+  }
+}
+
+/** 原子写缓存文件（先写临时文件再改名）。 */
+async function writeCached(path: string, content: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true })
+  // ⚠️ 临时文件必须和目标**同目录** —— 跨磁盘 rename 会失败（EXDEV）
+  const tmp = `${path}.tmp`
+  await writeFile(tmp, content, 'utf8')
+  try {
+    await rename(tmp, path)
+  } catch {
+    // 缓存写失败不影响本次使用，只是下次要重新下载
+    await writeFile(path, content, 'utf8').catch(() => undefined)
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 本地内置产物                                                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 当前模块所在目录（同时兼容 ESM 与 CJS）。
+ *
+ * CLI 以 ESM 运行（import.meta.url 可用），
+ * GUI 会把本模块打成 CJS 库（import.meta 为 undefined，需用 __dirname）。
+ */
+function moduleDir(): string {
+  try {
+    const meta = import.meta
+    if (meta && typeof meta.url === 'string') return dirname(fileURLToPath(meta.url))
+  } catch {
+    /* CJS 产物：import.meta 不存在，走下面的 __dirname */
+  }
+  return typeof __dirname === 'string' ? __dirname : process.cwd()
+}
+
+/**
+ * 读取本地内置的内核产物。
+ *
+ * 候选路径的含义：
+ *   - `../worker-core/dist/`   打包后（packages/cli/dist/）的同级目录
+ *   - `../../worker-core/dist/` 开发时（packages/cli/src/deploy/）的仓库根
+ *   - `../assets/`             npm 包内置资产（packages/cli/assets/）
+ *   - `../../assets/`          源码目录下的同一份资产
+ *   - `cwd/packages/worker-core/dist/` 以仓库根为 cwd 时的兜底
+ */
+export async function loadBuiltinBundle(fileName: string): Promise<string> {
+  const override = process.env[LOCAL_DIR_ENV]?.trim()
+  const candidates = override
+    ? [resolve(override, fileName)]
+    : [
+        resolve(moduleDir(), `../worker-core/dist/${fileName}`),
+        resolve(moduleDir(), `../../worker-core/dist/${fileName}`),
+        resolve(moduleDir(), `../assets/${fileName}`),
+        resolve(moduleDir(), `../../assets/${fileName}`),
+        resolve(process.cwd(), `packages/worker-core/dist/${fileName}`),
+      ]
+  for (const candidate of candidates) {
+    try {
+      const text = await readFile(candidate, 'utf8')
+      if (text.length > 0) return text
+    } catch {
+      /* 试下一个 */
+    }
+  }
+  throw new Error(
+    `未找到 ${fileName}，请先执行 npm run build -w @cfpilot/worker-core`
+  )
+}
+
+/** 从产物源码里提取构建指纹；读不到返回空串。 */
+export function extractBuildVersion(source: string): string {
+  const matched = BUILD_RE.exec(source)
+  if (matched?.[1]) return matched[1]
+  const numeric = BUILD_NUMERIC_RE.exec(source)
+  if (numeric?.[1]) return numeric[1]
+  return ''
+}
+
+/* ------------------------------------------------------------------ */
+/* 内核热更新通道（固定滚动 Release，与包版本解耦）                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 固定滚动 tag：内核热更新通道。
+ *
+ * ## 为什么需要独立通道
+ *
+ * 包 Release 的内核资产以 **tag 的包版本号**参与「最新」判定 ——
+ * 只改内核时不发新包，这条通道就永远看不到新内核。
+ * 固定 tag `kernel-latest` 由内核发布工作流单独维护（覆盖上传），
+ * 内核序号只随内核变动递增，与包版本完全无关。
+ */
+export const KERNEL_CHANNEL_TAG = 'kernel-latest'
+/** 通道版本清单的资产名。 */
+export const KERNEL_VERSION_ASSET = 'cfpilot-kernel-VERSION'
+
+/** 通道基址（测试用环境变量可覆盖；空 = 官方 kernel-latest）。 */
+const KERNEL_CHANNEL_BASE_ENV = 'CFPILOT_KERNEL_CHANNEL_BASE'
+
+/** 通道资产下载地址（测试基址可覆盖；镜像代理由 downloadAsset 自理）。 */
+function channelAssetUrl(asset: string): string {
+  const base = process.env[KERNEL_CHANNEL_BASE_ENV]?.trim()
+  if (base) return `${base.replace(/\/+$/, '')}/${asset}`
+  return `${RELEASES_WEB}/download/${KERNEL_CHANNEL_TAG}/${asset}`
+}
+
+/** 内核版本清单。 */
+export interface KernelVersionManifest {
+  /**
+   * 内核序号（UTC `yyyymmddHHMM`，纯数字单调递增）。
+   *
+   * BUILD_VERSION 是内容哈希、比不了先后，通道必须另有一个能比大小的量。
+   * 序号只由内核发布工作流写入；包内置清单的序号取打包时的构建时间，
+   * 因此「包比内核后发布」时内置序号天然 ≥ 最新内核序号，不会误判有新版。
+   */
+  seq: number
+  /** 构建指纹（BUILD_VERSION）；同序号时用于识别内容变化。 */
+  build: string
+  /** 最低工具版本（空串 = 未声明）；旧工具不得部署比它新的协议内核。 */
+  minToolVersion: string
+}
+
+/** 解析通道版本清单；格式不对返回 null（调用方按「通道不可用」处理）。 */
+export function parseKernelVersionManifest(text: string): KernelVersionManifest | null {
+  try {
+    const raw = JSON.parse(text) as Record<string, unknown>
+    const seq = Number(raw.seq)
+    if (!Number.isFinite(seq) || !Number.isInteger(seq) || seq <= 0) return null
+    const build = typeof raw.build === 'string' ? raw.build.trim() : ''
+    const minToolVersion = typeof raw.minToolVersion === 'string' ? raw.minToolVersion.trim() : ''
+    return { seq, build, minToolVersion }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 通道内核是否比内置新：序号更高；同序号但构建指纹不同也算新
+ * （同序号重新覆盖发布时，内容哈希是唯一的内容变化证据）。
+ */
+export function isChannelNewer(
+  channel: KernelVersionManifest,
+  builtin: KernelVersionManifest
+): boolean {
+  if (channel.seq > builtin.seq) return true
+  return (
+    channel.seq === builtin.seq &&
+    channel.build !== '' &&
+    builtin.build !== '' &&
+    channel.build !== builtin.build
+  )
+}
+
+/** 查询通道最新内核清单；失败返回 null（离线 / 通道未发布都是正常情况）。 */
+async function fetchChannelVersion(timeoutMs: number): Promise<KernelVersionManifest | null> {
+  try {
+    // 只取 ~100 字节的清单就能决定要不要下载产物本体；
+    // 清单内容只影响「要不要拉新」，最终产物仍要过官方清单的摘要校验，
+    // 被篡改的清单最多引发一次注定失败的下载，不构成安全问题。
+    const text = await downloadAsset(channelAssetUrl(KERNEL_VERSION_ASSET), timeoutMs)
+    return parseKernelVersionManifest(text)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 读取包内置的内核版本清单（打包时的内核序号锚点）。
+ *
+ * 读不到时返回 seq=0 的兜底 —— 旧包没有这个文件，
+ * 此时任何通道内核都视为「更新」。
+ */
+export async function loadBuiltinKernelVersion(): Promise<KernelVersionManifest> {
+  const override = process.env[LOCAL_DIR_ENV]?.trim()
+  const candidates = override
+    ? [resolve(override, KERNEL_VERSION_ASSET)]
+    : [
+        resolve(moduleDir(), `../assets/${KERNEL_VERSION_ASSET}`),
+        resolve(moduleDir(), `../../assets/${KERNEL_VERSION_ASSET}`),
+        resolve(moduleDir(), `../../worker-core/dist/${KERNEL_VERSION_ASSET}`),
+        resolve(process.cwd(), `packages/worker-core/dist/${KERNEL_VERSION_ASSET}`),
+      ]
+  for (const candidate of candidates) {
+    try {
+      const text = await readFile(candidate, 'utf8')
+      const parsed = parseKernelVersionManifest(text)
+      if (parsed) return parsed
+    } catch {
+      /* 试下一个 */
+    }
+  }
+  return { seq: 0, build: '', minToolVersion: '' }
+}
+
+/**
+ * 「现在部署会用哪一份内核」——与桌面版的 `kernel.ResolveTarget` 一一对应。
+ *
+ * ## 为什么需要它（真机缺陷 2026-11-23）
+ *
+ * 早前各处拿「通道序号」去比「包里内置的锚点」。内置锚点只在发新包时变，
+ * 而「更新内核」更新的是**线上部署** —— 于是部署完再看，结论仍是
+ * 「有更新」，提示永远消不掉。
+ *
+ * 现在的判据只有一个：**线上已部署的 build** 与这里的 `build` 是否相同。
+ */
+export interface KernelTarget {
+  /** 本次部署会用的内核 build（通道比内置新时用通道的，否则用内置的） */
+  build: string
+  /** 展示用版本号（通道为 k<seq>，否则为工具版本） */
+  version: string
+  /** 通道清单（通道不可用时为 null） */
+  channel: KernelVersionManifest | null
+  /** 是否用通道内核（通道比内置新） */
+  fromChannel: boolean
+  /** 通道内核要求更高的工具版本 → 本次不升级 */
+  blocked: boolean
+}
+
+/** 解析「现在部署会用的内核」，不下载产物（秒级返回）。 */
+export async function resolveKernelTarget(
+  currentVersion: string,
+  timeoutMs = DEFAULT_TIMEOUT_MS
+): Promise<KernelTarget> {
+  const builtin = await loadBuiltinKernelVersion()
+  const target: KernelTarget = {
+    build: builtin.build,
+    version: currentVersion,
+    channel: null,
+    fromChannel: false,
+    blocked: false,
+  }
+
+  const channel = await fetchChannelVersion(timeoutMs)
+  if (!channel) return target
+
+  target.channel = channel
+
+  if (channel.minToolVersion && compareSemver(currentVersion, channel.minToolVersion) < 0) {
+    target.blocked = true
+    return target
+  }
+  // ⚠️ 版本号只在**真的用通道内核**时才换成 k<序号> ——
+  // 通道比内置旧时部署仍用内置，展示通道序号会让人以为目标是通道内核。
+  if (isChannelNewer(channel, builtin)) {
+    target.build = channel.build
+    target.version = `k${channel.seq}`
+    target.fromChannel = true
+  }
+  return target
+}
+
+/**
+ * 线上已部署的内核是否与「现在部署会用的那份」不同。
+ *
+ * deployedBuild 为空表示线上版本未知 —— 返回 true（提示去部署页确认）。
+ */
+export function hasKernelUpdate(
+  target: KernelTarget,
+  deployedBuild: string | null | undefined
+): boolean {
+  if (target.blocked) return false
+  const want = String(target.build ?? '').trim()
+  if (!want) return false
+  const online = String(deployedBuild ?? '').trim()
+  if (!online) return true
+  return want.toLowerCase() !== online.toLowerCase()
+}
+
+/**
+ * 取通道内核产物（清单官方直连校验 + 缓存复验，与包 Release 通道同口径）。
+ */
+async function fetchChannelKernel(
+  channel: KernelVersionManifest,
+  timeoutMs: number
+): Promise<{ control: string; data: string }> {
+  // seq 已由 parseKernelVersionManifest 校验为正整数，拼进缓存目录无路径穿越。
+  const info: RemoteKernelInfo = {
+    version: `k${channel.seq}`,
+    controlUrl: channelAssetUrl(CONTROL_ASSET_NAME),
+    dataUrl: channelAssetUrl(DATA_ASSET_NAME),
+    checksumsUrl: channelAssetUrl(CHECKSUMS_ASSET_NAME),
+  }
+  return await fetchRemoteKernel(info, timeoutMs)
+}
+
+
+/* ------------------------------------------------------------------ */
+/* 对外主入口                                                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 取「应该用于部署」的内核。
+ *
+ * 三级选择：
+ *   1. 内核热更新通道（`kernel-latest` 固定 tag）：序号比内置新 → 用通道内核；
+ *   2. 包 Release 通道：tag 版本比 currentVersion 新 → 用 Release 内核；
+ *   3. 本地内置。
+ *
+ * 网络失败（离线 / 限流 / 下载中断）**不会抛错**，一律回退本地内置产物，
+ * 并在 `source` 里标明来源是「内置」。
+ *
+ * @param currentVersion 当前应用版本（semver），用于兼容护栏与 Release 通道比较
+ * @param options.log 日志回调（用于提示「远程不可用，已回退内置」）
+ */
+export async function loadKernelBundle(
+  currentVersion: string,
+  options: { log?: (message: string) => void; timeoutMs?: number } = {}
+): Promise<KernelBundle> {
+  const log = options.log ?? (() => {})
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+
+  // ---- 1. 内核热更新通道（固定滚动 tag，与包版本解耦）----
+  //
+  // 只改内核、不发新包时，只有这条通道能看到新内核。
+  // 通道不可用（离线 / 尚未发布过）→ 静默走下一级，不打扰用户。
+  const channel = await fetchChannelVersion(timeoutMs)
+  if (channel) {
+    if (channel.minToolVersion && compareSemver(currentVersion, channel.minToolVersion) < 0) {
+      // 兼容护栏：旧工具不部署比它新的协议内核，明确要求先升级工具。
+      log(
+        `· 远程内核 k${channel.seq} 要求工具版本 ≥ ${channel.minToolVersion}，当前 ${currentVersion}` +
+          ' —— 请先升级 CLI / 桌面版，再更新内核'
+      )
+    } else {
+      const builtin = await loadBuiltinKernelVersion()
+      if (isChannelNewer(channel, builtin)) {
+        try {
+          const bundle = await fetchChannelKernel(channel, timeoutMs)
+          return {
+            control: bundle.control,
+            data: bundle.data,
+            version: currentVersion,
+            source: `远程内核 k${channel.seq}（${channel.build || 'build 未知'}，已校验）`,
+          }
+        } catch (err) {
+          log(
+            `· 远程内核 k${channel.seq} 获取失败，改用内置内核 ${currentVersion}（部署照常进行）：` +
+              (err instanceof Error ? err.message : String(err))
+          )
+          log(`  → 当前访问方式：${describeProxy()}`)
+        }
+      }
+    }
+  }
+
+  // ---- 2. 包 Release 通道（降级：tag 版本比较）----
+  const remote = await fetchRemoteKernelInfo({ timeoutMs })
+
+  if (remote && compareSemver(remote.version, currentVersion) > 0) {
+    try {
+      const bundle = await fetchRemoteKernel(remote, timeoutMs)
+      return {
+        control: bundle.control,
+        data: bundle.data,
+        version: remote.version,
+        source: `远程 ${remote.version}（已校验）`,
+      }
+    } catch (err) {
+      // 远程下载失败 → 落回本地内置（不抛错：离线是正常情况）
+      //
+      // ⚠️ 文案要说清：部署**照常进行**，且本地内核与当前版本一致 ——
+      //    否则用户会以为部署失败了。
+      log(
+        `· 远程内核 ${remote.version} 获取失败，改用内置内核 ${currentVersion}（部署照常进行）：` +
+          (err instanceof Error ? err.message : String(err))
+      )
+      log(`  → 内置内核与当前版本一致，功能完整；当前访问方式：${describeProxy()}`)
+      log('  → 想要更新的内核请设置 HTTPS_PROXY 后重试')
+    }
+  }
+
+  // ---- 3. 本地内置 ----
+  const control = await loadBuiltinBundle('control.js')
+  const data = await loadBuiltinBundle('dataplane.js')
+  return {
+    control,
+    data,
+    version: currentVersion,
+    source: `内置 ${currentVersion}`,
+  }
+}
+
+/**
+ * 取指定版本的远程内核产物（优先命中缓存）。
+ */
+async function fetchRemoteKernel(
+  info: RemoteKernelInfo,
+  timeoutMs: number
+): Promise<{ control: string; data: string }> {
+  const dir = cacheDir(info.version)
+  const controlPath = join(dir, 'control.js')
+  const dataPath = join(dir, 'dataplane.js')
+
+  // ---- 1. 每次部署都从官方地址重取校验清单 ----
+  //
+  // ⚠️ 缓存里的 SHA256SUMS **不作信任锚**（审计 C5）：能写缓存目录的本机攻击者
+  // 可同时植入恶意产物与配套清单，校验自洽通过、无需触网。清单体积很小，
+  // 每次官方重取；缓存只用于产物本体（产物仍逐个对照官方清单校验）。
+  const { map: sums } = await downloadChecksums(info, timeoutMs)
+
+  // ---- 2. 缓存命中也要校验（缓存文件同样会被篡改或写坏）----
+  let control = await readCached(controlPath)
+  let data = await readCached(dataPath)
+  if (control) {
+    try {
+      verifyAsset('control.js', control, sums)
+    } catch {
+      control = null
+      await unlink(controlPath).catch(() => undefined)
+    }
+  }
+  if (data) {
+    try {
+      verifyAsset('dataplane.js', data, sums)
+    } catch {
+      data = null
+      await unlink(dataPath).catch(() => undefined)
+    }
+  }
+  if (control && data) return { control, data }
+
+  // ---- 3. 下载（允许镜像）并逐个校验 ----
+  control ??= await downloadAsset(info.controlUrl, timeoutMs)
+  verifyAsset('control.js', control, sums)
+  data ??= await downloadAsset(info.dataUrl, timeoutMs)
+  verifyAsset('dataplane.js', data, sums)
+  if (!control.trim()) throw new Error('下载到的控制面产物为空')
+  if (!data.trim()) throw new Error('下载到的数据面产物为空')
+
+  // ---- 4. 落缓存（失败不影响本次使用，只是下次要重新下载）----
+  // 只缓存产物本体；清单每次官方重取，不落缓存（审计 C5）。
+  await writeCached(controlPath, control).catch(() => undefined)
+  await writeCached(dataPath, data).catch(() => undefined)
+
+  return { control, data }
+}

@@ -1,0 +1,1507 @@
+/**
+ * CFPilot 界面适配层（Go 版专用）
+ *
+ * ## 这个文件解决什么问题
+ *
+ * 界面的业务代码（renderer.ts，1100+ 行）到处调用
+ * `window.cfpilot.xxx()` —— 那是 Electron 的 preload 注入的 IPC 桥。
+ * Go 版没有 preload，只有 HTTP 接口。
+ *
+ * 本文件在 window 上造一个**与 Electron 版完全同形**的 `window.cfpilot` 对象，
+ * 内部把每个方法翻译成 `fetch('/api/...')`。
+ *
+ * 于是：
+ *   - renderer.ts **一行都不用改**
+ *   - 两个版本共用同一份界面源码
+ *   - 以后改界面只需改一处
+ *
+ * ## 加载顺序（重要）
+ *
+ * index.html 里必须先加载本文件、再加载 renderer.js：
+ *
+ *   <script src="./adapter.js"></script>
+ *   <script src="./renderer.js"></script>
+ *
+ * renderer.ts 在 DOMContentLoaded 时就取 `window.cfpilot` 并调用，
+ * 晚一步就拿到 undefined。
+ *
+ * ## 事件推送：SSE → 回调
+ *
+ * Electron 的 `onLog(cb)` 是 `webContents.send` 的订阅；
+ * 这里用**一条**共享的 EventSource 连接，把四种事件分发给各自的回调列表。
+ * 每个界面通常只调一次 onXxx，但允许多个订阅者（便于将来分模块）。
+ */
+(function () {
+  'use strict'
+
+  /* ------------------------------------------------------------------ */
+  /* 会话建立（关键：一切 API 的前置条件）                                */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * 用 URL 里的 `?t=<启动令牌>` 换取会话 Cookie。
+   *
+   * ## 为什么必须有这一步（2026-10-26 真实故障）
+   *
+   * 后端的安全模型是：
+   *   1. 启动时生成一次性令牌，拼在欢迎 URL 里：`/?t=abc123`
+   *   2. 前端用这个令牌请求 `/__session?t=abc123`，后端返回
+   *      `Set-Cookie: cfpilot_session=...; HttpOnly; SameSite=Strict`
+   *   3. 之后所有 `/api/*` 请求靠这个 Cookie 鉴权
+   *
+   * **但最初的实现里，前端从来没有调用过 `/__session`** ——
+   * 结果所有 API 都是 401，界面上「添加并保存」直接报
+   * 「未授权：请从托盘菜单打开界面」。
+   *
+   * 更隐蔽的是：我用 curl / Invoke-WebRequest 测试时**手动调了 `/__session`**，
+   * 所以自动化测试全过 —— 典型的「测试用手动步骤掩盖了真实缺陷」。
+   * 只有真实浏览器打开界面才暴露。
+   *
+   * ## 为什么要返回 Promise
+   *
+   * 会话建立必须**先完成**，否则后续 window.cfpilot 的任何调用都会 401。
+   * 所以这里把 Promise 存起来，`call()` 里 await 它。
+   */
+  const sessionReady = (function establishSession() {
+    // 从 URL 取启动令牌
+    var params = new URLSearchParams(location.search)
+    var bootToken = params.get('t') || ''
+
+    if (!bootToken) {
+      // 没有令牌：可能是**刷新后 URL 被清理**（令牌用过即从地址栏抹掉），
+      // 或用户直接访问根路径。
+      //
+      // ⚠️ **Cookie 可能仍然有效** —— 不能就此判定「会话未建立」。
+      //
+      // 之前这里直接 `return Promise.resolve(false)`，
+      // 于是刷新页面后 `ensureStream()` 认为会话没了 → **SSE 永远不建立**
+      // → 实时日志（优选进度、部署日志）全部收不到。
+      // 表现：点「开始优选」后运行日志窗口一片空白。
+      //
+      // 先用首页下发的短期 BootCookie 换取当前浏览器自己的会话；
+      // 如果已有 session Cookie，则服务端会返回新的独立会话，多个浏览器互不覆盖。
+      return fetch('/__session', {
+        method: 'GET',
+        credentials: 'same-origin',
+      })
+        .then(function (res) {
+          if (res.ok) return true
+          // 兼容旧服务：没有 BootCookie 时再探测已有 session Cookie。
+          return fetch('/api/service/status', { credentials: 'same-origin' }).then(function (probe) {
+            return probe.ok
+          })
+        })
+        .catch(function () {
+          return false
+        })
+    }
+
+    return fetch('/__session?t=' + encodeURIComponent(bootToken), {
+      method: 'GET',
+      credentials: 'same-origin',
+    })
+      .then(function (res) {
+        if (!res.ok) {
+          console.error('[cfpilot] 会话建立失败（HTTP ' + res.status + '），可能是启动令牌已失效')
+          return false
+        }
+        return true
+      })
+      .catch(function (err) {
+        console.error('[cfpilot] 会话建立失败', err)
+        return false
+      })
+      .then(function (ok) {
+        // 令牌用过就从地址栏抹掉，避免：
+        //   1. 减少令牌留在地址栏、截图和分享中的机会
+        //   2. 截图/分享时泄露令牌
+        try {
+          if (ok && location.search) {
+            var clean = location.pathname + location.hash
+            history.replaceState(null, '', clean)
+          }
+        } catch (e) {
+          /* 某些环境（file://）不支持，忽略 */
+        }
+        return ok
+      })
+  })()
+
+  /* ------------------------------------------------------------------ */
+  /* 基础请求                                                            */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * 调用后端 API。
+   *
+   * 约定：后端返回 { error: '...' } 时抛异常 ——
+   * 与 Electron 版 ipcRenderer.invoke 抛异常的行为对齐，
+   * 界面的 try/catch 不用改。
+   *
+   * ⚠️ 所有请求都先 `await sessionReady`：会话没建好就发请求必然 401。
+   */
+  async function call(method, path, body) {
+    // 等会话建立完成（已建立则立即返回）
+    if (!(await sessionReady)) {
+      throw new Error('当前浏览器尚未授权：请使用托盘打开的完整欢迎链接；不同浏览器不共享登录 Cookie。')
+    }
+
+    const opts = {
+      method: method,
+      headers: { 'Content-Type': 'application/json' },
+      // 带上 Cookie（会话鉴权靠它），并显式禁缓存避免移动 WebView 读到旧账户列表
+      credentials: 'same-origin',
+      cache: 'no-store',
+    }
+    if (body !== undefined) opts.body = JSON.stringify(body)
+
+    // ⚠️ **网络层失败要给出可诊断的提示**。
+    //
+    // `fetch` 抛出的 TypeError 消息固定是 "Failed to fetch" ——
+    // 用户看到「读取日志失败：Failed to fetch」完全不知道发生了什么。
+    // 最常见的原因就是**本地服务已经退出**（崩溃 / 被托盘菜单关掉）。
+    let res
+    try {
+      res = await fetch(path, opts)
+    } catch (err) {
+      throw new Error(
+        '无法连接本地服务（可能已退出，请从托盘菜单重新打开 CFPilot）：' +
+          (err && err.message ? err.message : String(err))
+      )
+    }
+    let data = null
+    const text = await res.text()
+    if (text) {
+      try {
+        data = JSON.parse(text)
+      } catch {
+        data = null
+      }
+    }
+
+    if (!res.ok) {
+      const msg =
+        (data && data.error) ||
+        (res.status === 401
+          ? '未授权：请从托盘菜单重新打开界面'
+          : '请求失败（HTTP ' + res.status + '）')
+      throw new Error(msg)
+    }
+    if (data && typeof data === 'object' && typeof data.error === 'string' && data.error) {
+      // 200 但带 error 字段（部分接口这么用）
+      throw new Error(data.error)
+    }
+    return data
+  }
+
+  const post = (path, body) => call('POST', path, body === undefined ? {} : body)
+  const get = (path) => call('GET', path)
+
+  /* ------------------------------------------------------------------ */
+  /* SSE 事件总线                                                        */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * 各事件的订阅者列表。
+   *
+   * ⚠️ 这里必须与后端 `s.events.publish(...)` 的**全部 9 个事件**一一对应：
+   * deploy-status / log / relay-progress / relay-result / scan-result /
+   * task-status / update-done / update-progress / edge-result。
+   *
+   * 漏一个键的后果（2026-11-05 真机）：relay-result / relay-progress 没声明，
+   * 界面启动调 onRelayResult / onRelayProgress 时 subscribe() 里的
+   * `listeners[name].push(cb)` 直接抛
+   * 「Cannot read properties of undefined (reading 'push')」，
+   * 被 safeBind 捕获成「初始化「反代优选」失败」，且这两类 SSE 推送永远收不到。
+   *
+   * 新增 SSE 事件时，除了在这里登记，还要跑
+   * `node scripts/check-adapter-contract.mjs`（会静态核对订阅名 ⊆ 本表）。
+   */
+  const listeners = {
+    log: [],
+    'deploy-status': [],
+    'scan-result': [],
+    'relay-result': [],
+    'relay-progress': [],
+    'update-progress': [],
+    'update-done': [],
+    'task-status': [],
+    'edge-result': [],
+  }
+
+  let es = null
+  let esReady = false
+
+  /**
+   * 给 SSE 连接注册单个事件的分发器。
+   *
+   * 抽成独立函数，是为了让 subscribe() 遇到「运行时才出现的事件名」时
+   * 也能补注册 —— openStream 只在建连那一刻遍历一次 Object.keys(listeners)，
+   * 之后新增的键不会再 addEventListener，推送会静默丢失。
+   */
+  function bindEvent(name) {
+    es.addEventListener(name, function (e) {
+      let payload = null
+      try {
+        payload = JSON.parse(e.data)
+      } catch {
+        return
+      }
+      const cbs = listeners[name] || []
+      cbs.forEach(function (cb) {
+        try {
+          cb(payload)
+        } catch (err) {
+          // 单个回调出错不能影响其它订阅者
+          console.error('[cfpilot] 事件回调异常', name, err)
+        }
+      })
+    })
+  }
+
+  /**
+   * 真正建立 SSE 连接。
+   *
+   * 只在**会话已建立**之后才调用 —— 见 ensureStream 的说明。
+   */
+  function openStream() {
+    if (es) return
+    es = new EventSource('/api/events')
+
+    es.addEventListener('open', function () {
+      esReady = true
+    })
+
+    // 只遍历「已登记」的事件名；漏登记的事件在 subscribe() 里会被补注册。
+    Object.keys(listeners).forEach(bindEvent)
+
+    es.addEventListener('error', function () {
+      esReady = false
+      // ⚠️ **必须把 es 置空**，否则这条连接就彻底废了。
+      //
+      // EventSource 的规范行为：收到**非 200 响应**（比如 401）时，
+      // 浏览器会「永久失败」这条连接 —— **不会自动重连**。
+      // 而 es 变量还指着这个已死的对象 → ensureStream() 里的
+      // `if (es) return` 会认为「已经建好了」→ 永远不再重建。
+      //
+      // 症状：界面能打开、按钮能点，但**实时日志一条都不来**
+      //（只有界面自己打的日志有）。
+      //
+      // 所以这里主动清空，让下次 ensureStream() 能重建。
+      // （网络类错误 EventSource 自己会重连，但那种情况
+      //   readyState 是 CONNECTING 而不是 CLOSED，不该重建。）
+      if (es && es.readyState === 2 /* CLOSED */) {
+        es = null
+      }
+    })
+  }
+
+  /**
+   * 建立（或复用）SSE 连接。
+   *
+   * ## ⚠️ 必须等会话建立完成再连
+   *
+   * `/api/events` 走会话校验，没有 Cookie 就是 **401**。
+   * 而 EventSource 收到非 200 响应会**永久失败**（不重连）——
+   * 于是「会话 Cookie 还没种下就发起 SSE」会一次性毁掉整条推送通道。
+   *
+   * 真实故障（2026-10-28）：`sessionReady` 的 fetch 与
+   * `new EventSource(...)` 几乎同时发出，EventSource 先落地 → 401 →
+   * 之后**整个会话都收不到任何实时日志**，
+   * 表现为「点开始部署只显示『开始部署』，后面再没有新日志」。
+   *
+   * 现在改成：等 `sessionReady` 落地后再建连接。
+   */
+  function ensureStream() {
+    if (es) return
+    if (!sessionReady) return
+    sessionReady.then(function (ok) {
+      if (es) return
+      if (!ok) {
+        console.error('[cfpilot] 会话已失效，实时日志不可用（请从托盘菜单重新打开界面）')
+        return
+      }
+      openStream()
+    })
+  }
+
+  /**
+   * 订阅一个事件。
+   *
+   * 返回取消订阅函数 —— 与 Electron 版的 `onXxx` 返回值语义一致
+   * （renderer.ts 里会保存返回值并在必要时调用）。
+   */
+  function subscribe(name, cb) {
+    if (typeof cb !== 'function') return function () {}
+    if (!listeners[name]) {
+      // 兜底：即使将来新增事件忘了在 listeners 里登记，也不能让界面初始化
+      // 崩在 `undefined.push` 上；同时补注册分发器，保证推送真的能收到。
+      listeners[name] = []
+      if (es) bindEvent(name)
+    }
+    listeners[name].push(cb)
+    ensureStream()
+    return function () {
+      const i = listeners[name].indexOf(cb)
+      if (i >= 0) listeners[name].splice(i, 1)
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* window.cfpilot —— 与 Electron preload 同形                          */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * 兼容 Electron 版的参数形态。
+   *
+   * Electron 版里 `runDeploy(params, kvNamespaceId)` 是两个参数，
+   * 这里合并成一个对象再发给后端。
+   */
+  function mergeDeployParams(params, kvNamespaceId) {
+    const out = Object.assign({}, params || {})
+    if (kvNamespaceId) out.kvNamespaceId = kvNamespaceId
+    return out
+  }
+
+  const api = {
+    /* ---------------- 构建变体 ---------------- */
+
+    meshEnabled: function () {
+      return get('/api/mesh/enabled').then(function (r) { return !!(r && r.enabled) })
+    },
+
+    /* ---------------- 部署 ---------------- */
+
+    runDeploy: function (params, kvNamespaceId) {
+      return post('/api/deploy/run', mergeDeployParams(params, kvNamespaceId))
+    },
+
+    checkDeployed: function (kvNamespaceId) {
+      return post('/api/deploy/check', { kvNamespaceId: kvNamespaceId || '' })
+    },
+
+    // 读取清单里保存的面板凭据（面板地址 / 密码 / UUID / WS 路径）。
+    //
+    // 云端环境变量是加密的，所以这是用户拿回面板密码的唯一途径。
+    getDeployCredentials: function (kvNamespaceId) {
+      return post('/api/deploy/credentials', { kvNamespaceId: kvNamespaceId || '' })
+    },
+
+    /* ---------------- 凭据与账户 ----------------
+     *
+     * ## ⚠️ 返回值必须与 Electron 版**逐字段一致**（2026-10-26 严重故障）
+     *
+     * 界面代码（renderer.ts）是按 Electron 版的桥接契约写的，
+     *
+     *     const saved = await window.cfpilot.updateProfile(id, {...})
+     *     if (!saved.ok) { log('新建账户失败：' + saved.error) }
+     *
+     * 我最初让适配层返回 `r.profile`（对象），于是 `saved.ok` 是 undefined
+     * → **永远判定为失败**，而且 createProfile 已经先创建了一条记录，
+     * 点几次就多几条「○ 新账户」。
+     *
+     * 正确契约（来自 packages/gui/src/main/bridge.ts）：
+     *
+     *   saveCredentials      → { saved: boolean }
+     *   wipeCredentials      → { wiped: boolean }
+     *   listProfiles         → ProfileView[]  ← 每项必须带 active 字段
+     *   createProfile        → ProfileView
+     *   updateProfile        → { ok: boolean, error?: string }
+     *   deleteProfile        → { deleted: boolean, activeId: string }
+     *   switchProfile        → { ok: boolean, activeId: string }
+     *   currentProfile       → ProfileView | null
+     *   credentialsState     → { hasToken, accountId, kvNamespaceId }
+     */
+
+    saveCredentials: function (input) {
+      // 后端返回 { ok, profile }；Electron 版返回 { saved }。
+      // 原样透传会让 `result.saved` 是 undefined，界面无法判断成功。
+      return post('/api/cred/save', input || {}).then(function () {
+        return { saved: true }
+      })
+    },
+
+    wipeCredentials: function () {
+      return post('/api/cred/wipe').then(function () {
+        return { wiped: true }
+      })
+    },
+
+    credentialsState: function () {
+      // 后端已返回 { hasToken, accountId, kvNamespaceId, ... }，字段名一致
+      return get('/api/cred/state')
+    },
+
+    listProfiles: function () {
+      // ⚠️ 必须给每一项补上 `active` 字段。
+      // 后端返回的是 { profiles, activeId } —— profiles 里没有 active，
+      // 而界面用 `profiles.find(p => p.active)` 找当前账户，
+      // 不补就会永远是 undefined → 下拉框选不中、切换逻辑失效。
+      return get('/api/profile/list').then(function (r) {
+        var list = (r && r.profiles) || []
+        var activeId = (r && r.activeId) || ''
+        return list.map(function (p) {
+          return Object.assign({}, p, { active: p.id === activeId })
+        })
+      })
+    },
+
+    createProfile: function (name, init) {
+      var body = { name: name || '' }
+      if (init && typeof init === 'object') {
+        if (typeof init.cfToken === 'string') body.cfToken = init.cfToken
+        if (typeof init.accountId === 'string') body.accountId = init.accountId
+      }
+      return post('/api/profile/create', body).then(function (r) {
+        var p = (r && r.profile) || null
+        if (!p) throw new Error('新建账户失败：后端没有返回账户信息')
+        // 与 listProfiles 保持一致：新建的账户即为激活项
+        return Object.assign({}, p, { active: true })
+      })
+    },
+
+    updateProfile: function (id, patch) {
+      // ⚠️ 返回 { ok, error? }，不是 profile 对象
+      return post('/api/profile/update', Object.assign({ id: id }, patch || {}))
+        .then(function () {
+          return { ok: true }
+        })
+        .catch(function (err) {
+          return { ok: false, error: err && err.message ? err.message : String(err) }
+        })
+    },
+
+    deleteProfile: function (id) {
+      // 后端返回 { deleted, activeId }，与 Electron 版一致
+      return post('/api/profile/delete', { id: id })
+    },
+
+    switchProfile: function (id) {
+      // 后端返回 { ok, activeId }，与 Electron 版一致
+      return post('/api/profile/switch', { id: id })
+    },
+
+    currentProfile: function () {
+      return get('/api/profile/current').then(function (r) {
+        var p = (r && r.profile) || null
+        return p ? Object.assign({}, p, { active: true }) : null
+      })
+    },
+
+    /* ---------------- 账号与 KV ---------------- */
+
+    detectAccount: function (profileId) {
+      var body = profileId ? { profileId: profileId } : {}
+      return post('/api/account/detect', body)
+    },
+
+    // 链式代理：取内嵌脚本（原文 + 手动执行命令）
+    chainScript: function () {
+      return get('/api/chain/script')
+    },
+
+    // 链式代理：本机 ssh 远程执行部署脚本。
+    //
+    // ⚠️ 这是一个**长请求**（装 sing-box + 起 systemd，慢机器上要几十秒），
+    // 所以不走 post() 的默认超时策略 —— 见下方 call 的实现说明。
+    // 后端上限 3 分钟，超时会带着已收到的输出返回 ok:false。
+    chainDeploy: function (params) {
+      return post('/api/chain/run', {
+        host: (params && params.host) || '',
+        port: (params && params.port) || 1080,
+      })
+    },
+
+    listKvOptions: function (accountId) {
+      // ⚠️ 返回 `{ options: [...] }`，不是裸数组！
+      //
+      // 界面代码是：
+      //     const result = await window.cfpilot.listKvOptions(id)
+      //     kvOptions = result.options        ← 期望对象外壳
+      //
+      // 早期我返回裸数组，于是 result.options 是 undefined，
+      // 后面 kvOptions.filter(...) 直接抛
+      // 「Cannot read properties of undefined (reading 'length')」。
+      return post('/api/kv/list', { accountId: accountId || '' }).then(function (r) {
+        return { options: (r && r.options) || [] }
+      })
+    },
+
+    createKvNamespace: function (accountId, title) {
+      // 界面期望直接拿到 { id, title }，后端返回的也是这个形状
+      return post('/api/kv/create', {
+        accountId: accountId || '',
+        title: title || '',
+      })
+    },
+
+    /* ---------------- 优选 ---------------- */
+
+    runScan: function (params) {
+      // Electron 版是「等扫描完成再 resolve」，这里保持同样语义：
+      // 启动扫描后等待 scan-result 事件，拿到结果再 resolve。
+      // 这样 renderer.ts 里 `const result = await api.runScan(...)`
+      // 那一行完全不用改。
+      return new Promise(function (resolve, reject) {
+        let settled = false
+
+        const unsub = subscribe('scan-result', function (payload) {
+          if (settled) return
+          settled = true
+          unsub()
+          clearTimeout(timer)
+          if (payload && payload.ok === false) {
+            reject(new Error((payload && payload.error) || '优选失败'))
+          } else {
+            resolve(payload)
+          }
+        })
+
+        // 兜底超时：扫描最长按 10 分钟算（候选多 + 网络慢）
+        const timer = setTimeout(function () {
+          if (settled) return
+          settled = true
+          unsub()
+          reject(new Error('优选超时（超过 10 分钟未返回结果）'))
+        }, 10 * 60 * 1000)
+
+        post('/api/scan/run', params || {}).catch(function (err) {
+          if (settled) return
+          settled = true
+          unsub()
+          clearTimeout(timer)
+          reject(err)
+        })
+      })
+    },
+
+    scanStatus: function () {
+      return get('/api/scan/status')
+    },
+
+    relayStatus: function () {
+      return get('/api/relay/status')
+    },
+
+    /* ---------------- 盲中继 / 云监测台 ---------------- */
+
+    /**
+     * 部署盲中继 + 云监测台。语义与 runScan 一致：等 edge-result 事件再 resolve。
+     * 与 CLI `cfpilot edge deploy` 同源（Go internal/edge.Deploy）。
+     */
+    deployEdgeRelay: function (params) {
+      return new Promise(function (resolve, reject) {
+        let settled = false
+        const unsub = subscribe('edge-result', function (payload) {
+          if (settled) return
+          settled = true
+          unsub()
+          clearTimeout(timer)
+          if (payload && payload.ok === false) {
+            reject(new Error((payload && payload.error) || '盲中继部署失败'))
+          } else {
+            resolve(payload && payload.result ? payload.result : payload)
+          }
+        })
+        const timer = setTimeout(function () {
+          if (settled) return
+          settled = true
+          unsub()
+          reject(new Error('盲中继部署超时（超过 10 分钟未返回结果）'))
+        }, 10 * 60 * 1000)
+        post('/api/edge/deploy', params || {}).catch(function (err) {
+          if (settled) return
+          settled = true
+          unsub()
+          clearTimeout(timer)
+          reject(err)
+        })
+      })
+    },
+
+    /** 列出账号下的 zone，供域名下拉选择 */
+    listEdgeZones: function () {
+      return get('/api/edge/zones').then(function (r) {
+        return { zones: (r && r.zones) || [] }
+      })
+    },
+
+    /**
+     * 检测账号下已部署的盲中继 / 云监测台实例（只读）。
+     *
+     * 返回结构见 globals.d.ts 的 checkEdgeDeployment 声明；
+     * 后端 /api/edge/check 只发 GET，绝不部署、不写任何资源。
+     */
+    checkEdgeDeployment: function () {
+      return get('/api/edge/check')
+    },
+
+    detectScanHost: function () {
+      // ⚠️ 界面判断的是 `result.ok && result.host`，后端只返回 { host, source }
+      // → ok 是 undefined，永远不会填域名。这里补上 ok 字段。
+      return post('/api/scan/detect-host')
+        .then(function (r) {
+          if (r && r.host) {
+            return {
+              ok: true,
+              host: r.host,
+              // 后端给的是中文 source（"自定义域名" / "pages.dev 子域名"），
+              // 界面比的是 'custom' / 'pages'
+              source: String(r.source || '').indexOf('自定义') >= 0 ? 'custom' : 'pages',
+            }
+          }
+          return { ok: false, error: (r && r.error) || '未能识别数据面域名' }
+        })
+        .catch(function (err) {
+          return { ok: false, error: err && err.message ? err.message : String(err) }
+        })
+    },
+
+    detectScanPath: function () {
+      // 同上：界面判断 `result.ok && result.path`
+      return post('/api/scan/detect-path')
+        .then(function (r) {
+          if (r && r.path) {
+            return {
+              ok: true,
+              path: r.path,
+              xhttpPath: r.xhttpPath || '/xhttp',
+              source: String(r.source || '').indexOf('KV') >= 0 ? 'kv' : 'env',
+            }
+          }
+          return { ok: false, error: (r && r.error) || '未能识别 WS 路径' }
+        })
+        .catch(function (err) {
+          return { ok: false, error: err && err.message ? err.message : String(err) }
+        })
+    },
+
+    /**
+     * 自动获取面板的一次性扫描令牌。
+     *
+     * 用保存的面板密码登录控制面，再调 /api/v1/scanner-token 换令牌。
+     * 用户不用手动去面板点「生成令牌」。
+     */
+    /**
+     * 把优选结果回填到面板的「手动优选 IP」。
+     *
+     * 服务端会现取临时令牌（10 分钟有效）再回填，
+     * 所以不会出现「优选跑太久令牌过期」的问题。
+     */
+    pushScanResults: function (lines, mode) {
+      // mode：`replace`（默认，清空后写入）/ `append`（保留已有的，只补新的）
+      return post('/api/scan/push-results', { lines: lines || [], mode: mode || 'replace' })
+    },
+
+    /* ---------------- 反代优选（出站链路体检） ---------------- */
+
+    // 启动体检。**不等结果**：一次体检要几分钟，结果走 SSE 的 relay-result。
+    runRelay: function (params) {
+      const p = params || {}
+      return post('/api/relay/run', {
+        host: p.host || '',
+        wsPath: p.wsPath || '',
+        uuid: p.uuid || '',
+        rounds: p.rounds || 2,
+        top: p.top || 10,
+        timeoutMs: p.timeoutMs || 12000,
+        candidates: p.candidates || '',
+        // 校验网址：终检候选能否转发到 CF 网段站点（留空用内置清单）
+        verifyHosts: Array.isArray(p.verifyHosts) ? p.verifyHosts : [],
+      })
+    },
+
+    cancelRelay: function () {
+      return post('/api/relay/cancel', {})
+    },
+
+    // 候选预览（通用）：IP 与域名都识别，界面用这个。
+    parseScanCandidates: function (raw) {
+      return post('/api/scan/parse-candidates', { raw: raw || '' })
+    },
+
+    // 候选预览（反代链路保留）：只数 IPv4。
+    parseRelayCandidates: function (raw) {
+      return post('/api/relay/parse-candidates', { raw: raw || '' })
+    },
+
+    // 远程导入：由**服务端**拉取（界面直连会被 CORS 拦掉）。
+    fetchRelayCandidates: function (url) {
+      return post('/api/relay/fetch-candidates', { url: url || '' })
+    },
+
+    // 从面板配置里读 UUID / WS 路径（用户手里通常只有订阅链接）。
+    relayUUID: function () {
+      return get('/api/relay/uuid')
+    },
+
+    // 随版本发布的内置反代候选（用户不可修改）
+    relayBuiltin: function () {
+      return get('/api/relay/builtin')
+    },
+
+    // 写入面板 ProxyIP 池：incremental 增量 / overwrite 覆盖
+    pushRelayResults: function (ips, mode) {
+      return post('/api/relay/push-results', { ips: ips || [], mode: mode || 'incremental' })
+    },
+
+    onRelayResult: function (cb) {
+      return subscribe('relay-result', cb)
+    },
+
+    onRelayProgress: function (cb) {
+      return subscribe('relay-progress', cb)
+    },
+
+    fetchScannerToken: function (host, password) {
+      return post('/api/scan/scanner-token', {
+        host: host || '',
+        password: password || '',
+      })
+    },
+
+    listScanCountries: function () {
+      // 后端返回 { countries: [{code,name,group,colos}, ...] }，
+      // `code` 是**国家码**（HK / JP / US），机房码放在 colos 里。
+      //
+      // 这里不再内置兜底表：界面只靠快捷分组（ASIA / US 关键字）
+      // 也能完成筛选，内置一份国家表只会与后端漂移。
+      return get('/api/scan/countries')
+        .then(function (r) {
+          var list = (r && r.countries) || []
+          if (!Array.isArray(list)) return []
+          return list.map(function (c) {
+            return {
+              code: String((c && c.code) || ''),
+              name: String((c && c.name) || (c && c.code) || ''),
+              group: String((c && c.group) || 'OTHER'),
+              colos: Array.isArray(c && c.colos) ? c.colos.map(String) : [],
+            }
+          }).filter(function (c) {
+            return c.code !== ''
+          })
+        })
+        .catch(function () {
+          return []
+        })
+    },
+
+    listScanCountryGroups: function () {
+      // 后端返回 { groups: { ASIA: [国家码], US: [国家码] } }。
+      // 分组表只在后端维护一份；拿不到时返回 {} ——
+      // 快捷分组的 ASIA / US 关键字仍然可用（后端自己会展开）。
+      return get('/api/scan/countries')
+        .then(function (r) {
+          var g = (r && r.groups) || {}
+          var out = {}
+          Object.keys(g).forEach(function (k) {
+            if (Array.isArray(g[k])) out[k] = g[k].map(String)
+          })
+          return out
+        })
+        .catch(function () {
+          return {}
+        })
+    },
+
+    checkEnvironment: function (host) {
+      // ⚠️ 界面判断的是 `result.clean`（布尔），后端返回的是
+      // { findings: [{kind, message, level}] } —— 缺 clean 字段，
+      // 于是「环境正常」永远不会显示。这里做转换。
+      //
+      // host（数据面域名）一并带上：IPv6 预检要靠它的 AAAA
+      // 找到「实测活跃的 48 位前缀」做金丝雀，否则只能用静态表里的。
+      return post('/api/scan/env-check', { host: host || '' })
+        .then(function (r) {
+          var findings = (r && r.findings) || []
+          // 有任意一条 level=warn 就认为环境不干净
+          var clean = !findings.some(function (f) {
+            return f && f.level === 'warn'
+          })
+          return {
+            clean: clean,
+            // 界面用的是 string[]，后端给的是对象数组 → 拍平成文案
+            findings: findings.map(function (f) {
+              return (f && f.message) || String(f)
+            }),
+            // IPv6 环境预检结论（后端原样透传；旧后端没有该字段时为 undefined）
+            ipv6: r && r.ipv6 ? r.ipv6 : null,
+          }
+        })
+        .catch(function (err) {
+          // 检测失败不该阻断优选，当作「无法判断」处理
+          return {
+            clean: true,
+            findings: ['环境检测失败：' + (err && err.message ? err.message : String(err))],
+            ipv6: null,
+          }
+        })
+    },
+
+    /* ---------------- 一键优选 ---------------- */
+
+    /**
+     * 一键优选并回填面板。
+     *
+     * 与托盘菜单里的「一键优选 IP」是**同一个后端接口**：
+     * 后台跑完整优选 + 回填面板，完成后由后端弹系统通知。
+     */
+    quickScan: function () {
+      return post('/api/scan/quick')
+    },
+
+    /* ---------------- 外部 IP 数据源（Phase 5） ---------------- */
+
+    /** 数据源配置 + 池统计 + 定时器状态，一次取齐 */
+    sourcesList: function () {
+      return get('/api/sources/list')
+    },
+    /** 保存整份数据源配置（增删改 / 启停都在前端编辑好后整体提交） */
+    sourcesSave: function (config) {
+      return post('/api/sources/save', { config: config })
+    },
+    /** 测试连接：只拉清单不写池 */
+    sourcesTest: function (id) {
+      return post('/api/sources/test', { id: id })
+    },
+    /** 立即同步；ids 为空表示同步全部启用源（含 TCP/TLS 轻量校验） */
+    sourcesSync: function (ids) {
+      return post('/api/sources/sync', { ids: ids || [] })
+    },
+    sourcesStatus: function () {
+      return get('/api/sources/status')
+    },
+    /** 本地池全量候选（上限 5000，分页 / 筛选 / 导出都在前端做） */
+    sourcesPool: function () {
+      return get('/api/sources/pool')
+    },
+    /** 批量禁用 / 启用 / 删除候选 */
+    sourcesPoolUpdate: function (keys, action) {
+      return post('/api/sources/pool/update', { keys: keys, action: action })
+    },
+    /** 从本地池取样跑完整优选 + 回填（唯一会写 KV 的动作，默认 replace） */
+    sourcesQuick: function (poolSample) {
+      return post('/api/sources/quick', { poolSample: poolSample || 200 })
+    },
+    /** 「加载数据源清单」：按 ID 拉取并合并清单原文 */
+    sourcesFetchCandidates: function (ids) {
+      return post('/api/sources/fetch', { ids: ids || [] })
+    },
+
+    /* ---------------- 优选历史与复测（Go 版新增） ---------------- */
+
+    /**
+     * 读取本机保存的优选历史（最新在前）。
+     *
+     * 优选成功由**后端**自动留底（本地优选 / 一键优选都会写），
+     * 界面只读不写 —— 避免双写竞态。
+     */
+    getScanHistory: function () {
+      return get('/api/scan/history')
+        .then(function (r) {
+          return {
+            ok: !!(r && r.ok),
+            sessions: (r && r.sessions) || [],
+            error: (r && r.error) || '',
+          }
+        })
+        .catch(function (err) {
+          return {
+            ok: false,
+            sessions: [],
+            error: err && err.message ? err.message : String(err),
+          }
+        })
+    },
+
+    /** 读取已有证据的单 IP 质量报告，不触发检测。 */
+    getIPQualityReport: function (params) {
+      return get('/api/scan/quality-report?sessionId=' + encodeURIComponent(params.sessionId || '') + '&ip=' + encodeURIComponent(params.ip || '') + '&port=' + encodeURIComponent(params.port || 443))
+    },
+
+    /**
+     * 识别**本机网络**的出口（实验性、显式触发）。
+     *
+     * ⚠️ 结果是本机直连/SOCKS5 路径的出口，不是候选 IP 的出口；
+     * 仅供判断目标站看到的出口类型，不得当作逐候选差异。
+     */
+    identifyEgress: function (params) {
+      return post('/api/scan/quality-egress', {
+        sessionId: (params && params.sessionId) || '',
+        ip: (params && params.ip) || '',
+        port: (params && params.port) || 443,
+        serviceUrl: (params && params.serviceUrl) || '',
+        bearerToken: (params && params.bearerToken) || '',
+        socks5Proxy: (params && params.socks5Proxy) || '',
+      })
+    },
+
+    /**
+     * 穿候选隧道检测目标站兼容性（实验性、显式触发，串行 ≤10 个目标）。
+     * targets: [{label, spec: 'host[:port]/path', expectedText?}]
+     */
+    probeTunnelCompatibility: function (params) {
+      return post('/api/scan/quality-compat', {
+        sessionId: (params && params.sessionId) || '',
+        ip: (params && params.ip) || '',
+        port: (params && params.port) || 443,
+        host: (params && params.host) || '',
+        wsPath: (params && params.wsPath) || '',
+        uuid: (params && params.uuid) || '',
+        trojanPassword: (params && params.trojanPassword) || '',
+        targets: (params && params.targets) || [],
+      })
+    },
+
+    /** 穿候选隧道识别**候选出口**（实验性、显式触发）。 */
+    identifyTunnelEgress: function (params) {
+      return post('/api/scan/quality-tunnel-egress', {
+        sessionId: (params && params.sessionId) || '',
+        ip: (params && params.ip) || '',
+        port: (params && params.port) || 443,
+        host: (params && params.host) || '',
+        wsPath: (params && params.wsPath) || '',
+        uuid: (params && params.uuid) || '',
+        trojanPassword: (params && params.trojanPassword) || '',
+        serviceUrl: (params && params.serviceUrl) || '',
+      })
+    },
+
+    /** 读取实验性功能开关（默认全部关闭）。 */
+    getExperimental: function () {
+      return get('/api/experimental')
+    },
+
+    /** 保存实验性功能开关。 */
+    saveExperimental: function (params) {
+      return post('/api/experimental', params || {})
+    },
+
+    /** 列出网络档案（含样本量与当前档案）。 */
+    listExperimentalProfiles: function () {
+      return get('/api/experimental/profiles')
+    },
+
+    /** 重命名网络档案（改维度 → 档案 ID 变化，观测一并迁移）。 */
+    renameExperimentalProfile: function (params) {
+      return call('PUT', '/api/experimental/profiles', params || {})
+    },
+
+    /** 删除网络档案及其观测。 */
+    deleteExperimentalProfile: function (id) {
+      return call('DELETE', '/api/experimental/profiles?id=' + encodeURIComponent(id || ''))
+    },
+
+    /** 自适应效果 A/B 对照（同一档案、同一域名下的开/关对照）。 */
+    getAdaptiveEffect: function (profileId) {
+      return get('/api/scan/adaptive-effect?profileId=' + encodeURIComponent(profileId || ''))
+    },
+
+    /**
+     * 账号用量与额度。
+     *
+     * 默认**只读缓存**（不发 Cloudflare 请求）；refresh=true 才真正重新采集一次。
+     */
+    getUsage: function (refresh) {
+      return get('/api/usage' + (refresh ? '?refresh=1' : ''))
+    },
+
+    /** 删除一条优选历史会话 */
+    deleteScanHistory: function (id) {
+      return call('DELETE', '/api/scan/history?id=' + encodeURIComponent(id || ''))
+    },
+
+    /* ---------------- 定时优选任务 ---------------- */
+
+    /**
+     * 读取当前账号的定时优选任务清单。
+     *
+     * 后端首次访问时会自动为该账号物化 5 条内置任务。
+     */
+    listScheduledTasks: function () {
+      return get('/api/schedule/tasks').then(function (r) {
+        return {
+          ok: !!(r && r.ok),
+          account: (r && r.account) || null,
+          tasks: (r && r.tasks) || [],
+          scheduler: (r && r.scheduler) || null,
+          enabledCount: (r && r.enabledCount) || 0,
+          enabledLimit: (r && r.enabledLimit) || 3,
+          hint: (r && r.hint) || '',
+          error: (r && r.error) || '',
+        }
+      })
+    },
+
+    /** 新建一个定时优选任务 */
+    createScheduledTask: function (params) {
+      var p = params || {}
+      return post('/api/schedule/tasks', {
+        name: p.name || '',
+        description: p.description || '',
+        intervalDays: Number(p.intervalDays) || 2,
+        runAt: p.runAt || '',
+        minSpeedMBps: Number(p.minSpeedMBps) || 0,
+        raceBackfill: !!p.raceBackfill,
+        scan: p.scan || {},
+      }).then(function (r) {
+        return {
+          ok: !!(r && r.ok),
+          task: (r && r.task) || null,
+          error: (r && r.error) || '',
+          conflict: (r && r.conflict) || null,
+        }
+      })
+    },
+
+    /**
+     * 批量修改定时优选任务（多选后「保存应用」）。
+     *
+     * 只有实际改动过的字段才会提交 —— 空白字段保持原值，
+     * 避免一次编辑把别的任务的名称也抹平。
+     */
+    updateScheduledTasks: function (params) {
+      var p = params || {}
+      var body = { ids: p.ids || [] }
+      if (p.name !== undefined && p.name !== null) body.name = p.name
+      if (p.description !== undefined && p.description !== null) body.description = p.description
+      if (p.intervalDays !== undefined && p.intervalDays !== null) body.intervalDays = Number(p.intervalDays)
+      if (p.runAt !== undefined && p.runAt !== null) body.runAt = p.runAt
+      if (p.minSpeedMBps !== undefined && p.minSpeedMBps !== null) body.minSpeedMBps = Number(p.minSpeedMBps)
+      if (p.enabled !== undefined && p.enabled !== null) body.enabled = !!p.enabled
+      if (p.raceBackfill !== undefined && p.raceBackfill !== null) body.raceBackfill = !!p.raceBackfill
+      return call('PUT', '/api/schedule/tasks', body).then(function (r) {
+        return {
+          ok: !!(r && r.ok),
+          tasks: (r && r.tasks) || [],
+          error: (r && r.error) || '',
+          conflict: (r && r.conflict) || null,
+        }
+      })
+    },
+
+    /** 删除定时优选任务（内置任务不会被删，会在 skipped 里说明） */
+    deleteScheduledTasks: function (ids) {
+      return call('DELETE', '/api/schedule/tasks', { ids: ids || [] }).then(function (r) {
+        return {
+          ok: !!(r && r.ok),
+          deleted: (r && r.deleted) || 0,
+          skipped: (r && r.skipped) || [],
+          error: (r && r.error) || '',
+        }
+      })
+    },
+
+    /** 读取本地优选 IP 池（定时任务跑出来的结果） */
+    listScheduledPool: function () {
+      return get('/api/schedule/pool').then(function (r) {
+        return {
+          ok: !!(r && r.ok),
+          entries: (r && r.entries) || [],
+          error: (r && r.error) || '',
+        }
+      })
+    },
+
+    /**
+     * 把选中的池内条目回填到面板。
+     *
+     * mode：replace = 覆盖（会清空面板已有的优选 IP，含用户手填的）；
+     *       append  = 增量（只补真正新的）。
+     */
+    pushScheduledPool: function (entries, mode) {
+      return post('/api/schedule/pool/push', {
+        entries: entries || [],
+        mode: mode === 'append' ? 'append' : 'replace',
+      }).then(function (r) {
+        return {
+          ok: !!(r && r.ok),
+          count: (r && r.count) || 0,
+          mode: (r && r.mode) || '',
+          error: (r && r.error) || '',
+        }
+      })
+    },
+
+    /** 从本地优选 IP 池移除条目 */
+    deleteScheduledPool: function (ips) {
+      return call('DELETE', '/api/schedule/pool', { ips: ips || [] }).then(function (r) {
+        return {
+          ok: !!(r && r.ok),
+          deleted: (r && r.deleted) || 0,
+          error: (r && r.error) || '',
+        }
+      })
+    },
+
+    /**
+     * 对选中的 IP 跑分层可用性复测（TCP → TLS → WS101，可选测速）。
+     *
+     * ⚠️ host / wsPath / probePath 必须用**历史会话里保存的参数**，
+     * 不是当前表单的值 —— 否则改过表单后复测会打到错误的域名上。
+     * 传 sessionId 时复测结论会写回该历史会话的条目。
+     */
+    reTestIps: function (params) {
+      return post('/api/scan/re-test', {
+        sessionId: (params && params.sessionId) || '',
+        host: (params && params.host) || '',
+        wsPath: (params && params.wsPath) || '',
+        probePath: (params && params.probePath) || '',
+        withSpeed: !!(params && params.withSpeed),
+        verifyPayload: !!(params && params.verifyPayload),
+        uuid: (params && params.uuid) || '',
+        trojanPassword: (params && params.trojanPassword) || '',
+        verifyTargetHost: (params && params.verifyTargetHost) || '',
+        verifyTargetPort: (params && params.verifyTargetPort) || 0,
+        targets: (params && params.targets) || [],
+      }).then(function (r) {
+        return {
+          ok: !!(r && r.ok),
+          results: (r && r.results) || [],
+          error: (r && r.error) || '',
+        }
+      })
+    },
+
+    /**
+     * 质量检测：把一条 IP 的质量证据补齐（分层复测 + IP 纯净度），并写回优选历史。
+     *
+     * 与 getIPQualityReport 的区别：那个**只读**本地已保存的证据，
+     * 所以刚优选完的条目大半是「未执行」；这个会真的去跑一遍能跑的检查。
+     *
+     * host / wsPath / probePath 一律用**历史会话里保存的参数**（后端也会再校验），
+     * 界面不传，避免打到别的域名上。
+     */
+    runQualityCheck: function (params) {
+      return post('/api/scan/quality-check', {
+        sessionId: (params && params.sessionId) || '',
+        ip: (params && params.ip) || '',
+        port: (params && params.port) || 443,
+        withSpeed: !!(params && params.withSpeed),
+      }).then(function (r) {
+        return {
+          ok: !!(r && r.ok),
+          report: (r && r.report) || null,
+          results: (r && r.results) || [],
+          error: (r && r.error) || '',
+        }
+      })
+    },
+
+    /* ---------------- 日志 ---------------- */
+
+    /**
+     * 读取本机日志文件（末尾若干行）。
+     *
+     * @param tail 取末尾多少行（默认 500，后端上限 5000）
+     */
+    getLogs: function (tail) {
+      return get('/api/logs?tail=' + (tail || 500))
+    },
+
+    /**
+     * 在文件管理器中打开文件所在的文件夹。
+     *
+     * 日志页的「打开日志文件所在文件夹」用它 ——
+     * 后端 /api/update/reveal 接受任意文件路径并打开它**所在的目录**，
+     * 所以不必为日志单独加一个接口。
+     */
+    revealFile: function (file) {
+      return post('/api/update/reveal', { file: file || '' })
+    },
+
+    /* ---------------- 更新 ---------------- */
+
+    checkUpdate: function () {
+      return post('/api/update/check')
+    },
+
+    downloadUpdate: function (url, version) {
+      return post('/api/update/download', {
+        url: url,
+        version: version || '',
+      })
+    },
+
+    applyUpdate: function (file) {
+      // 「重启并更新应用」：校验 sidecar 哈希 → rename-swap 主程序 →
+      // spawn 收尾进程（等旧进程退出后清理备份并以原参数重启）。
+      // 哈希校验 fail-closed：sidecar 缺失 / 不符一律拒绝（见 update/apply.go）。
+      return post('/api/update/apply', { file: file })
+    },
+
+    /* ---------------- 服务管理（Go 版新增） ---------------- */
+
+    serviceStatus: function () {
+      return get('/api/service/status')
+    },
+
+    /* ---------------- 组网：命名网络档案 ---------------- */
+
+    meshProfiles: function () {
+      return get('/api/mesh/profiles')
+    },
+
+    meshProfileSave: function (name, config) {
+      return post('/api/mesh/profiles', { action: 'save', name: name, config: config })
+    },
+
+    meshProfileSelect: function (name) {
+      return post('/api/mesh/profiles', { action: 'select', name: name })
+    },
+
+    meshProfileDelete: function (name) {
+      return post('/api/mesh/profiles', { action: 'delete', name: name })
+    },
+
+    /** 纯本地的部署信息（内置内核 + 最近一次部署留档），不联网、不用 Token。 */
+    getLocalDeployInfo: function () {
+      return get('/api/deploy/local')
+    },
+
+    setServicePort: function (port) {
+      return post('/api/service/port', { port: port })
+    },
+
+    /* ---------------- 系统 ---------------- */
+
+    openExternal: function (url) {
+      // 只放行 https，避免被构造出 javascript: / file: 等协议
+      if (!/^https:\/\//i.test(url)) return Promise.resolve()
+      // 应用窗口内没有地址栏也没有标签页：新开窗口会变成孤儿窗口，
+      // 统一交给系统浏览器打开。浏览器形态（容器 / 局域网 / 安卓）没有桥，走原来的 window.open。
+      var sh = window.__cfpilotShell
+      if (sh && typeof sh.send === 'function') {
+        sh.send('open-external', url)
+        return Promise.resolve()
+      }
+      window.open(url, '_blank', 'noopener,noreferrer')
+      return Promise.resolve()
+    },
+
+    /**
+     * 窗口控制（可选能力）。
+     *
+     * 只在应用窗口里存在；浏览器 / 容器 / 安卓上拿到的是一组 no-op，
+     * 界面不需要额外判断宿主。
+     */
+    windowApi: {
+      available: false,
+      minimize: function () {},
+      maximize: function () {},
+      close: function () {},
+    },
+
+    /* ---------------- 事件订阅 ---------------- */
+
+    onLog: function (cb) {
+      return subscribe('log', cb)
+    },
+
+    onDeployStatus: function (cb) {
+      return subscribe('deploy-status', cb)
+    },
+
+    onScanResult: function (cb) {
+      return subscribe('scan-result', cb)
+    },
+
+    onUpdateProgress: function (cb) {
+      return subscribe('update-progress', cb)
+    },
+
+    onUpdateDone: function (cb) {
+      return subscribe('update-done', cb)
+    },
+
+    /** 定时优选任务的状态变化（运行中 / 完成 / 失败） */
+    onTaskStatus: function (cb) {
+      return subscribe('task-status', cb)
+    },
+
+    /* ---------------- 版本信息 ---------------- */
+
+    // 界面上「一键部署」下方的版本显示会读这个（Electron 版来自 app.getVersion）
+    appVersion: 'unknown',
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* 启动                                                               */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * ⚠️ `window.cfpilot` 必须**最先**赋值。
+   *
+   * 曾经的写法是先 `ensureStream()` 再 `window.cfpilot = api`，
+   * 结果：只要 EventSource 构造抛异常（浏览器禁用 / 连接数超限 /
+   * 加载顺序异常），整个脚本就中断在那一行，
+   * `window.cfpilot` 永远不会被赋值 →
+   * renderer.ts 里所有 `window.cfpilot.xxx()` 全部 TypeError →
+   * 界面看起来「加载出来了」，但国家列表、账户、部署按钮**全部无反应**。
+   *
+   * 真实症状：机房国家列表一直停在「正在加载国家列表…」。
+   *
+   * 所以现在：先挂对象，再干那些可能失败的初始化，且每步各自兜住异常。
+   */
+  window.cfpilot = api
+
+  /* ------------------------------------------------------------------ */
+  /* 桌面扁平横幅：导航并入标题行（仅 Go 版，面板 UI 不变）               */
+  /* ------------------------------------------------------------------ */
+  /**
+   * 把 #nav 移进标题横幅（logo 那一行），释放约 50px 纵向空间。
+   * 页签扁平化：背景与页面一致、之间用分隔线、激活时只高亮文字+下划线。
+   * 只改桌面适配层，packages/ui 保持不动（面板 UI 不受影响）。
+   */
+  function applyFlatHeader() {
+    try {
+      var header = document.querySelector('header.top')
+      var nav = document.getElementById('nav')
+      if (!header || !nav || nav.parentElement === header) return
+      if (!document.getElementById('cfpilot-desktop-flat')) {
+        var style = document.createElement('style')
+        style.id = 'cfpilot-desktop-flat'
+        style.textContent =
+          'header.top{display:flex;align-items:center;gap:14px;padding:8px 20px}' +
+          'header.top .brand .sub{margin-top:1px}' +
+          'header.top nav.tabs{background:transparent;border:none;border-radius:0;padding:0;margin:0;width:auto;max-width:none;flex:1 1 auto;justify-content:flex-start;gap:0;flex-wrap:nowrap}' +
+          'header.top nav.tabs button{flex:0 0 auto;min-width:0;padding:8px 13px;border-radius:0;position:relative;background:transparent}' +
+          'header.top nav.tabs button+button{border-left:1px solid var(--border)}' +
+          'header.top nav.tabs button:hover{background:var(--bg-hover);color:var(--text-main)}' +
+          'header.top nav.tabs button.active{background:transparent;color:var(--accent);font-weight:600;box-shadow:none}' +
+          'header.top nav.tabs button.active::after{content:"";position:absolute;left:10px;right:10px;bottom:0;height:2px;background:var(--accent);border-radius:2px 2px 0 0}' +
+          '@media(max-width:980px){header.top{flex-wrap:wrap;gap:8px 14px}header.top nav.tabs{order:10;flex:1 1 100%;overflow-x:auto;justify-content:flex-start}}' +
+          '@media(max-width:640px){header.top .brand .sub{display:none}}'
+        document.head.appendChild(style)
+      }
+      var spacer = header.querySelector('.spacer')
+      var actions = header.querySelector('.top-actions')
+      header.insertBefore(nav, spacer || actions || null)
+    } catch (err) {
+      /* 排版失败不影响功能 */
+    }
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', applyFlatHeader)
+  } else {
+    applyFlatHeader()
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* 应用窗口的无边框标题栏                                               */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * 只有「自绘标题栏」的窗口（当前是 Windows）才装标题栏。
+   *
+   * 判据来自壳注入的 window.__cfpilotShell.chrome：
+   *   - custom：无边框窗口，标题栏、拖动、窗口按钮都由本文件提供；
+   *   - native：窗口管理器已经画了标题栏（Linux），这里什么都不做，
+   *     否则会出现两层标题栏。
+   *
+   * 浏览器 / 容器 / 安卓没有 __cfpilotShell，整段直接跳过 ——
+   * packages/ui 因此保持「外壳无关」。
+   */
+  function installWindowChrome() {
+    var sh = window.__cfpilotShell
+    if (!sh || sh.chrome !== 'custom') return
+    if (!document.body || document.getElementById('cfpilot-titlebar')) return
+
+    var style = document.createElement('style')
+    style.id = 'cfpilot-titlebar-style'
+    style.textContent =
+      // body 变成纵向 flex：标题栏固定高度，.app 占剩下的空间。
+      // 面板原本用 height:100%，这里必须显式改成弹性，否则标题栏会把内容顶出视口。
+      'body{display:flex;flex-direction:column;height:100%}' +
+      'body>.app{flex:1 1 auto;min-height:0;height:auto}' +
+      '#cfpilot-titlebar{flex:0 0 auto;height:34px;display:flex;align-items:center;gap:10px;' +
+      'padding-left:12px;background:var(--bg-nav);border-bottom:1px solid var(--border);' +
+      'user-select:none;-webkit-user-select:none;cursor:default}' +
+      '#cfpilot-titlebar .tb-brand{display:flex;align-items:center;gap:8px;font-size:12.5px;' +
+      'font-weight:600;color:var(--text-secondary);letter-spacing:.02em}' +
+      '#cfpilot-titlebar .tb-logo{width:18px;height:18px;border-radius:5px;display:flex;' +
+      'align-items:center;justify-content:center;font-size:9.5px;font-weight:700;color:#fff;' +
+      'background:linear-gradient(135deg,#4f7cff,#8b5cf6)}' +
+      '#cfpilot-titlebar .tb-spacer{flex:1 1 auto}' +
+      '#cfpilot-titlebar .tb-actions{display:flex;align-items:center;height:100%}' +
+      '#cfpilot-titlebar .tb-actions button{width:44px;height:34px;border:0;background:transparent;' +
+      'color:var(--text-secondary);font-size:13px;line-height:1;cursor:default;' +
+      'display:flex;align-items:center;justify-content:center}' +
+      '#cfpilot-titlebar .tb-actions button:hover{background:var(--bg-hover);color:var(--text-main)}' +
+      '#cfpilot-titlebar .tb-actions button.tb-close:hover{background:#e81123;color:#fff}'
+    document.head.appendChild(style)
+
+    var bar = document.createElement('div')
+    bar.id = 'cfpilot-titlebar'
+    bar.innerHTML =
+      '<div class="tb-brand"><span class="tb-logo">CP</span><span class="tb-name">CFPilot</span></div>' +
+      '<div class="tb-spacer"></div>' +
+      '<div class="tb-actions">' +
+      '<button type="button" data-win="min" title="最小化" aria-label="最小化">&#x2013;</button>' +
+      '<button type="button" data-win="max" title="最大化" aria-label="最大化">&#x25A1;</button>' +
+      '<button type="button" class="tb-close" data-win="close" title="关闭" aria-label="关闭">&#x2715;</button>' +
+      '</div>'
+    document.body.insertBefore(bar, document.body.firstChild)
+
+    // 拖动：不经 CSS app-region（WebView2 会把浮层也继承成拖动区），
+    // 交给壳去发 WM_NCLBUTTONDOWN(HTCAPTION)，系统负责移动 / 贴靠。
+    bar.addEventListener('mousedown', function (e) {
+      if (e.button !== 0) return
+      if (e.target && e.target.closest && e.target.closest('button')) return
+      sh.send('drag')
+    })
+    // 双击标题栏 = 最大化 / 还原
+    bar.addEventListener('dblclick', function (e) {
+      if (e.target && e.target.closest && e.target.closest('button')) return
+      sh.send('max')
+    })
+    bar.addEventListener('click', function (e) {
+      var btn = e.target && e.target.closest ? e.target.closest('button[data-win]') : null
+      if (!btn) return
+      var action = btn.getAttribute('data-win')
+      if (action === 'min') sh.send('min')
+      else if (action === 'max') sh.send('max')
+      else if (action === 'close') sh.send('close')
+    })
+
+    if (api && api.windowApi) {
+      api.windowApi.available = true
+      api.windowApi.minimize = function () { sh.send('min') }
+      api.windowApi.maximize = function () { sh.send('max') }
+      api.windowApi.close = function () { sh.send('close') }
+    }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', installWindowChrome)
+  } else {
+    installWindowChrome()
+  }
+
+  // 建立 SSE 连接（失败不影响 API 可用性）
+  try {
+    ensureStream()
+  } catch (err) {
+    console.error('[cfpilot] SSE 连接建立失败（实时日志不可用，但功能仍可使用）', err)
+  }
+
+  // 取版本号填入（失败保持 unknown）
+  try {
+    api
+      .serviceStatus()
+      .then(function (st) {
+        if (st && st.version) api.appVersion = st.version
+        // +mesh 版：自绘标题栏的品牌要能一眼区分产物。
+        // 页面横幅文案两版一致（见 packages/ui），只有这里与系统窗口标题带 +mesh。
+        if (st && st.variant === 'mesh') {
+          var brand = document.querySelector('#cfpilot-titlebar .tb-name')
+          if (brand) brand.textContent = 'CFPilot +mesh'
+        }
+      })
+      .catch(function () {
+        /* 取不到就保持 unknown，不阻断界面 */
+      })
+  } catch (err) {
+    console.error('[cfpilot] 读取版本失败', err)
+  }
+})()

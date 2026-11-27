@@ -1,0 +1,75 @@
+{
+  "name": "cfpilot",
+  "version": "0.60.0-beta.2",
+  "private": true,
+  "type": "module",
+  "description": "CFPilot — Cloudflare Workers 代理微内核 + 真连接优选面板 + 本地优选器 + 中文部署向导",
+  "license": "AGPL-3.0-only",
+  "author": "CFPilot Contributors",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xmwengxing/CFPilot.git"
+  },
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "vless",
+    "trojan",
+    "xhttp",
+    "proxy",
+    "subscription",
+    "ip-optimization"
+  ],
+  "workspaces": [
+    "packages/worker-core",
+    "packages/cli",
+    "packages/cli-mesh",
+    "packages/ui"
+  ],
+  "engines": {
+    "node": ">=20.10.0"
+  },
+  "scripts": {
+    "build": "npm run build --workspaces --if-present && node scripts/make-pages-zip.mjs",
+    "zip:pages": "node scripts/make-pages-zip.mjs",
+    "check:geosite": "node scripts/check-geosite.mjs",
+    "build:worker": "npm run build -w @cfpilot/worker-core",
+    "deploy:workers": "node scripts/deploy-workers-poc.mjs",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev": "npm run dev -w @cfpilot/worker-core",
+    "verify": "npm run build && node scripts/check-kernel-desensitize.mjs && node scripts/check-panel-bundle.mjs && node scripts/check-edge-relay.mjs && npm run typecheck && npm run test && node scripts/check-geosite.mjs && node scripts/check-log-panel.mjs && node scripts/check-adapter-contract.mjs && node scripts/check-adapter-shape.mjs && node scripts/check-adapter-session.mjs && node scripts/check-ui-integration.mjs && node scripts/check-build-version.mjs && node scripts/check-installer-flow.mjs && node scripts/check-release-notes.mjs && node scripts/check-xhttp-probe-marker.mjs && node scripts/check-copy-format.mjs packages/ui/src/index.html packages/worker-core/src/ui/panel.html && node scripts/check-html-tags.mjs packages/ui/src/index.html packages/worker-core/src/ui/panel.html && node scripts/gen-builtin-sources.mjs --check",
+    "check:edge-relay": "node scripts/check-edge-relay.mjs",
+    "check:desensitize": "node scripts/check-kernel-desensitize.mjs",
+    "check:panel-bundle": "node scripts/check-panel-bundle.mjs",
+    "check:log-panel": "node scripts/check-log-panel.mjs",
+    "check:xhttp-probe": "node scripts/check-xhttp-probe-marker.mjs",
+    "check:adapter": "node scripts/check-adapter-contract.mjs",
+    "check:adapter-shape": "node scripts/check-adapter-shape.mjs",
+    "check:ui": "node scripts/check-ui-integration.mjs",
+    "version:sync": "node scripts/sync-version.mjs",
+    "version:bump": "node scripts/bump-version.mjs",
+    "clean": "node scripts/clean.mjs",
+    "check:build-version": "node scripts/check-build-version.mjs",
+    "check:installer-flow": "node scripts/check-installer-flow.mjs",
+    "check:release-notes": "node scripts/check-release-notes.mjs",
+    "publish:npm": "node scripts/publish-npm.mjs cfpilot && node scripts/publish-npm.mjs cfpilot-mesh",
+    "verify:npm": "node scripts/verify-npm-publish.mjs"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261021.1",
+    "@types/node": "^26.6.5",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.5",
+    "wrangler": "^4.151.3"
+  },
+  "allowScripts": {
+    "electron@33.4.11": true,
+    "esbuild@0.28.2": true,
+    "workerd@1.20261019.1": true,
+    "app-builder-bin": true,
+    "7zip-bin": true
+  }
+}

@@ -1,0 +1,194 @@
+/**
+ * 反代入口池测试。
+ *
+ * 守护的是自研数据面补齐 vendor 核心能力的关键逻辑：
+ * **Cloudflare 网段目标必须能通过第三方反代出去**。
+ *
+ * 对照实验（真实 Cloudflare，16 轮交替采样，真实 TLS 客户端首包）：
+ *   目标 example.com:443（全 CF 网段）
+ *     vendor（有反代入口）→ 成功 100%
+ *     self （无反代入口）→ 成功 0%
+ */
+import { describe, expect, it, beforeEach } from 'vitest'
+import {
+  BUILTIN_RELAY_DOMAINS,
+  clearRelayCache,
+  coloToCountry,
+  collectRelayEndpoints,
+  relayCacheSize,
+  resolveRelayEntry,
+} from '../src/outbound/relay'
+import { buildRouteCandidates, groupCandidates } from '../src/outbound/route'
+
+describe('反代入口解析', () => {
+  beforeEach(() => {
+    clearRelayCache()
+  })
+
+  it('IP 字面量直接可用，无需解析', async () => {
+    const result = await resolveRelayEntry('1.2.3.4')
+    expect(result).toEqual([{ ip: '1.2.3.4', port: 443, label: '1.2.3.4' }])
+  })
+
+  it('IP 带端口时按给定端口', async () => {
+    const result = await resolveRelayEntry('1.2.3.4:8443')
+    expect(result[0]).toMatchObject({ ip: '1.2.3.4', port: 8443 })
+  })
+
+  it('IPv6 字面量可用', async () => {
+    const result = await resolveRelayEntry('2606:4700::1')
+    expect(result[0]!.ip).toBe('2606:4700::1')
+  })
+
+  it('空条目返回空数组', async () => {
+    expect(await resolveRelayEntry('')).toEqual([])
+    expect(await resolveRelayEntry('   ')).toEqual([])
+  })
+
+  it('域名解析失败时返回空数组而不是抛异常', async () => {
+    const result = await resolveRelayEntry('this-does-not-exist-cfpilot.invalid')
+    expect(Array.isArray(result)).toBe(true)
+  })
+})
+
+describe('反代入口池汇总', () => {
+  beforeEach(() => {
+    clearRelayCache()
+  })
+
+  it('用户自配入口优先于内置表', async () => {
+    const result = await collectRelayEndpoints({
+      userEntries: '1.1.1.1\n2.2.2.2:8443',
+      useBuiltin: false,
+    })
+    expect(result.map((r) => r.ip)).toEqual(['1.1.1.1', '2.2.2.2'])
+    expect(result[1]!.port).toBe(8443)
+  })
+
+  it('useBuiltin 为 false 时不引入任何第三方入口', async () => {
+    const result = await collectRelayEndpoints({ useBuiltin: false })
+    expect(result).toEqual([])
+  })
+
+  it('内置表非空，且是**固定 IP**（不再依赖 DoH 解析）', () => {
+    expect(BUILTIN_RELAY_DOMAINS.length).toBeGreaterThan(0)
+    // 内置表已从「若干第三方域名」换成实测过的固定 IP：
+    //   - 不再每次出站做 DoH 解析；
+    //   - 同一 colo 每次选中同一批入口，出口稳定（域名表会竞速挑到不同 IP，
+    //     同一会话的多个请求来自不同出口 → 触发目标站风控）。
+    for (const entry of BUILTIN_RELAY_DOMAINS) {
+      expect(entry).toMatch(/^\d{1,3}(\.\d{1,3}){3}$/)
+    }
+  })
+
+  it('去重：同一 IP 不重复出现', async () => {
+    const result = await collectRelayEndpoints({
+      userEntries: '1.1.1.1\n1.1.1.1\n1.1.1.1:443',
+      useBuiltin: false,
+    })
+    expect(result).toHaveLength(1)
+  })
+
+  it('内置冗余表全部参与候选，表头优先顺序不变', async () => {
+    // Cloudflare 网段目标（x.com → 172.66.x）完全依赖反代。
+    // 只取前 6 个会让后面的固定 IP 永远轮不到 —— 表头几个失效后目标长期不可用。
+    const result = await collectRelayEndpoints({ useRemoteFeed: false })
+    expect(result).toHaveLength(BUILTIN_RELAY_DOMAINS.length)
+    expect(result.slice(0, 6).map((r) => r.ip)).toEqual(BUILTIN_RELAY_DOMAINS.slice(0, 6))
+    // 固定 IP 零 DoH：全表候选不产生任何子请求
+    expect(result.every((r) => BUILTIN_RELAY_DOMAINS.includes(r.ip))).toBe(true)
+  })
+
+  it('用户自配入口排在全表内置入口之前', async () => {
+    const result = await collectRelayEndpoints({ userEntries: '9.9.9.9', useRemoteFeed: false })
+    expect(result[0]!.ip).toBe('9.9.9.9')
+    expect(result.slice(1).map((r) => r.ip)).toEqual([...BUILTIN_RELAY_DOMAINS])
+  })
+})
+
+describe('反代候选进入选路', () => {
+  const relay = [
+    { ip: '38.190.210.250', port: 443, label: 'proxyip.hk → 38.190.210.250' },
+    { ip: '43.132.231.159', port: 443, label: 'proxyip.hk → 43.132.231.159' },
+  ]
+
+  it('默认作兜底（降权组）', () => {
+    const list = buildRouteCandidates({
+      targetHost: 'example.com',
+      targetPort: 443,
+      relay,
+    })
+    const groups = groupCandidates(list)
+    expect(groups.direct.some((c) => c.source === 'relay')).toBe(false)
+    expect(groups.fallback.filter((c) => c.source === 'relay')).toHaveLength(2)
+  })
+
+  it('relay 候选永远降权兜底（直连优先、反代只兜底）', () => {
+    const list = buildRouteCandidates({
+      targetHost: 'example.com',
+      targetPort: 443,
+      relay,
+    })
+    const groups = groupCandidates(list)
+    // 反代永不进入主竞速组：能走直连时绝不走反代（反代入口对大上传有上限）
+    expect(groups.direct.filter((c) => c.source === 'relay')).toHaveLength(0)
+    expect(groups.fallback.filter((c) => c.source === 'relay')).toHaveLength(2)
+  })
+
+  it('反代候选在代理之后（用户显式配置的代理优先）', () => {
+    const list = buildRouteCandidates({
+      targetHost: 'example.com',
+      targetPort: 443,
+      relay,
+      proxies: [{ host: 'p.example', port: 1080, kind: 'socks5' }],
+    })
+    expect(list[0]!.source).toBe('proxy')
+  })
+
+  it('反代候选标注来源便于诊断', () => {
+    const list = buildRouteCandidates({ targetHost: 'example.com', targetPort: 443, relay })
+    const r = list.find((c) => c.source === 'relay')!
+    expect(r.label).toContain('反代')
+    expect(r.label).toContain('38.190.210.250')
+  })
+})
+
+describe('colo → 地区映射（与 vendor 的 _Zc 同构）', () => {
+  it('常见机房映射到国家码', () => {
+    expect(coloToCountry('HKG')).toBe('HK')
+    expect(coloToCountry('SIN')).toBe('SG')
+    expect(coloToCountry('NRT')).toBe('JP')
+    expect(coloToCountry('LAX')).toBe('US')
+    expect(coloToCountry('FRA')).toBe('DE')
+  })
+
+  it('大小写不敏感', () => {
+    expect(coloToCountry('hkg')).toBe('HK')
+    expect(coloToCountry('Sin')).toBe('SG')
+  })
+
+  it('未知机房回落到 US', () => {
+    expect(coloToCountry('ZZZ')).toBe('US')
+    expect(coloToCountry('')).toBe('US')
+    expect(coloToCountry(undefined)).toBe('US')
+  })
+
+  it('已是国家码时原样返回', () => {
+    expect(coloToCountry('JP')).toBe('JP')
+    expect(coloToCountry('SG')).toBe('SG')
+  })
+})
+
+describe('反代入口解析缓存的容量上限', () => {
+  it('不同入口持续写入不会让 Map 无限增长', async () => {
+    clearRelayCache()
+    // IP 字面量入口不走 DoH，纯内存路径，可以快速造出大量不同 key
+    for (let i = 0; i < 300; i++) {
+      await resolveRelayEntry(`10.0.${(i >> 8) & 255}.${i & 255}`)
+    }
+    expect(relayCacheSize()).toBeLessThanOrEqual(256)
+    expect(relayCacheSize()).toBeGreaterThan(200)
+    clearRelayCache()
+    expect(relayCacheSize()).toBe(0)
+  })
+})

@@ -1,0 +1,1321 @@
+package server
+
+// 本文件实现「部署类」API。
+//
+// ## 与 Electron 版的对应关系
+//
+//	window.cfpilot.runDeploy(params)     → POST /api/deploy/run
+//	window.cfpilot.checkDeployed(kvId)   → POST /api/deploy/check
+//	window.cfpilot.listKvOptions(accId)  → POST /api/kv/list
+//	window.cfpilot.createKvNamespace(...) → POST /api/kv/create
+//	window.cfpilot.detectAccount()       → POST /api/account/detect
+//
+// 部署是**长时间任务**（要建项目、配变量、等部署完成，可能 1~3 分钟），
+// 所以接口设计成：
+//   1. POST /api/deploy/run 立即返回 { started: true }
+//   2. 进度通过 SSE 的 `log` 事件持续推送
+//   3. 完成后推送 `deploy-status` 事件（含最终结果）
+//
+// 这样浏览器不会因为超时而中断，用户也能实时看到每一步。
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/cfapi"
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/deploy"
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/kernel"
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/safe"
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/store"
+)
+
+// deployState 记录当前部署任务状态（同一时刻只允许一个部署）。
+type deployState struct {
+	mu      sync.Mutex
+	running bool
+}
+
+// registerDeployRoutes 挂载部署相关路由。
+func (s *Server) registerDeployRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/api/deploy/run", s.guard(s.handleDeployRun))
+	mux.HandleFunc("/api/deploy/check", s.guard(s.handleDeployCheck))
+	mux.HandleFunc("/api/deploy/credentials", s.guard(s.handleDeployCredentials))
+	// 纯本地的部署信息（不联网、不用 Token）：运行状态卡片常态用
+	mux.HandleFunc("/api/deploy/local", s.guard(s.handleDeployLocal))
+	mux.HandleFunc("/api/account/detect", s.guard(s.handleAccountDetect))
+	mux.HandleFunc("/api/kv/list", s.guard(s.handleKvList))
+	mux.HandleFunc("/api/kv/create", s.guard(s.handleKvCreate))
+}
+
+// newCFClient 建一个 Cloudflare 客户端。
+//
+// 统一走 s.cfBase：生产恒为空（官方地址），
+// 测试可以指向 httptest 服务器来验证接口契约。
+func (s *Server) newCFClient(token string) *cfapi.Client {
+	return cfapi.New(cfapi.Options{Token: token, APIBase: s.cfBase})
+}
+
+// resolveKVNamespaceID 决定「本次用哪个 KV 命名空间」。
+//
+// 规则：**请求里指定的优先**，留空才回落到 profile 里保存的。
+//
+// ⚠️ 两个接口必须用同一套规则：
+//
+//	handleDeployCheck       读清单判断部署状态
+//	handleDeployCredentials 读清单返回面板凭据
+//
+// 之前凭据接口压根不解析请求体，只用 profile 里的 KV：
+// 下拉框选中的 KV 与 profile 保存的不一致时，
+// 返回的是**另一个 KV** 的面板密码 / UUID / WS 路径
+// → 用户拿错密码去登别的实例。
+func resolveKVNamespaceID(requested, profileKV string) string {
+	if v := strings.TrimSpace(requested); v != "" {
+		return v
+	}
+	return strings.TrimSpace(profileKV)
+}
+
+// freshKvPrefix 是「全新部署」自动新建的 KV 名称前缀（与 CLI 的 cfpilot-kv- 一致）。
+const freshKvPrefix = "cfpilot-kv-"
+
+// resolveDeployKv 决定本次部署**实际使用**的 KV 命名空间 ID。
+//
+// 规则：
+//   - 全新部署（mode=fresh）→ **忽略**请求 / 账户里选中的 KV，新建一个独占的
+//   - 其余情况          → 请求里指定的优先，留空回落到账户里保存的
+//
+// 返回的第二个值非空表示本次新建了 KV（界面据此刷新下拉框）。
+//
+// ## 为什么全新部署必须自建 KV
+//
+// 内核在 KV 里的键是**全局平铺**的（CONFIG / PANEL_PATH / ADMIN_PW_HASH …），
+// 没有实例前缀。拿一个已有实例的 KV 去跑「全新部署」，等于把新的
+// UUID / WS 路径 / 面板密码写进原实例的 CONFIG —— 原实例的所有客户端
+// 节点立刻失效，而且全程没有任何报错。
+//
+// 归属校验（deploy.assertKvOwnership）能拦下这种写入，但那是**兜底**：
+// 用户点「全新部署」的意图本来就是「再开一套」，还要求他先去凭据页
+// 手动新建并选中一个 KV，等于把内部约束摊给用户。这里直接建好。
+func (s *Server) resolveDeployKv(
+	ctx context.Context,
+	client *cfapi.Client,
+	profile *store.Profile,
+	mode, requested string,
+) (string, string, error) {
+	if strings.EqualFold(strings.TrimSpace(mode), "fresh") {
+		title := freshKvPrefix + shortRandom(8)
+		ns, err := client.CreateKVNamespace(ctx, profile.AccountID, title)
+		if err != nil {
+			return "", "", fmt.Errorf("全新部署需要新建 KV 命名空间，但创建失败：%w", err)
+		}
+		s.logLevel("全新部署：已新建 KV 命名空间 "+ns.Title+"（"+ns.ID+"）", "ok")
+		// 顺手写进当前账户：否则后续「检查状态 / 取凭据」还指着上一个实例
+		if _, e := s.store.SaveActive(store.Patch{KVNamespaceID: &ns.ID}); e != nil {
+			s.logLevel("保存 KV 选择失败："+e.Error(), "warn")
+		}
+		return ns.ID, ns.Title, nil
+	}
+
+	id := resolveKVNamespaceID(requested, profile.KVNamespaceID)
+	if id == "" {
+		return "", "", errors.New("尚未选择 KV 命名空间，请到「Cloudflare 凭据」页刷新 KV 列表并选一个")
+	}
+	// 顺手查出这个 KV 的**名称**：界面要显示「KV 名称」而不是一串 ID。
+	// 这里已经在用 Token（部署本身就要用），多查一次列表的成本可忽略。
+	title := ""
+	if list, err := client.ListKVNamespaces(ctx, profile.AccountID); err == nil {
+		for _, ns := range list {
+			if ns.ID == id {
+				title = ns.Title
+				break
+			}
+		}
+	}
+	return id, title, nil
+}
+
+// deploySkipSameVersion 判断本次部署是否跳过「线上版本与本地相同」的部署。
+//
+// 规则：
+//   - mode == "update" → 不跳过（用户显式点了「更新部署」）
+//   - force（界面的「强制重新部署」）→ 不跳过
+//   - 其余 → 跳过（避免无谓触发平台审核）
+//
+// ⚠️ 之前 force 是**死字段**：界面传了，后端一次都没用，
+// 于是勾了「强制重新部署」但线上版本相同时照样跳过 → 复选框完全无效。
+// CLI 的 --force 是生效的（skipSameVersion = !flagBool(args,'force')），
+// 两端必须一致（AGENTS.md §1.3）。
+func deploySkipSameVersion(mode string, force bool) bool {
+	return mode != "update" && !force
+}
+
+// deployRequest 是部署请求体（字段与 Electron 版 runDeploy 的 params 对齐）。
+type deployRequest struct {
+	Mode string `json:"mode"` // auto / fresh / update
+	// Force 对应界面的「强制重新部署（忽略版本相同则跳过）」。
+	//
+	// ⚠️ 与 ForceKv 语义不同，两个都要看：
+	//   - Force   → 忽略「线上版本 == 本地版本」这一跳过条件
+	//   - ForceKv → 强制越过 KV 归属校验（接管另一个实例占用的 KV）
+	Force bool `json:"force"`
+	// ForceKv 对应界面的「强制覆盖 KV」
+	ForceKv bool `json:"forceKv"`
+	// NewCredentials 表示重新生成全部凭据（不沿用清单）
+	NewCredentials bool `json:"newCredentials"`
+
+	ControlProject string `json:"controlProject"`
+	DataProject    string `json:"dataProject"`
+	PanelPath      string `json:"panelPath"`
+	WSPath         string `json:"wsPath"`
+
+	// DataHost 是 Workers 数据面的节点域名（写进控制面 DATA_HOST，工具不绑定）
+	DataHost string `json:"dataHost"`
+	// DataPlaneMode 是数据面部署形态：pages / workers。
+	//
+	// 留空 = 沿用部署清单里记录的形态（没有清单则 pages）。
+	// 界面**总是**发送当前选中的值，并在读取部署状态时把清单里的形态回填到
+	// 单选框 —— 否则「一个 Workers 实例被顺手更新一次」就会被悄悄改成 Pages。
+	DataPlaneMode string `json:"dataPlaneMode"`
+
+	// KVNamespaceID 可选，留空用当前账户里保存的
+	KVNamespaceID string `json:"kvNamespaceId"`
+
+	// PanelPassword 是**本次部署**要设置的面板密码（可选）。
+	//
+	// 留空表示随机生成（首次）或沿用清单原密码（更新）。
+	// ⚠️ 与账户里的 PanelPassword（用于改已部署面板的密码）严格分开。
+	PanelPassword string `json:"panelPassword"`
+}
+
+// handleDeployRun 启动部署（异步）。
+func (s *Server) handleDeployRun(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "仅支持 POST"})
+		return
+	}
+
+	var req deployRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体不是合法 JSON"})
+		return
+	}
+
+	// 取凭据
+	profile, err := s.store.Active()
+	if err != nil || profile == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "尚未保存 Cloudflare 凭据"})
+		return
+	}
+	if strings.TrimSpace(profile.CfToken) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "缺少 API Token，请先在「账户配置」里填写"})
+		return
+	}
+	if strings.TrimSpace(profile.AccountID) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "缺少账号 ID，请先点「自动检测账号」"})
+		return
+	}
+
+	// KV 解析：**全新部署会新建一个**，其余情况沿用请求 / 账户里选的（见 resolveDeployKv）
+	kvCtx, cancelKv := context.WithTimeout(context.Background(), 25*time.Second)
+	kvID, freshKvTitle, kvErr := s.resolveDeployKv(kvCtx, s.newCFClient(profile.CfToken), profile, req.Mode, req.KVNamespaceID)
+	cancelKv()
+	if kvErr != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": kvErr.Error()})
+		return
+	}
+
+	// 读内核产物
+	//
+	// ⚠️ 用 LoadPreferred 而不是 Load：远程若有**更新的内核**，
+	// 就用远程的部署（应用版本不再绑死部署用的代码）。
+	loadCtx, cancelLoad := context.WithTimeout(context.Background(), 90*time.Second)
+	artifacts, err := s.loadKernelArtifacts(loadCtx)
+	cancelLoad()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	controlScript := artifacts.Control
+	dataScript := artifacts.Data
+	build := artifacts.Build
+	kernelVersion := artifacts.Version
+
+	// 同一时刻只允许一个部署
+	s.deploy.mu.Lock()
+	if s.deploy.running {
+		s.deploy.mu.Unlock()
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "已有部署正在进行，请等待完成"})
+		return
+	}
+	s.deploy.running = true
+	s.deploy.mu.Unlock()
+
+	mode := req.Mode
+	if mode == "" || mode == "update" {
+		mode = "auto"
+	}
+
+	opt := deploy.DefaultOptions()
+	opt.Token = profile.CfToken
+	opt.AccountID = profile.AccountID
+	opt.KVNamespaceID = kvID
+	opt.ControlScript = controlScript
+	opt.DataScript = dataScript
+	opt.Mode = mode
+	// 数据面形态：只接受 pages / workers，其它值当作「沿用清单」
+	plane := strings.ToLower(strings.TrimSpace(req.DataPlaneMode))
+	if plane == "pages" || plane == "workers" {
+		opt.DataPlaneMode = plane
+	}
+	if opt.DataPlaneMode == "workers" {
+		opt.DataHost = strings.TrimSpace(req.DataHost)
+	}
+	opt.Force = req.ForceKv
+	opt.ControlProject = req.ControlProject
+	opt.DataProject = req.DataProject
+	opt.PanelPath = req.PanelPath
+	opt.WSPath = req.WSPath
+	// ⚠️ 部署密码只读 DeployPanelPassword，**绝不读 PanelPassword**
+	//
+	//
+	// 历史教训：
+	//   早期两个输入框都写同一个 PanelPassword 字段 ——
+	//     凭据页「修改已部署面板的密码」→ saveCredentials({panelPassword})
+	//     部署时                        → opt.PanelPassword = profile.PanelPassword
+	//   结果在凭据页改了密码，下次部署的密码也跟着变，
+	//   而云端环境变量加密，用户完全不知道自己改了部署密码，
+	//   于是面板登不进去（真机踩过）。
+	//
+	// 现在语义清晰：
+	//   - DeployPanelPassword：部署页填的，只在部署时用
+	//   - PanelPassword：凭据页填的，只用于「登录已部署面板去改密码」
+	//   - 都没填 → 首次部署随机生成 / 更新部署沿用清单原密码
+	if v := strings.TrimSpace(req.PanelPassword); v != "" {
+		opt.PanelPassword = v
+	} else {
+		opt.PanelPassword = strings.TrimSpace(profile.DeployPanelPassword)
+	}
+	opt.LocalBuild = build
+	opt.LocalKernelVersion = kernelVersion
+	// 「重新生成凭据」= 不沿用清单里的
+	opt.KeepCredentials = !req.NewCredentials
+	// ⚠️ 「强制重新部署」= 忽略「版本相同则跳过」。
+	//
+	// req.Force 之前是死字段（声明了但一次都没用），
+	// 界面上勾了「强制重新部署」但线上版本相同时照样跳过 → 复选框完全无效。
+	// CLI 的 --force 是生效的（skipSameVersion = !flagBool(args,'force')），
+	// 两端必须一致。
+	//
+	// ⚠️ 与 opt.Force（= req.ForceKv）语义不同，别混：
+	//   - ForceKv：强制越过 KV 归属校验（另一个实例占用时接管）
+	//   - Force  ：强制重新部署（哪怕线上版本与本地相同）
+	opt.SkipSameVersion = deploySkipSameVersion(req.Mode, req.Force)
+	opt.Log = func(m string) { s.logf(m) }
+	// KV 写配额日风控：部署一次要写两次 KV（清单 + CONFIG）。
+	// 本地按官方上限的十分之一封顶，防止程序 bug 把当天写配额打光。
+	opt.ClaimWrites = s.claimDailyWrite
+
+	// 异步执行：接口立即返回，进度走 SSE
+	go func() {
+		defer func() {
+			s.deploy.mu.Lock()
+			s.deploy.running = false
+			s.deploy.mu.Unlock()
+		}()
+
+		// ⚠️ **panic 兜底**：部署跑在后台 goroutine 里，
+		// panic 会让**整个进程**退出（托盘 + 服务 + 日志一起消失），
+		// 而 panic 信息在托盘模式的 stderr 里用户看不见。
+		//
+		// 接住 → 记日志（含堆栈）→ 报给界面，进程继续跑。
+		defer func() {
+			if r := safe.Recover("部署任务"); r != nil {
+				s.logLevel("部署过程发生内部错误，详情已记入日志（服务继续运行）", "err")
+				s.events.publish("deploy-status", map[string]any{
+					"ok":    false,
+					"error": "部署过程发生内部错误，详情已记入日志",
+				})
+			}
+		}()
+
+		res, runErr := deploy.New(opt).Run(context.Background())
+
+		payload := map[string]any{"ok": runErr == nil}
+		if runErr != nil {
+			payload["error"] = runErr.Error()
+			s.logLevel("部署失败："+runErr.Error(), "err")
+		} else {
+			payload["result"] = res
+			// 留档最近一次部署：运行状态卡片不用调 Token 也能显示它
+			s.saveSnapshot(&DeploySnapshot{
+				KVNamespaceID:    kvID,
+				KVTitle:          freshKvTitle,
+				ControlProject:   res.Control.Name,
+				ControlSubdomain: res.Control.Subdomain,
+				DataProject:      res.Data.Name,
+				DataSubdomain:    res.Data.Subdomain,
+				KernelVersion:    kernelVersion,
+				Build:            build,
+				At:               time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+				AccountID:        profile.AccountID,
+				AccountName:      profile.AccountName,
+				DataPlaneMode:    res.DataPlaneMode,
+			})
+			for _, warn := range res.Warnings {
+				s.logLevel("⚠ "+warn, "warn")
+			}
+			if res.Skipped {
+				s.logLevel("线上已是最新版本，跳过部署", "ok")
+			} else {
+				s.logLevel("部署完成", "ok")
+			}
+
+			// ⚠️ 必须把面板凭据完整打印出来
+			//
+			// 早期 Go 版**完全没有这段汇总**，导致：
+			//   - 部署成功后界面看不到面板密码 / 路径
+			//   - 云端环境变量是加密的，用户也读不到
+			//   - 结果：面板进不去（密码丢了就彻底没了）
+			//
+			// Electron 版一直有这段汇总，Go 版漏了。
+			// 注意：**只在面板密码不是从清单沿用来的全新值时**才值得强调，
+			// 但无论新旧都要显示 —— 用户可能忘了。
+			if !res.Skipped {
+				s.logSummary(res)
+			}
+		}
+		s.events.publish("deploy-status", payload)
+	}()
+
+	resp := map[string]any{
+		"started": true,
+		"note":    "部署已开始，进度会通过 SSE 实时推送",
+	}
+	// 全新部署自建的 KV：回给界面，让它把下拉框切到这个新命名空间
+	if freshKvTitle != "" {
+		resp["kvNamespaceId"] = kvID
+		resp["kvTitle"] = freshKvTitle
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// loadKernelArtifacts 读取「应该用于部署」的内核产物（control.js / dataplane.js）。
+//
+// 实际实现在 internal/kernel 包里 —— 那边用 go:embed 把产物**内嵌进 exe**，
+// 同时支持从 GitHub Release 拉取**更新的内核**（见 kernel.LoadPreferred）。
+//
+// ## 为什么改成内嵌
+//
+// 最初的设计假设「exe 旁边有 worker-core/dist 目录」，但构建脚本
+// 从来没把产物拷进去。用户下载的单文件 exe 完全不包含内核，
+// 点「开始部署」直接报「找不到内核产物」—— 部署功能 100% 不可用。
+//
+// 现在产物编译进二进制，真正的单文件分发。
+//
+// ## 为什么还要远程内核
+//
+// 内嵌意味着「部署用的代码被应用版本绑死」—— 用户没升级应用就
+// 只能部署旧内核。远程内核把两者解耦：应用不升级也能部署新内核。
+//
+// ⚠️ 远程不可用（离线）时**自动回退到内嵌产物**，绝不让部署失败。
+func (s *Server) loadKernelArtifacts(ctx context.Context) (*kernel.Artifacts, error) {
+	a, info, err := kernel.LoadPreferred(ctx, Version())
+	if err != nil && a == nil {
+		return nil, fmt.Errorf(
+			"内核产物不可用：%w\n"+
+				"  这通常意味着构建时漏了拷贝内核产物。\n"+
+				"  请重新执行 node scripts/build-desktop.mjs（它会自动拷贝）", err)
+	}
+	if err != nil {
+		// 降级（远程下载失败之类）：给出警告，但继续用可用的内核部署
+		s.logLevel("⚠ "+err.Error(), "warn")
+	}
+	if a == nil {
+		return nil, fmt.Errorf("内核产物不可用")
+	}
+	log.Printf("[cfpilot] 内核产物已加载（%s，control=%dKB data=%dKB，build=%s，内核版本=%s）",
+		a.Source, len(a.Control)/1024, len(a.Data)/1024, a.Build, a.Version)
+	if info != nil && info.Version != a.Version {
+		log.Printf("[cfpilot] 远程可用内核版本：%s（本次未采用）", info.Version)
+	}
+	return a, nil
+}
+
+// localKernelBuild 返回本地内核的构建指纹（不联网）。
+//
+// 「检查状态」只需要 build 指纹做「线上 ≠ 本地」的判断，
+// 不该为了拿指纹去连 GitHub。
+func localKernelBuild() string {
+	a, err := kernel.Load()
+	if err != nil {
+		return ""
+	}
+	return a.Build
+}
+
+// readBuildVersion 从产物里提取版本串。
+//
+// 产物里的版本形如 `<git短hash>-<源码内容哈希前8位>`，例如 `a946dfa-1f2e3d4c`。
+// 同时兼容纯数字（旧的 `202610251200` 格式）。
+//
+// ⚠️ 读不到就返回空串，**绝不返回 "unknown"** ——
+// 假值会让「检查状态」显示「线上内核 unknown ≠ 本地 xxx」，用户看不懂。
+func readBuildVersion(dir string, fallback []byte) string {
+	// 优先读独立的版本文件（构建脚本会写）
+	if raw, err := os.ReadFile(filepath.Join(dir, "build-version.txt")); err == nil {
+		if v := strings.TrimSpace(string(raw)); v != "" {
+			return v
+		}
+	}
+	// 从产物里正则找（`const BUILD_VERSION = "xxx"` 之类）
+	return extractBuildVersion(string(fallback))
+}
+
+// handleDeployCheck 检查线上部署状态。
+//
+// 返回 DeployStatus（与 Electron 版的 checkDeployed 对齐）：
+//
+//	{ state: 'none'|'outdated'|'latest'|'blocked',
+//	  reason?: 'no-token'|'no-account'|'no-kv',
+//	  localBuild, remoteBuild, controlProject, dataProject, ... }
+//
+// 另外还返回**内核版本对比**（build 指纹比不出新旧，semver 可以）：
+//
+//	{ kernelVersion:       线上已部署的内核版本（清单里的；旧清单为空 = 未知）
+//	  localKernelVersion:  应用内嵌的内核版本（= 应用版本）
+//	  remoteKernelVersion: 远程最新的内核版本（查不到就是空串）
+//	  kernelUpdatable:     远程是否比线上新
+//	  kernelRemoteError:   远程查询失败的原因（没有失败就是空串） }
+func (s *Server) handleDeployCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "仅支持 POST"})
+		return
+	}
+
+	var req struct {
+		KVNamespaceID string `json:"kvNamespaceId"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	profile, err := s.store.Active()
+	if err != nil || profile == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"state": "none", "hasDeploy": false, "reason": "no-token"})
+		return
+	}
+	if strings.TrimSpace(profile.CfToken) == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"state": "none", "hasDeploy": false, "reason": "no-token"})
+		return
+	}
+	if strings.TrimSpace(profile.AccountID) == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"state": "none", "hasDeploy": false, "reason": "no-account"})
+		return
+	}
+	kvID := resolveKVNamespaceID(req.KVNamespaceID, profile.KVNamespaceID)
+	if kvID == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"state": "none", "hasDeploy": false, "reason": "no-kv"})
+		return
+	}
+
+	client := s.newCFClient(profile.CfToken)
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+
+	// 先读清单
+	raw, ok := client.GetKVValue(ctx, profile.AccountID, kvID, deploy.ManifestKey)
+	if !ok || strings.TrimSpace(raw) == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"state": "none", "hasDeploy": false})
+		return
+	}
+	var m deploy.Manifest
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"state": "none", "hasDeploy": false, "note": "部署清单格式损坏"})
+		return
+	}
+
+	// 「本次部署会用的内核」——通道比内置新时是通道内核，否则是内置内核。
+	// 它才是判断「线上是否最新」的唯一参照物（见 kernel.ResolveTarget）。
+	targetCtx, cancelTarget := context.WithTimeout(ctx, 8*time.Second)
+	target := kernel.ResolveTarget(targetCtx, Version())
+	cancelTarget()
+
+	// 部署实际会使用的 build（不是「exe 里内嵌的那份」—— 两者在走内核
+	// 热更新通道时会不同，用错就会出现「部署完还是显示可升级」）。
+	localBuild := target.Build
+	if strings.TrimSpace(localBuild) == "" {
+		localBuild = localKernelBuild()
+	}
+
+	// 线上版本：优先问数据面自己（最权威），探不到才回落清单里的值。
+	//
+	// ⚠️ 用 `rv.Build`（构建指纹）比对，**不能**用 `rv.Version`（语义版本）：
+	// 两者含义不同，混用会让「线上与本地是否同一份产物」永远判为不同。
+	// 见 version_probe.go 的 remoteVersion 注释。
+	remoteBuild := m.Build
+	liveKernel := ""
+	if m.DataSubdomain != "" {
+		if rv := s.probeRemoteVersion(ctx, m.DataSubdomain); rv.Build != "" || rv.Version != "" {
+			if rv.Build != "" {
+				remoteBuild = rv.Build
+			}
+			liveKernel = rv.Version
+		}
+	}
+
+	state := "latest"
+	switch {
+	case remoteBuild == "" || localBuild == "":
+		// 有一边读不到，无法判断新旧，按 outdated 处理让用户可选择更新
+		state = "outdated"
+	case remoteBuild != localBuild:
+		state = "outdated"
+	}
+
+	// ---------------- 内核版本对比 ----------------
+	//
+	// ⚠️ 远程查询**必须能失败**（离线时不能让整个检查状态失败）。
+	// 查不到就返回空串 + kernelUpdatable=false，并给出说明字段。
+	ks := kernelStatus{Deployed: strings.TrimSpace(m.KernelVersion), Local: Version()}
+	// 线上自报的语义版本比清单可靠（清单是部署时写死的，用户可能在控制台
+	// 手工重新部署过）。有就用它；没有才退回清单值。
+	//
+	// 这就是「Workers 实例没有内核版本」的直接修法：不再只依赖清单。
+	if liveKernel != "" && liveKernel != "dev" {
+		ks.Deployed = liveKernel
+	}
+	// 内核更新判定的唯一口径：**线上已部署的 build** 是否等于「现在部署会用的那份」。
+	//
+	// ⚠️ 不能拿通道序号去比「本程序内置的锚点」：内置锚点只在应用升级时变，
+	// 而「更新内核」更新的是线上部署 —— 那样比出来的结论在更新完成后依然
+	// 是「有更新」，用户就会看到提示永远消不掉（真机反复出现）。
+	// target 已在上面解析（state 的计算也用它）。
+	if target.Info != nil {
+		// 通道可用：直接用通道版本号展示（k<序号> 比不了 semver）
+		ks.Remote = target.Version
+		ks.MinToolBlocked = target.Blocked
+		ks.ChannelNewer = target.HasUpdateAgainstDeployed(remoteBuild)
+		ks.ChannelLatest = !ks.ChannelNewer
+		if ks.ChannelLatest {
+			// 线上已是要部署的那份（可能比本程序内置还新，也可能同版本）→ 不是 outdated
+			state = "latest"
+		} else {
+			state = "outdated"
+		}
+	} else {
+		// 通道不可用（离线 / 未发布）→ 回退包 Release 的 semver 对比
+		remoteCtx, cancelRemote := context.WithTimeout(ctx, 8*time.Second)
+		if info, e := kernel.FetchRemoteInfo(remoteCtx); e != nil {
+			ks.RemoteErr = e.Error()
+			s.logLevel("⚠ 查询远程内核版本失败："+e.Error(), "warn")
+		} else if info != nil {
+			ks.Remote = info.Version
+		}
+		cancelRemote()
+	}
+
+	// 检查过状态 = 拿到了最新的部署记录 → 顺手刷新本地快照，
+	// 这样「运行状态」卡片在下次打开时能直接显示它（不用再调 Token）。
+	kvTitle := ""
+	if list, err := client.ListKVNamespaces(ctx, profile.AccountID); err == nil {
+		for _, ns := range list {
+			if ns.ID == kvID {
+				kvTitle = ns.Title
+				break
+			}
+		}
+	}
+	info := InstanceInfo{
+		KVTitle:          kvTitle,
+		ControlProject:   m.ControlProject,
+		DataProject:      m.DataProject,
+		ControlSubdomain: m.ControlSubdomain,
+		DataSubdomain:    m.DataSubdomain,
+		KernelVersion:    ks.Deployed,
+		Build:            remoteBuild,
+		At:               m.At,
+	}
+	s.rememberInstances(map[string]InstanceInfo{kvID: info})
+	s.saveSnapshot(&DeploySnapshot{
+		KVNamespaceID:    kvID,
+		KVTitle:          kvTitle,
+		ControlProject:   m.ControlProject,
+		ControlSubdomain: m.ControlSubdomain,
+		DataProject:      m.DataProject,
+		DataSubdomain:    m.DataSubdomain,
+		KernelVersion:    ks.Deployed,
+		Build:            remoteBuild,
+		At:               m.At,
+		AccountID:        profile.AccountID,
+		AccountName:      profile.AccountName,
+		DataPlaneMode:    m.DataPlaneMode,
+	})
+
+	// 节点域名：**以平台上的真实绑定为准**（清单可能已被写脏）。
+	//
+	// 真机事故（2026-11-02）：清单里的 dataCustomDomain 是另一个账号的域名，
+	// 照着它回填输入框 → 用户看不出填错 → 更新部署再次写坏。
+	hostCtx, cancelHost := nodeHostContext(ctx)
+	nodeHost := s.resolveNodeHost(hostCtx, client, profile.AccountID, &m)
+	cancelHost()
+	// 清单被写脏时顺手修正，让它自愈（只在不一致时写一次 KV）。
+	repairCtx, cancelRepair := nodeHostContext(ctx)
+	s.repairManifestNodeHost(repairCtx, client, profile.AccountID, kvID, &m, nodeHost)
+	cancelRepair()
+
+	resp := buildDeployStatusResponse(&m, state, localBuild, remoteBuild, ks)
+	resp["nodeHost"] = nodeHost.Host
+	resp["nodeHostSource"] = nodeHost.Source
+	resp["nodeHostWarning"] = nodeHost.Warning
+	resp["nodeHostStale"] = nodeHost.Stale
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// kernelStatus 是内核版本的对比结果。
+type kernelStatus struct {
+	// Deployed 是线上已部署的内核版本（清单里的；旧清单为空 = 版本未知）
+	Deployed string
+	// Local 是应用内嵌的内核版本（= 应用版本）
+	Local string
+	// Remote 是远程最新的内核版本（查不到就是空串；内核热更新通道的
+	// 版本号形如 k202611141435，不是 semver）
+	Remote string
+	// ChannelNewer 表示「有更新」来自内核热更新通道（而非包 Release）。
+	// 此时 Updatable 无条件为 true —— 通道序号比内置锚点新就意味着
+	// 「内置内核已经落后」，与线上部署的是哪个版本无关。
+	ChannelNewer bool
+	// ChannelLatest 表示线上已部署的 build 就是官方通道的最新 build。
+	// 此时无论与本程序内置是否一致，都不需要更新（可能是用户刚在
+	// 别的工具里更新过内核，线上比内置还新）。
+	ChannelLatest bool
+	// MinToolBlocked 表示通道内核要求更高的工具版本，本次不宜升级
+	// （旧工具部署新内核会踩协议不兼容，提示里要说清「先升级工具」）
+	MinToolBlocked bool
+	// RemoteErr 是远程查询失败的原因（没有失败就是空串）
+	RemoteErr string
+}
+
+// Updatable 判断远程内核是否比线上更新。
+//
+// 内核热更新通道判定「有更新」时（ChannelNewer）无条件可升级 ——
+// 通道序号是单调递增的，比内置锚点新就是有新内核。
+// 线上已是通道最新（ChannelLatest）时不可升级 —— 就算它和本程序内置不一致
+// （线上可能比内置还新，点「更新」反而会降级）。
+//
+// ⚠️ 线上版本未知（空串）时，CompareSemver 把空串当成「更旧」，
+// 于是结果为 true —— 这是**故意的**：
+// 线上版本都读不出来，用户更应该重新部署一次拿到确定的版本。
+//
+// 远程版本查不到（离线）时永远是 false —— 不能凭「查不到」就催用户更新。
+func (k kernelStatus) Updatable() bool {
+	if k.ChannelLatest || k.MinToolBlocked {
+		return false
+	}
+	if k.ChannelNewer {
+		return true
+	}
+	if strings.TrimSpace(k.Remote) == "" {
+		return false
+	}
+	return kernel.CompareSemver(k.Remote, strings.TrimSpace(k.Deployed)) > 0
+}
+
+// buildDeployStatusResponse 组装「检查状态」的响应体。
+//
+// 抽成纯函数是为了能直接测字段契约（界面读的就是这些字段名）。
+// dataPlaneModeOf 归一化清单里的数据面形态。
+//
+// 旧清单没有这个字段（历史版本只有 Pages 形态），一律按 pages 处理 ——
+// 不能返回空串，否则界面单选框会「一个都不选中」。
+func dataPlaneModeOf(m *deploy.Manifest) string {
+	if m != nil && m.DataPlaneMode == "workers" {
+		return "workers"
+	}
+	return "pages"
+}
+
+func buildDeployStatusResponse(
+	m *deploy.Manifest,
+	state, localBuild, remoteBuild string,
+	ks kernelStatus,
+) map[string]any {
+	return map[string]any{
+		// ⚠️ 字段名必须与 Electron 版 DeployStatus **逐字段一致**
+		//
+		//
+		// 界面代码（renderer.ts 的 applyDeployStatus）读的是：
+		//   status.build        ← 线上内核版本
+		//   status.localBuild   ← 本地内核版本
+		//   status.at           ← 部署时间
+		//
+		// 我最初返回 remoteBuild / deployedAt，于是：
+		//   - status.build 是 undefined → `if (!status.build)` 恒为真
+		//     → 永远走「读不到版本」分支，界面看起来毫无变化
+		//   - status.at 是 undefined → 不显示部署时间
+		//
+		// 这就是用户看到的「永远是空壳按钮、只打一句日志」。
+		"state":            state,
+		"hasDeploy":        true,
+		"build":            remoteBuild, // 契约字段名（线上版本）
+		"localBuild":       localBuild,
+		"at":               m.At, // 契约字段名（部署时间）
+		"controlProject":   m.ControlProject,
+		"dataProject":      m.DataProject,
+		"controlSubdomain": m.ControlSubdomain,
+		"dataSubdomain":    m.DataSubdomain,
+		"customDomain":     m.DataCustomDomain,
+		// 数据面形态：界面用它把「Pages / Workers」单选框回填成线上实际形态。
+		// 旧清单没有这个字段 → 按 pages 处理（旧版本只有 Pages 形态）。
+		"dataPlaneMode": dataPlaneModeOf(m),
+
+		// ---- 内核版本对比（新增）----
+		//
+		// kernelVersion         线上已部署的内核版本（清单里的，旧清单为空 = 未知）
+		// localKernelVersion    应用内嵌的内核版本（= 应用版本）
+		// remoteKernelVersion   远程最新的内核版本（查不到就是空串）
+		// kernelUpdatable       远程是否比线上新
+		// kernelRemoteError     远程查询失败的原因（没有失败就是空串）
+		"kernelVersion":       ks.Deployed,
+		"localKernelVersion":  ks.Local,
+		"remoteKernelVersion": ks.Remote,
+		"kernelUpdatable":     ks.Updatable(),
+		"kernelRemoteError":   ks.RemoteErr,
+		// 线上 build == 官方通道最新 build：界面用它把「已经是最新」
+		// 说清楚（哪怕线上与本程序内置的 build 不同 —— 用户在别的工具
+		// 里更新过内核时，「更新」按钮反而是降级，必须拦住）。
+		"kernelChannelLatest": ks.ChannelLatest,
+	}
+}
+
+// handleDeployCredentials 返回清单里保存的面板凭据（供界面随时查看）。
+//
+// ## 为什么需要这个接口
+//
+// Cloudflare 平台上的环境变量是**加密的**（页面只显示 `****`），
+// 所以一旦部署完成时没记下面板密码，用户就彻底拿不回来了。
+//
+// 部署清单（KV 里的 CFP_DEPLOY_MANIFEST）里保存了明文凭据，
+// 这个接口把它读出来给界面展示。数据只在本机回环服务内流转。
+//
+// ⚠️ 安全：接口仍需会话 Cookie；不对外网暴露。
+func (s *Server) handleDeployCredentials(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "仅支持 POST"})
+		return
+	}
+
+	// ⚠️ 必须解请求体里的 kvNamespaceId —— 界面传的正是「当前选中的 KV」。
+	//
+	// 之前这里连请求体都没解，只用 profile 里保存的 KV：
+	// 下拉框选中的 KV 与 profile 保存的不一致时，
+	// 返回的是**另一个 KV** 的面板密码 / UUID / WS 路径
+	// → 用户拿错密码去登别的实例。
+	//
+	// 与 handleDeployCheck 保持一致：请求优先，留空才用 profile 的。
+	var req struct {
+		KVNamespaceID string `json:"kvNamespaceId"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	profile, err := s.store.Active()
+	if err != nil || profile == nil || strings.TrimSpace(profile.CfToken) == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "请先保存 API Token"})
+		return
+	}
+	kvID := resolveKVNamespaceID(req.KVNamespaceID, profile.KVNamespaceID)
+	if kvID == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "请先选择 KV 命名空间"})
+		return
+	}
+
+	client := s.newCFClient(profile.CfToken)
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+
+	raw, ok := client.GetKVValue(ctx, profile.AccountID, kvID, deploy.ManifestKey)
+	if !ok || strings.TrimSpace(raw) == "" {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":    false,
+			"error": "这个 KV 里没有部署记录，请先完成一次部署",
+		})
+		return
+	}
+	var m deploy.Manifest
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "部署清单格式损坏"})
+		return
+	}
+
+	// 面板完整地址 = 控制面域名 + 面板路径
+	// ⚠️ 面板路径必须保证带前导斜杠（兼容清单里可能存在的旧格式裸串）
+	panelPath := m.Credentials.PanelPath
+	if panelPath != "" && !strings.HasPrefix(panelPath, "/") {
+		panelPath = "/" + panelPath
+	}
+	panelURL := ""
+	if m.ControlSubdomain != "" && panelPath != "" {
+		host := m.ControlSubdomain
+		if !strings.HasPrefix(host, "http") {
+			host = "https://" + host
+		}
+		panelURL = host + panelPath
+	}
+
+	// 控制面自定义域名：清单里不存这个字段（只有数据面的 dataCustomDomain），
+	// 所以以平台上控制面 Pages 项目的**真实绑定**为准。
+	//
+	// 用户在 Cloudflare 控制台手动绑定的域名也能显示；查不到（未绑定 / 网络失败）
+	// 时返回空串，由界面给出「未绑定」提示，而不是把这一行藏起来。
+	// 单独用 5 秒子超时：不能让一趟平台查询拖慢「查看凭据」这个本机操作。
+	panelCustomDomain := ""
+	if project := strings.TrimSpace(m.ControlProject); project != "" {
+		domainCtx, cancelDomain := context.WithTimeout(ctx, 5*time.Second)
+		if p, e := client.GetPagesProject(domainCtx, profile.AccountID, project); e == nil && p != nil {
+			for _, d := range p.Domains {
+				host := strings.TrimSpace(d)
+				if host == "" || strings.HasSuffix(strings.ToLower(host), ".pages.dev") {
+					continue
+				}
+				panelCustomDomain = host
+				break
+			}
+		}
+		cancelDomain()
+	}
+	panelCustomURL := ""
+	if panelCustomDomain != "" && panelPath != "" {
+		host := panelCustomDomain
+		if !strings.HasPrefix(host, "http") {
+			host = "https://" + host
+		}
+		panelCustomURL = host + panelPath
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":                true,
+		"panelUrl":          panelURL,
+		"panelCustomDomain": panelCustomDomain,
+		"panelCustomUrl":    panelCustomURL,
+		"panelPath":         panelPath,
+		"panelPassword":     m.Credentials.PanelPassword,
+		"uuid":              m.Credentials.UUID,
+		"wsPath":            m.Credentials.WSPath,
+		"dataSubdomain":     m.DataSubdomain,
+		"build":             m.Build,
+		"at":                m.At,
+	})
+}
+
+// logSummary 打印部署完成后的凭据汇总。
+//
+// ## 为什么必须有
+//
+// 用户部署成功后**看不到面板密码**，而 Cloudflare 平台上的环境变量
+// 是加密的（页面只显示 `****`），所以密码一旦没记录就彻底找不回来，
+// 面板永远进不去。
+//
+// Electron 版一直有这个汇总块，Go 版漏了 —— 属于功能缺失。
+//
+// 输出内容（与 Electron 版对齐）：
+//   - 控制面 / 数据面的访问地址
+//   - UUID、WS 路径
+//   - **面板路径与面板密码**（最关键）
+func (s *Server) logSummary(res *deploy.Result) {
+	line := strings.Repeat("─", 52)
+
+	s.logLevel(line, "info")
+	s.logLevel("部署完成，以下是访问本实例所需的全部信息", "ok")
+	s.logLevel(line, "info")
+
+	if res.Control.Subdomain != "" {
+		s.logLevel("控制面地址："+res.Control.Subdomain, "info")
+	}
+	if res.Data.Subdomain != "" {
+		s.logLevel("订阅域名："+res.Data.Subdomain, "info")
+	}
+
+	if res.UUID != "" {
+		s.logLevel("UUID："+res.UUID, "info")
+	}
+	if res.WSPath != "" {
+		s.logLevel("WS 路径："+res.WSPath, "info")
+	}
+
+	// ⚠️ 面板凭据单独强调 —— 这是用户唯一一次能看到明文密码的机会
+	if res.PanelPath != "" {
+		s.logLevel("面板路径："+res.PanelPath, "ok")
+	}
+	if res.PanelPassword != "" {
+		s.logLevel("面板密码："+res.PanelPassword, "ok")
+		s.logLevel("⚠ 请立刻保存面板密码 —— 云端环境变量是加密的，之后无法再读取", "warn")
+	}
+
+	if res.Control.Subdomain != "" && res.PanelPath != "" {
+		s.logLevel("面板完整地址：https://"+res.Control.Subdomain+res.PanelPath, "ok")
+	}
+
+	s.logLevel(line, "info")
+}
+
+// handleAccountDetect 检测账号（用 Token 列出账号）。
+func (s *Server) handleAccountDetect(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "仅支持 POST"})
+		return
+	}
+
+	var req struct {
+		// Token 可选：不传就用已保存的（界面重新检测时不必重输）
+		Token string `json:"token"`
+		// ProfileID 可选：指定要检测的账户配置 ID（防并发切换账户时读错/写错目标）
+		ProfileID string `json:"profileId"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	// usingProfileToken 表示「本次探测用的是当前 profile 自己的 Token」。
+	//
+	// ⚠️ 只有这种情况下才能把探测结果写回 profile。
+	//
+	// 调用方显式传了外部 Token（req.Token != ""）时，探测出来的账号
+	// 属于**那个外部 Token**，而当前 profile 的 CfToken 并不会更新 ——
+	// 写回 AccountID 会让 profile 变成「token A + accountId B」的混合体：
+	// 之后拿 token A 去列 account B 的 KV → 403 / 空列表。
+	// 所以外部 Token 只回显探测结果，**绝不落盘**。
+	token := strings.TrimSpace(req.Token)
+	profileID := strings.TrimSpace(req.ProfileID)
+	usingProfileToken := token == ""
+	if usingProfileToken {
+		var (
+			p   *store.Profile
+			err error
+		)
+		if profileID != "" {
+			p, err = s.store.Get(profileID)
+		} else {
+			p, err = s.store.Active()
+		}
+		if err != nil || p == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请先填写 API Token"})
+			return
+		}
+		profileID = p.ID
+		token = p.CfToken
+	}
+	if token == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请先填写 API Token"})
+		return
+	}
+
+	client := s.newCFClient(token)
+	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+	defer cancel()
+
+	accounts, err := client.ListAccounts(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "无法列出账号：" + err.Error(),
+		})
+		return
+	}
+	if len(accounts) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "这个 Token 下没有任何账号，请检查权限（需要 Account Settings: Read）",
+		})
+		return
+	}
+
+	// 只有一个账号时直接用；多个时返回列表让界面选
+	if len(accounts) == 1 {
+		acc := accounts[0]
+		// 顺手把账号信息写回对应的 profile
+		//
+		// ⚠️ 仅限「用的是 profile 自己的 Token」：
+		// 外部 Token 探测出来的账号不属于本 profile，
+		// 写回去会造成「token A + accountId B」的混合体（见上面的说明）。
+		if usingProfileToken {
+			var saveErr error
+			if profileID != "" {
+				_, saveErr = s.store.Update(profileID, store.Patch{
+					AccountID:   &acc.ID,
+					AccountName: &acc.Name,
+				})
+			} else {
+				_, saveErr = s.store.SaveActive(store.Patch{
+					AccountID:   &acc.ID,
+					AccountName: &acc.Name,
+				})
+			}
+			if saveErr != nil {
+				s.logLevel("保存账号信息失败："+saveErr.Error(), "warn")
+			}
+			// 顺手在后台采集一次账号用量：点开「用量/额度」时直接有数据，
+			// 不用临时再花一次 API 调用（后台任务，不阻塞本次响应）。
+			s.primeUsageCache()
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"accountId":   acc.ID,
+			"accountName": acc.Name,
+			"accounts": []map[string]string{
+				{"id": acc.ID, "name": acc.Name},
+			},
+			// saved=false 表示「只回显、没落盘」（外部 Token 探测）。
+			"saved": usingProfileToken,
+		})
+		return
+	}
+
+	list := make([]map[string]string, 0, len(accounts))
+	for _, a := range accounts {
+		list = append(list, map[string]string{"id": a.ID, "name": a.Name})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"accountId":   "",
+		"accountName": "",
+		"accounts":    list,
+		"saved":       usingProfileToken,
+	})
+}
+
+// handleKvList 列出 KV 命名空间并标注归属。
+//
+// 归属判定与部署侧的 inspectKvOwnership 保持一致：
+//
+//	instance  本工具部署的实例（含清单）
+//	foreign   被旧版第三方实现占用 —— **界面应禁用**
+//	cfpilot   含 CFPilot 配置但无清单（残留）
+//	empty     空
+func (s *Server) handleKvList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "仅支持 POST"})
+		return
+	}
+
+	var req struct {
+		AccountID string `json:"accountId"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	profile, err := s.store.Active()
+	if err != nil || profile == nil || strings.TrimSpace(profile.CfToken) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "尚未保存 API Token"})
+		return
+	}
+	accountID := strings.TrimSpace(req.AccountID)
+	if accountID == "" {
+		accountID = profile.AccountID
+	}
+	if accountID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "缺少账号 ID"})
+		return
+	}
+
+	// 走 newCFClient（而不是直接 cfapi.New）：测试可注入假 API 根地址
+	client := s.newCFClient(profile.CfToken)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	nsList, err := client.ListKVNamespaces(ctx, accountID)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "列出 KV 失败：" + err.Error()})
+		return
+	}
+
+	type kvOption struct {
+		ID               string `json:"id"`
+		Title            string `json:"title"`
+		Ownership        string `json:"ownership"`
+		ControlProject   string `json:"controlProject,omitempty"`
+		DataProject      string `json:"dataProject,omitempty"`
+		At               string `json:"at,omitempty"`
+		Build            string `json:"build,omitempty"`
+		ControlSubdomain string `json:"controlSubdomain,omitempty"`
+		DataSubdomain    string `json:"dataSubdomain,omitempty"`
+	}
+
+	// ---- 逐个命名空间探测，但**并发** ----
+	//
+	// 每个命名空间先列键名（1 趟），有清单键才再读一次值（第 2 趟）。
+	// 串行时 6 个命名空间实测要 20~25 秒（跨境链路 RTT 大），
+	// 而凭据页启动时就会触发这个请求 —— 用户看到的是「检测账号…」卡住二十多秒，
+	// 很像程序假死。
+	//
+	// 并发 4 路（不无限放大：CF 免费版有速率限制）：实测降到 5~8 秒，
+	// 且顺序不变（结果按下标写回，前端下拉框顺序稳定）。
+	const kvProbeConcurrency = 4
+	options := make([]kvOption, len(nsList))
+	for i, ns := range nsList {
+		options[i] = kvOption{ID: ns.ID, Title: ns.Title, Ownership: "empty"}
+	}
+
+	sem := make(chan struct{}, kvProbeConcurrency)
+	var wg sync.WaitGroup
+	for i := range nsList {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			ns := nsList[i]
+			opt := &options[i]
+
+			// 1) 先列键名：归属靠**键名集合**判定，不能只看 config / CONFIG。
+			//    别的项目可能用 `c` / `wk` / `rm` 这类键名，只探两个键会把
+			//    真实占用判成「空命名空间」，用户一下部署就把对方配置覆盖了。
+			keys, kerr := client.ListKVKeys(ctx, accountID, ns.ID)
+			if kerr != nil {
+				// 读不到 ≠ 空 —— 标成占用，界面会禁用它
+				opt.Ownership = "foreign"
+				return
+			}
+			if len(keys) == 0 {
+				opt.Ownership = "empty"
+				return
+			}
+
+			hasManifest := false
+			cfpilotTouched := false
+			for _, key := range keys {
+				if key == deploy.ManifestKey {
+					hasManifest = true
+				}
+				if deploy.IsCfPilotKVKey(key) {
+					cfpilotTouched = true
+				}
+			}
+
+			// 2) 有清单 → instance（或清单损坏 → cfpilot 残留）
+			if hasManifest {
+				if raw, ok := client.GetKVValue(ctx, accountID, ns.ID, deploy.ManifestKey); ok && strings.TrimSpace(raw) != "" {
+					var m deploy.Manifest
+					if err := json.Unmarshal([]byte(raw), &m); err == nil {
+						opt.Ownership = "instance"
+						opt.ControlProject = m.ControlProject
+						opt.DataProject = m.DataProject
+						opt.At = m.At
+						opt.Build = m.Build
+						opt.ControlSubdomain = m.ControlSubdomain
+						opt.DataSubdomain = m.DataSubdomain
+						return
+					}
+				}
+				opt.Ownership = "cfpilot"
+				return
+			}
+
+			if cfpilotTouched {
+				opt.Ownership = "cfpilot"
+				return
+			}
+
+			// 3) 有键但一个都不是本项目的 → 被其它项目占着（界面禁用）
+			opt.Ownership = "foreign"
+		}(i)
+	}
+	wg.Wait()
+
+	instanceCount := 0
+	known := map[string]InstanceInfo{}
+	for _, o := range options {
+		if o.Ownership == "instance" {
+			instanceCount++
+			known[o.ID] = InstanceInfo{
+				KVTitle:          o.Title,
+				ControlProject:   o.ControlProject,
+				DataProject:      o.DataProject,
+				ControlSubdomain: o.ControlSubdomain,
+				DataSubdomain:    o.DataSubdomain,
+				Build:            o.Build,
+				At:               o.At,
+			}
+		}
+	}
+	// 把实例信息记到本地：部署页显示「KV 名称 · 控制面 / 数据面」时不用再调 Token。
+	s.rememberInstances(known)
+	s.logf(fmt.Sprintf("找到 %d 个 KV 命名空间，其中 %d 个是 CFPilot 实例", len(options), instanceCount))
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"options":   options,
+		"total":     len(options),
+		"instances": instanceCount,
+	})
+}
+
+// handleKvCreate 新建 KV 命名空间。
+func (s *Server) handleKvCreate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "仅支持 POST"})
+		return
+	}
+
+	var req struct {
+		AccountID string `json:"accountId"`
+		Title     string `json:"title"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体不是合法 JSON"})
+		return
+	}
+
+	profile, err := s.store.Active()
+	if err != nil || profile == nil || strings.TrimSpace(profile.CfToken) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "尚未保存 API Token"})
+		return
+	}
+	accountID := strings.TrimSpace(req.AccountID)
+	if accountID == "" {
+		accountID = profile.AccountID
+	}
+	if accountID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "缺少账号 ID"})
+		return
+	}
+
+	title := strings.TrimSpace(req.Title)
+	if title == "" {
+		title = "cfpilot-gui-" + shortRandom(8)
+	}
+
+	client := s.newCFClient(profile.CfToken)
+	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+	defer cancel()
+
+	ns, err := client.CreateKVNamespace(ctx, accountID, title)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "创建 KV 失败：" + err.Error()})
+		return
+	}
+
+	s.logLevel("已创建 KV 命名空间 "+ns.Title+"（"+ns.ID+"）", "ok")
+
+	// 顺手写入当前账户，避免用户还要再选一次
+	if _, e := s.store.SaveActive(store.Patch{KVNamespaceID: &ns.ID}); e != nil {
+		s.logLevel("保存 KV 选择失败："+e.Error(), "warn")
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":    ns.ID,
+		"title": ns.Title,
+	})
+}
+
+// shortRandom 生成短的随机后缀。
+func shortRandom(n int) string {
+	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+	out := make([]byte, n)
+	now := time.Now().UnixNano()
+	for i := range out {
+		out[i] = alphabet[(now>>uint(i*3))%int64(len(alphabet))]
+	}
+	return string(out)
+}
+
+// errNoArtifacts 表示找不到内核产物。
+var errNoArtifacts = errors.New("找不到内核产物")

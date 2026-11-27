@@ -1,0 +1,349 @@
+package server
+
+// 优选 API 的测试。
+//
+// 重点验证：
+//   - 缺域名时给出可操作的提示（而不是启动一个注定失败的扫描）
+//   - 自定义候选的清洗（粘 1000 行只认出 3 个是常见坑）
+//   - pages.dev 域名规范化（曾经的 `a.pages.dev.pages.dev` 事故）
+//   - 端口探测与地区列表
+
+import (
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/scan"
+)
+
+// 缺域名必须 400，且提示能指导用户。
+func TestScanRunRequiresHost(t *testing.T) {
+	s, base := newTestServer(t)
+	s.SetStore(newEmptyStore(t))
+	cookie := loginCookie(t, s, base)
+
+	code, body := postJSON(t, base+"/api/scan/run", cookie, map[string]any{
+		"sample": 10,
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("缺域名应 400，实际 %d (%v)", code, body)
+	}
+	if !strings.Contains(str(body["error"]), "域名") {
+		t.Errorf("错误信息应提到域名，实际 %v", body["error"])
+	}
+}
+
+// 带协议前缀的域名要能自动清洗掉。
+func TestScanRunStripsScheme(t *testing.T) {
+	s, base := newTestServer(t)
+	s.SetStore(newEmptyStore(t))
+	cookie := loginCookie(t, s, base)
+
+	// 只验证接口接受并启动了任务（不等扫描完成）
+	code, body := postJSON(t, base+"/api/scan/run", cookie, map[string]any{
+		"host":       "https://cf.example.com/",
+		"candidates": "127.0.0.1",
+		"port":       1,
+		"top":        5,
+	})
+	if code != http.StatusOK {
+		t.Fatalf("应接受，实际 %d (%v)", code, body)
+	}
+	if body["started"] != true {
+		t.Errorf("应返回 started=true，实际 %v", body["started"])
+	}
+}
+
+// 扫描接口只接受 POST。
+func TestScanRunRejectsGET(t *testing.T) {
+	s, base := newTestServer(t)
+	cookie := loginCookie(t, s, base)
+	if code := doGetWithCookie(t, base+"/api/scan/run", cookie); code != http.StatusMethodNotAllowed {
+		t.Errorf("GET 应 405，实际 %d", code)
+	}
+}
+
+// 候选清洗接口：粘 CSV 也要正确认出来。
+func TestScanParseCandidates(t *testing.T) {
+	s, base := newTestServer(t)
+	cookie := loginCookie(t, s, base)
+
+	raw := strings.Join([]string{
+		"IP 地址,已发送,已接收,丢包率,平均延迟,下载速度 (MB/s)",
+		"104.16.1.1,4,4,0.00,45.2,12.34",
+		"104.17.2.2:443#香港,4,4,0.00,50.1,10.00",
+		"[2606:4700::1]:443,4,4,0,60,8",
+		"cf.example.com,4,4,0,70,5",
+		"999.999.999.999,0,0,100,0,0",
+	}, "\n")
+
+	code, body := postJSON(t, base+"/api/scan/parse-candidates", cookie, map[string]any{"raw": raw})
+	if code != http.StatusOK {
+		t.Fatalf("应 200，实际 %d", code)
+	}
+	count, _ := body["count"].(float64)
+	if int(count) != 4 {
+		t.Errorf("应认出 4 个（排除表头与非法 IP），实际 %v", count)
+	}
+	// 响应只回「个数」：回传整个候选数组等于把请求体再放大一遍
+	// （界面每敲一个键就调一次这个接口）。
+	if _, ok := body["candidates"]; ok {
+		t.Errorf("响应不应回传候选数组，实际 %v", body)
+	}
+
+	// 认出的具体是哪几个，由同一个解析器保证
+	got := scan.ParseCandidateList(raw)
+	want := map[string]bool{
+		"104.16.1.1":     true,
+		"104.17.2.2":     true,
+		"2606:4700::1":   true,
+		"cf.example.com": true,
+	}
+	for _, g := range got {
+		if !want[g] {
+			t.Errorf("不应包含 %q", g)
+		}
+	}
+}
+
+// 地区列表要非空且含常用机房。
+func TestScanCountries(t *testing.T) {
+	s, base := newTestServer(t)
+	cookie := loginCookie(t, s, base)
+
+	code, body := getJSON(t, base+"/api/scan/countries", cookie)
+	if code != http.StatusOK {
+		t.Fatalf("应 200，实际 %d", code)
+	}
+	list, ok := body["countries"].([]any)
+	if !ok || len(list) == 0 {
+		t.Fatalf("应有地区列表，实际 %v", body["countries"])
+	}
+
+	found := map[string]bool{}
+	for _, item := range list {
+		m, _ := item.(map[string]any)
+		if m != nil {
+			code := str(m["code"])
+			found[code] = true
+			// 国家码必须是 2 位：机房码（HKG）是实现细节，不再作为选择单位
+			if len(code) != 2 {
+				t.Errorf("countries 应返回国家码，实际 %q", code)
+			}
+			if str(m["group"]) == "" || str(m["group"]) == "OTHER" {
+				t.Errorf("%s 缺少大洲分组", code)
+			}
+			if colos, ok := m["colos"].([]any); !ok || len(colos) == 0 {
+				t.Errorf("%s 缺少机房码列表", code)
+			}
+		}
+	}
+	for _, want := range []string{"HK", "JP", "SG", "US", "DE"} {
+		if !found[want] {
+			t.Errorf("缺少常用国家 %s", want)
+		}
+	}
+}
+
+// 分组（亚洲组 / 美国组）要随地区列表一起返回，否则界面按钮一直置灰。
+func TestScanCountryGroups(t *testing.T) {
+	s, base := newTestServer(t)
+	cookie := loginCookie(t, s, base)
+
+	code, body := getJSON(t, base+"/api/scan/countries", cookie)
+	if code != http.StatusOK {
+		t.Fatalf("应 200，实际 %d", code)
+	}
+	groups, ok := body["groups"].(map[string]any)
+	if !ok {
+		t.Fatalf("应有 groups 字段，实际 %v", body)
+	}
+
+	asia, ok := groups["ASIA"].([]any)
+	if !ok || len(asia) == 0 {
+		t.Fatalf("亚洲组应有国家列表，实际 %v", groups["ASIA"])
+	}
+	asiaSet := map[string]bool{}
+	for _, item := range asia {
+		asiaSet[str(item)] = true
+	}
+	for _, want := range []string{"HK", "JP", "SG"} {
+		if !asiaSet[want] {
+			t.Errorf("亚洲组缺少国家 %s", want)
+		}
+	}
+	if asiaSet["US"] || asiaSet["AU"] {
+		t.Error("亚洲组不应包含美国 / 澳洲")
+	}
+
+	us, ok := groups["US"].([]any)
+	if !ok || len(us) != 1 || str(us[0]) != "US" {
+		t.Fatalf("美国组应只含 US，实际 %v", groups["US"])
+	}
+}
+
+// 环境检测：没代理时应给出「可信」的结论，并**总是**带上 IPv6 预检字段。
+//
+// ipv6 可能是 null（本机没有公网 IPv6 / 没有可用活跃前缀），
+// 但**字段必须存在** —— 界面靠它决定弹窗里显示「✓ 可用」还是「未检测」。
+func TestScanEnvCheck(t *testing.T) {
+	s, base := newTestServer(t)
+	cookie := loginCookie(t, s, base)
+
+	code, body := postJSON(t, base+"/api/scan/env-check", cookie, map[string]any{})
+	if code != http.StatusOK {
+		t.Fatalf("应 200，实际 %d", code)
+	}
+	findings, ok := body["findings"].([]any)
+	if !ok || len(findings) == 0 {
+		t.Fatalf("应至少有一条结论，实际 %v", body["findings"])
+	}
+	if _, exists := body["ipv6"]; !exists {
+		t.Fatalf("应带 ipv6 预检字段，实际 %v", body)
+	}
+	if env, ok := body["ipv6"].(map[string]any); ok {
+		if status, _ := env["status"].(string); status == "" {
+			t.Errorf("ipv6.status 不应为空：%v", env)
+		}
+	}
+}
+
+// 取消接口：没有扫描时也应正常返回。
+func TestScanCancelNoop(t *testing.T) {
+	s, base := newTestServer(t)
+	cookie := loginCookie(t, s, base)
+
+	code, body := postJSON(t, base+"/api/scan/cancel", cookie, map[string]any{})
+	if code != http.StatusOK {
+		t.Fatalf("应 200，实际 %d", code)
+	}
+	if !strings.Contains(str(body["note"]), "没有") {
+		t.Errorf("应提示当前没有扫描，实际 %v", body["note"])
+	}
+}
+
+// 缺凭据时自动识别域名要给出明确提示。
+func TestScanDetectHostNoCredentials(t *testing.T) {
+	s, base := newTestServer(t)
+	s.SetStore(newEmptyStore(t))
+	cookie := loginCookie(t, s, base)
+
+	code, body := postJSON(t, base+"/api/scan/detect-host", cookie, map[string]any{})
+	if code != http.StatusBadRequest {
+		t.Fatalf("应 400，实际 %d", code)
+	}
+	if !strings.Contains(str(body["error"]), "Token") {
+		t.Errorf("应提示填 Token，实际 %v", body["error"])
+	}
+}
+
+// ---------- pages.dev 域名规范化 ----------
+
+func TestNormalizePagesHost(t *testing.T) {
+	cases := []struct{ in, want string }{
+		// 核心回归：不能出现 `.pages.dev.pages.dev`
+		{"cpdata.pages.dev", "cpdata.pages.dev"},
+		{"cpdata.pages.dev.pages.dev", "cpdata.pages.dev"},
+		{"cpdata.pages.dev.pages.dev.pages.dev", "cpdata.pages.dev"},
+		// 不带后缀的要补一次
+		{"cpdata", "cpdata.pages.dev"},
+		{"cpdata-ux7t-li8f", "cpdata-ux7t-li8f.pages.dev"},
+		// 带协议与路径
+		{"https://cpdata.pages.dev/", "cpdata.pages.dev"},
+		{"https://cpdata.pages.dev/__version", "cpdata.pages.dev"},
+		{"http://cpdata.pages.dev", "cpdata.pages.dev"},
+		// 大小写
+		{"CPDATA.PAGES.DEV", "CPDATA.pages.dev"},
+		// 空
+		{"", ""},
+		{"   ", ""},
+	}
+	for _, tc := range cases {
+		if got := normalizePagesHost(tc.in); got != tc.want {
+			t.Errorf("normalizePagesHost(%q) = %q，期望 %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// formatCopyable 输出格式要与 CLI 版一致（用户会跨版本复制）。
+//
+// 备注 = 族标记 + 机房码 + 城市中文名 + 延迟 + 速度（`#IPv4_HKG香港_120_5.2`）：
+//   - 族标记 → 订阅节点名前缀（`优选IPv4_`）
+//   - 机房 + 城市 → 面板机房列与国家筛选
+//   - 延迟 + 速度 → 面板的两列指标（没有它们面板三列全空）
+//
+// IPv6 必须带方括号，否则 `2606:4700::1:443` 会被解析成「一个更长的 IPv6 地址」。
+func TestFormatCopyable(t *testing.T) {
+	entries := []scan.Entry{
+		{IP: "104.16.1.1", Port: 443, Colo: "HKG", Latency: 120, Speed: 5.2},
+		{IP: "104.17.2.2", Port: 2053, Colo: "", Latency: 88, Speed: 0},
+		{IP: "2606:4700:3035::1", Port: 443, Colo: "ZZZ", Latency: 20, Speed: 1.3},
+	}
+	got := formatCopyable(entries)
+	want := "104.16.1.1:443#IPv4_HKG香港_120_5.2\n" +
+		"104.17.2.2:2053#IPv4_CF_88_0\n" +
+		"[2606:4700:3035::1]:443#IPv6_ZZZ_20_1.3\n"
+	if got != want {
+		t.Errorf("输出格式不对：\n期望 %q\n实际 %q", want, got)
+	}
+}
+
+// 备注必须能被面板的 parseScannerRemark 解析出「族 + 机房 + 延迟 + 速度」。
+//
+// 这是回填链路的闭环：面板拿到 `IPv4_HKG香港_120_5.2` 后
+// 要能剥出干净的三字码 HKG（否则国家筛选失效），并取到 120 / 5.2。
+func TestPreferredRemarkRoundTrip(t *testing.T) {
+	e := scan.Entry{IP: "104.16.1.1", Port: 443, Colo: "HKG", Latency: 120, Speed: 5.2}
+	got := preferredRemark(e)
+	if got != "IPv4_HKG香港_120_5.2" {
+		t.Fatalf("备注格式不对：%q", got)
+	}
+	if scan.FamilyOf("2606:4700::1") != "v6" || scan.FamilyOf("1.2.3.4") != "v4" {
+		t.Error("族判定不对")
+	}
+}
+
+// 切页或刷新后，/api/scan/status 与 /api/relay/status 必须能还原当前进度。
+func TestScanAndRelayStatusSnapshot(t *testing.T) {
+	s, base := newTestServer(t)
+	s.SetStore(newEmptyStore(t))
+	cookie := loginCookie(t, s, base)
+
+	s.scan.mu.Lock()
+	s.scan.running = true
+	s.scan.mu.Unlock()
+	s.setScanProgressStart("data.example.com")
+	s.updateScanProgressState(scan.Progress{Message: "阶段二：TLS + WS 101 校验", Done: 5, Total: 10}, "阶段二：TLS + WS 101 校验（5/10）")
+
+	code, body := getJSON(t, base+"/api/scan/status", cookie)
+	if code != http.StatusOK {
+		t.Fatalf("scan status 应 200，实际 %d", code)
+	}
+	if body["running"] != true || body["hasState"] != true {
+		t.Fatalf("应报告 running=true hasState=true，实际 %v", body)
+	}
+	if body["stage"] != "协议验证" {
+		t.Errorf("阶段名应为「协议验证」，实际 %v", body["stage"])
+	}
+	if pct, _ := body["pct"].(float64); int(pct) != 35 {
+		t.Errorf("阶段二 5/10 应为 35%%，实际 %v", body["pct"])
+	}
+
+	s.scan.mu.Lock()
+	s.scan.running = false
+	s.scan.mu.Unlock()
+	s.finishScanProgressState(true)
+
+	code, doneBody := getJSON(t, base+"/api/scan/status", cookie)
+	if code != http.StatusOK || doneBody["finished"] != true || doneBody["ok"] != true {
+		t.Fatalf("收尾状态不对：%d %v", code, doneBody)
+	}
+	if pct, _ := doneBody["pct"].(float64); int(pct) != 100 {
+		t.Errorf("完成后应为 100%%，实际 %v", doneBody["pct"])
+	}
+
+	code, rBody := getJSON(t, base+"/api/relay/status", cookie)
+	if code != http.StatusOK || rBody["running"] != false {
+		t.Fatalf("relay status 初始状态不对：%d %v", code, rBody)
+	}
+}

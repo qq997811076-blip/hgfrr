@@ -1,0 +1,793 @@
+/**
+ * 面板 REST API
+ */
+import type { Env, UserConfig } from './types'
+import type { Store } from './store'
+import {
+  createSession,
+  destroySession,
+  clearSessionCookie,
+  hasSessionCookie,
+  issueOneTimeToken,
+  sessionCookie,
+  discardPlaintextPassword,
+  upgradePasswordHash,
+  verifyPasswordDetailed,
+  verifyScanToken,
+  verifySession,
+  type AuthContext,
+} from './auth'
+import {
+  LOCAL_IPS_KEY,
+  SCANNER_TOKEN_KEY,
+  loadDomainLibrary,
+  loadLocalIps,
+  loadRouteProfile,
+  mergeConfig,
+  saveConfig,
+  saveDomainLibrary,
+  saveRouteProfile,
+  readFreshConfig,
+  stripFactoryOverlays,
+} from './config'
+import { collectNodes, parseLocalList, splitValidCandidateLines } from './sub-engine'
+import { buildBuiltinProfileText, ROUTE_MAIN_GROUP } from './route-profile'
+import { loadSubSecret, rotateSubSecret, signSubToken, verifySubToken } from './sub-token'
+import { describeFieldErrors, validateConfigPatch, validateIpList } from './config-validate'
+import { buildConfigExport, diffConfig, pickImportable } from './config-transfer'
+import { CF_IPV4_CIDRS, COUNTRY_NAMES, PREFERRED_DOMAINS, SUPPORTED_COUNTRIES, coloLabel } from './data/pools'
+import { randomHex } from './util'
+import { CpuBudget } from './budget'
+import { readJsonLimited } from './util'
+import { invalidateAuth } from './routes/shared'
+import { BUILD_VERSION, PKG_VERSION } from './version'
+
+
+// 请求体大小上限。
+//
+// 早前所有接口都直接 `request.json()` —— 读多少由客户端说了算，
+// 一个不带 Content-Length 的超大 body 就能把 isolate 内存吃满（1101）。
+// 统一在读取前限量，超限回 413，而不是先分配再校验。
+const MAX_LOGIN_BODY = 8 * 1024
+const MAX_CONFIG_BODY = 256 * 1024
+const MAX_IP_POOL_BODY = 4 * 1024 * 1024
+const MAX_DOMAINS_BODY = 512 * 1024
+
+/** 限量读取 + 解析 JSON；失败时直接给出可返回的 Response */
+async function parseJsonBody<T>(
+  request: Request,
+  maxBytes: number
+): Promise<{ value: T } | { response: Response }> {
+  const result = await readJsonLimited<T>(request, maxBytes)
+  if (!result.ok) {
+    return {
+      response: error(result.tooLarge ? '请求体过大' : '请求体解析失败', result.tooLarge ? 413 : 400),
+    }
+  }
+  return { value: result.value }
+}
+
+// 回填时的条数上限。
+//
+// 两个池子都是「候选池」，订阅最终只按 maxNodes 取一部分，
+// 留几万条毫无意义，却会让每次订阅请求都读 + 解析一份巨大的 KV 值
+// （配置有 15 秒缓存，超时就要重解析 —— 免费版的 CPU 预算扛不住）。
+const MAX_LOCAL_IPS_ENTRIES = 5000
+const MAX_RELAY_POOL_ENTRIES = 200
+import { normalizeNodeDomain } from './routes/shared'
+
+export const API_PREFIX = '/api/v1'
+
+/**
+ * 登录失败限速（isolate 级，尽力而为）。
+ *
+ * ## 为什么需要
+ *
+ * 面板路径是随机生成的，但一旦泄露（截图、日志、订阅链接），
+ * 密码就成了唯一屏障。没有限速时攻击者可以无限次 POST /login 爆破。
+ *
+ * ## 为什么不用 KV
+ *
+ * KV 写配额是硬约束（免费版 1000 次/天，AGENTS §1.30）——
+ * 每次登录失败写一次 KV，等于给攻击者一个「一键耗尽配额」的按钮。
+ * 因此只用 isolate 内存：全局不精确，但足够把在线爆破从「无限次」压到「
+ * 每 isolate 每分钟 5 次」，而正常用户完全无感。
+ */
+const LOGIN_MAX_FAILURES = 5
+const LOGIN_WINDOW_MS = 60_000
+/** 上限：防止伪造来源 IP 把 Map 撑爆 */
+const LOGIN_MAX_TRACKED = 500
+
+interface LoginFailure {
+  count: number
+  resetAt: number
+}
+
+const LOGIN_FAILURES = new Map<string, LoginFailure>()
+
+/** 取来源 IP（Cloudflare 提供 CF-Connecting-IP；本地调试回落 XFF） */
+function clientIp(request: Request): string {
+  return (
+    request.headers.get('CF-Connecting-IP') ??
+    request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ??
+    'unknown'
+  )
+}
+
+/** 当前是否已被限速；顺带清理过期条目 */
+function loginThrottled(ip: string, now: number): boolean {
+  const entry = LOGIN_FAILURES.get(ip)
+  if (!entry) return false
+  if (now >= entry.resetAt) {
+    LOGIN_FAILURES.delete(ip)
+    return false
+  }
+  return entry.count >= LOGIN_MAX_FAILURES
+}
+
+/**
+ * 容量兜底：先删过期项，仍满则 **FIFO 淘汰最旧一条**，绝不全量清空。
+ *
+ * 全量清空会让 500 个 IP 的限速记录一次性失效 —— 攻击者只要持续灌不同来源 IP
+ * 就能把暴力破解防御整体抹掉。导出是为了让淘汰策略可以单独回归。
+ */
+export function pruneLoginFailures(
+  map: Map<string, LoginFailure>,
+  now: number,
+  max: number = LOGIN_MAX_TRACKED
+): void {
+  if (map.size < max) return
+  for (const [key, value] of map) {
+    if (now >= value.resetAt) map.delete(key)
+  }
+  while (map.size >= max) {
+    const oldest = map.keys().next().value
+    if (oldest === undefined) break
+    map.delete(oldest)
+  }
+}
+
+/** 记录一次失败 */
+function recordLoginFailure(ip: string, now: number): void {
+  const entry = LOGIN_FAILURES.get(ip)
+  if (!entry || now >= entry.resetAt) {
+    pruneLoginFailures(LOGIN_FAILURES, now)
+    LOGIN_FAILURES.set(ip, { count: 1, resetAt: now + LOGIN_WINDOW_MS })
+    return
+  }
+  entry.count += 1
+}
+
+function json(data: unknown, status = 200, headers: Record<string, string> = {}): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store',
+      ...headers,
+    },
+  })
+}
+
+function error(message: string, status: number): Response {
+  return json({ ok: false, error: message }, status)
+}
+
+/** 读取扫描回调令牌：KV 优先，其次环境变量 */
+export async function getScannerToken(store: Store, env: Env): Promise<string> {
+  const fromKv = await store.get(SCANNER_TOKEN_KEY)
+  if (fromKv) return fromKv
+  if (typeof env.SCANNER_TOKEN === 'string' && env.SCANNER_TOKEN) return env.SCANNER_TOKEN
+  const generated = randomHex(24)
+  await store.put(SCANNER_TOKEN_KEY, generated)
+  return generated
+}
+
+export interface ApiContext {
+  store: Store
+  env: Env
+  config: UserConfig
+  auth: AuthContext
+  /** 配置写入后调用以刷新缓存 */
+  onConfigChanged: () => void
+}
+
+let kernelCheckCache: { at: number; body: Record<string, unknown> } | null = null
+
+/**
+ * 处理面板 API 请求。
+ * 非 API 路由返回 null。
+ */
+export async function handleApi(
+  request: Request,
+  url: URL,
+  ctx: ApiContext
+): Promise<Response | null> {
+  if (!url.pathname.startsWith(API_PREFIX)) return null
+
+  const { store, env, config, auth } = ctx
+  const path = url.pathname.slice(API_PREFIX.length) || '/'
+  const method = request.method.toUpperCase()
+
+  // ---- 公开接口 ----
+  if (path === '/session' && method === 'GET') {
+    const authenticated = await verifySession(store, request)
+    // ⚠️ 未鉴权时**绝不返回 panelPath**（C-2）：面板路径是「未登录者不应
+    // 知道入口」这层防护的全部依据，免费泄露等于把爆破面提前交出去。
+    // 面板/向导在登录成功后拿到的路径已足够用（auth panelPath 由登录响应下发）。
+    return json(
+      authenticated
+        ? { ok: true, authenticated, panelPath: auth.panelPath }
+        : // hasSessionCookie：带了 Cookie 却查不到 → 多半是 KV 还没传播开，
+          // 界面据此等一下再试，而不是直接把人弹回登录页。
+          { ok: true, authenticated, hasSessionCookie: hasSessionCookie(request) }
+    )
+  }
+
+  if (path === '/login' && method === 'POST') {
+    const parsed = await parseJsonBody<{ password?: string }>(request, MAX_LOGIN_BODY)
+    if ('response' in parsed) return parsed.response
+    const password = String(parsed.value.password ?? '')
+    if (!password) return error('请输入密码', 400)
+    const ip = clientIp(request)
+    const now = Date.now()
+    if (loginThrottled(ip, now)) {
+      return new Response(
+        JSON.stringify({ ok: false, error: '尝试过于频繁，请稍后再试' }),
+        {
+          status: 429,
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': 'no-store',
+            'Retry-After': String(Math.ceil(LOGIN_WINDOW_MS / 1000)),
+          },
+        }
+      )
+    }
+    const result = await verifyPasswordDetailed(auth, password)
+    if (!result.ok) {
+      recordLoginFailure(ip, now)
+      return error('密码错误', 401)
+    }
+    LOGIN_FAILURES.delete(ip)
+    // 旧格式（单次 SHA-256）验证通过后静默升级为 PBKDF2。
+    // 失败不影响本次登录 —— 只是下次还要再算一次旧哈希。
+    if (result.legacy) {
+      await upgradePasswordHash(store, password).catch(() => undefined)
+    }
+    // 自动生成的密码明文只保留到「第一次登录成功」为止。
+    // 部署向导注入 PANEL_PASSWORD 的实例根本没有这个键（内部先 get 再决定是否删）。
+    await discardPlaintextPassword(store).catch(() => undefined)
+    // 上面两步都改了 KV（哈希升级 / 删明文）：必须让 60 秒鉴权缓存立即失效，
+    // 否则 /status 仍会下发已删除的明文密码，且 60 秒内重复登录会再写一次 KV。
+    invalidateAuth()
+    const token = await createSession(store)
+    return json({ ok: true }, 200, { 'Set-Cookie': sessionCookie(token) })
+  }
+
+  if (path === '/logout' && method === 'POST') {
+    // destroySession 先读再删：随机伪造 Cookie 不会消耗 KV 删除配额。
+    await destroySession(store, request)
+    return json({ ok: true }, 200, { 'Set-Cookie': clearSessionCookie() })
+  }
+
+  // ---- 扫描回调（Bearer 令牌鉴权，不依赖面板会话） ----
+  //
+  // ## ⚠️ 回填必须**覆盖**面板原有的「手动优选 IP」
+  //
+  // 优选池有四层，订阅节点来自 L1 + L2：
+  //
+  //   L1  LOCAL_PREFERRED_IPS  ← 本地真连接优选的结果（这里写入）
+  //   L2  config.add           ← 面板「手动优选 IP」输入框
+  //   L3  config.addApi        ← 远程 TXT 池
+  //   L4  config.addCsv        ← 远程 CSV 池
+  //
+  // 旧实现只写 L1、不动 L2 → 订阅里 **L1 + L2 都在** →
+  // 用户看到「回填了但订阅仍是旧 IP 的节点」。
+  //
+  // 修法：回填时同时清空 L2（config.add）。
+  // 理由：两者是同一用途（优选 IP 池），而回填的是**实测过真连接**的结果，
+  // 质量高于手填；用户手动加的那批保留反而会拉低整体可用率。
+  //
+  // 只清 config.add，**不动** addApi / addCsv —— 那是用户自己配的远程池。
+  if (path === '/preferred-ips' && method === 'POST') {
+    const header = request.headers.get('Authorization') ?? ''
+    const token = header.startsWith('Bearer ') ? header.slice(7).trim() : header.trim()
+    const authorized = await verifyScanToken(store, token, env)
+    if (!authorized) return error('Token 校验失败', 401)
+    const parsed = await parseJsonBody<{ ips?: unknown; mode?: unknown; target?: unknown }>(
+      request,
+      MAX_IP_POOL_BODY
+    )
+    if ('response' in parsed) return parsed.response
+    const body = parsed.value
+    const list = Array.isArray(body.ips) ? body.ips.map((v) => String(v)) : []
+    const rawLines = list.map((line) => line.trim()).filter((line) => line.length > 0)
+
+    // ⚠️ 逐行清洗：看不懂的行**跳过并回报**，不静默吞掉。
+    //
+    // 解析层对看不懂的行是静默跳过的 —— 用户看到「保存成功」但列表里没有，
+    // 这种失败最难查。写入前先过一遍清洗器，把无效行数报回去。
+    const { valid: incoming, invalid } = splitValidCandidateLines(rawLines)
+
+    // mode：
+    //   replace（默认）—— 清空后写入（历史行为，调用方不传时不变）
+    //   append         —— 保留池里已有的，只补新的（「增量回填」）
+    const append = body.mode === 'append'
+
+    // target：
+    //   local（默认）—— 本地优选池（订阅的 L1 来源）
+    //   relay        —— 自定义反代入口池（反代优选的产出；
+    //                   只影响出站选路，**不进订阅**）
+    const toRelay = body.target === 'relay'
+
+    // 同 ip:port 只保留一条：已有的**不动**（保留上一轮的备注），只补真正新的
+    const keyOf = (line: string): string =>
+      line.split('#')[0]!.trim().replace(/^\[([^\]]+)\]:(\d+)$/, '$1:$2')
+
+    if (incoming.length === 0 && rawLines.length > 0) {
+      // ⚠️ 全都是看不懂的行 —— **不动池子**。
+      //
+      // 空列表是另一回事：那是「清空」的明确语义（历史行为，不能改）。
+      // 但「粘了一堆垃圾」绝不能被当成「清空」—— 那会把用户攒的池子清掉。
+      return error('没有可识别的条目（已跳过 ' + invalid + ' 行）', 400)
+    }
+
+    // ---- 写「自定义反代入口池」（在 CONFIG 里）----
+    if (toRelay) {
+      if (incoming.length === 0) {
+        return error('没有可识别的反代入口', 400)
+      }
+      const limit = MAX_RELAY_POOL_ENTRIES
+      const accepted = incoming.slice(0, limit)
+      const overLimit = incoming.length - accepted.length
+      const current = (config.relayPool ?? '')
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean)
+      let merged: string[]
+      let added = accepted.length
+      if (append) {
+        const seen = new Set(current.map(keyOf))
+        const fresh = accepted.filter((line) => {
+          const key = keyOf(line)
+          if (seen.has(key)) return false
+          seen.add(key)
+          return true
+        })
+        added = fresh.length
+        merged = [...current, ...fresh]
+      } else {
+        merged = accepted
+      }
+      if (merged.length > limit) merged = merged.slice(0, limit)
+
+      // ⚠️ **重新读一次 CONFIG** 再合并。
+      //
+      // config 是 15 秒缓存的（见 getConfig），拿缓存里的旧值写回去，
+      // 会把用户刚在面板上改的东西覆盖掉。这里读 KV 的最新值。
+      const freshConfig = await readFreshConfig(store, config)
+      if (append) {
+        // 增量：走合并（出厂兜底条目由 saveConfig 剥离，不固化进 KV）
+        await saveConfig(store, mergeConfig(freshConfig, { relayPool: merged.join('\n') }))
+      } else {
+        // 覆盖：relayPool 用户层**直接替换** —— 不能走 mergeConfig 的合并分支，
+        // 否则旧条目会跟着保留（覆盖的语义就是「清掉旧的」）。
+        await saveConfig(store, { ...freshConfig, relayPool: merged.join('\n') })
+      }
+      ctx.onConfigChanged()
+      return json({
+        ok: true,
+        target: 'relay',
+        mode: append ? 'append' : 'replace',
+        count: accepted.length,
+        added,
+        invalid,
+        overLimit,
+        limit,
+      })
+    }
+
+    // ---- 写「本地优选池」（独立键，订阅的 L1 来源）----
+    //
+    // ⚠️ KV 免费版配额是 **1000 次写/天**，而「一键优选」可能一天跑好几次
+    // （托盘菜单、手册扫描、多实例）。同一批结果重复 put 纯属浪费配额，
+    // 写配额耗尽后「保存配置 / 回填」会直接 500。
+    const previous = await store.get(LOCAL_IPS_KEY)
+    let cleaned: string
+    let added = incoming.length
+    if (append) {
+      const existing = (previous ?? '')
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0)
+      const seen = new Set(existing.map(keyOf))
+      const fresh = incoming.filter((line) => {
+        const key = keyOf(line)
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+      added = fresh.length
+      cleaned = [...existing, ...fresh].join('\n')
+    } else {
+      cleaned = incoming.join('\n')
+    }
+    // 条数上限：池子是订阅的节点来源，留几万条毫无意义（订阅按 maxNodes 取），
+    // 却会让每次订阅请求都读+解析一份巨大的 KV 值。
+    const overLimit = Math.max(0, cleaned.split('\n').filter((l) => l.trim()).length - MAX_LOCAL_IPS_ENTRIES)
+    if (overLimit > 0) {
+      cleaned = cleaned
+        .split('\n')
+        .filter((l) => l.trim())
+        .slice(0, MAX_LOCAL_IPS_ENTRIES)
+        .join('\n')
+    }
+    const changed = previous !== cleaned
+    if (changed) await store.put(LOCAL_IPS_KEY, cleaned)
+
+    // 覆盖：清空面板手填的「手动指定 IP」，让订阅里只有本次回填的结果；
+    // 增量：**不动**它（增量的语义就是「什么都别删」）。
+    //
+    // 两种模式都**自动启用「手动指定 IP」来源**（poolManual）——
+    // 否则用户没勾选该来源时，回填的 IP 不会进订阅，看起来「回填没生效」。
+    //
+    // ⚠️ 必须**重新读一次 CONFIG** 再合并（与上面的 relay 分支同口径）：
+    // `config` 是 15 秒缓存的（见 getConfig），拿它写回会把用户刚在面板上
+    // 改过的其它字段一起覆盖掉，表现为「刚改完又变回去了」。
+    const fresh = await readFreshConfig(store, config)
+    const patch: Partial<typeof config> = {}
+    if (!append && (fresh.add ?? '').trim() !== '') patch.add = ''
+    if (!fresh.poolManual) patch.poolManual = true
+    let clearedManual = false
+    if (Object.keys(patch).length > 0) {
+      await saveConfig(store, mergeConfig(fresh, patch))
+      ctx.onConfigChanged()
+      clearedManual = patch.add !== undefined
+    }
+
+    return json({
+      ok: true,
+      target: 'local',
+      mode: append ? 'append' : 'replace',
+      count: incoming.length,
+      added,
+      invalid,
+      overLimit,
+      limit: MAX_LOCAL_IPS_ENTRIES,
+      clearedManual,
+      enabledManual: patch.poolManual === true,
+    })
+  }
+
+  // ---- 以下接口需要面板会话 ----
+  const authenticated = await verifySession(store, request)
+  if (!authenticated) return error('未登录或会话已过期', 401)
+
+  // ---- 内核通道检查（面板顶部横幅按钮）----
+  //
+  // 控制面自己没有「内置内核锚点」的概念（那是桌面版 exe 里的东西），
+  // 判定口径是：**官方 kernel-latest 通道的 build ≠ 本实例部署清单里的
+  // build** —— 通道永远只放最新发布，build 不同即「通道上有可部署的新内核」。
+  // 查询结果按 isolate 缓存 15 秒：横幅按钮反复点不会反复打 GitHub。
+  if (path === '/kernel-check' && method === 'GET') {
+    if (kernelCheckCache && Date.now() - kernelCheckCache.at < 15_000) {
+      return json(kernelCheckCache.body)
+    }
+    let manifestBuild = ''
+    try {
+      const raw = await store.get('CFP_DEPLOY_MANIFEST')
+      if (raw) manifestBuild = (JSON.parse(raw) as { build?: string }).build ?? ''
+    } catch {
+      /* 清单读不到：currentBuild 留空 */
+    }
+    let latestSeq = 0
+    let latestBuild = ''
+    let checkError = ''
+    try {
+      const res = await fetch(
+        'https://github.com/xmwengxing/CFPilot/releases/download/kernel-latest/cfpilot-kernel-VERSION',
+        { signal: AbortSignal.timeout(6000) }
+      )
+      const manifest = (await res.json()) as { seq?: number; build?: string }
+      latestSeq = manifest.seq ?? 0
+      latestBuild = manifest.build ?? ''
+    } catch (e) {
+      checkError = e instanceof Error ? e.message : String(e)
+    }
+    const hasUpdate = !checkError && latestBuild !== '' && latestBuild !== manifestBuild
+    const body: Record<string, unknown> = {
+      ok: checkError === '',
+      currentBuild: manifestBuild,
+      latestSeq,
+      latestBuild,
+      hasUpdate,
+      error: checkError,
+      assetBase: 'https://github.com/xmwengxing/CFPilot/releases/download/kernel-latest',
+      toolRelease: 'https://github.com/xmwengxing/CFPilot/releases/latest',
+    }
+    if (checkError === '') kernelCheckCache = { at: Date.now(), body }
+    return json(body)
+  }
+
+  if (path === '/status' && method === 'GET') {
+    const localIps = await loadLocalIps(store)
+    const parsed = parseLocalList(localIps)
+    // 节点域名 = 订阅里实际下发的 SNI / Host：subDomain > DATA_HOST > 面板域名。
+    // 拆分部署时它与面板域名不同，面板概览与本地优选命令都必须用它。
+    const nodeDomain = normalizeNodeDomain(config.subDomain || env.DATA_HOST || url.hostname)
+    // ⚠️ 这里的版本号**必须是真实的构建版本**。
+    //
+    // 2026-10-28 用户报障：「系统内核版本」这张卡从来没变过，像是硬编码。
+    // 查下来确实写死成 `version: '0.1.0'` —— 面板永远显示 0.1.0。
+    // 现在给两个值：
+    //   version     = BUILD_VERSION（<git短hash>-<源码哈希>，精确到内容）
+    //   pkgVersion  = PKG_VERSION（0.9.4 这类人读版本，构建期从 package.json 注入）
+    // 另带 readAt（读取时刻），面板据此显示「数据是刚读的」。
+    return json({
+      ok: true,
+      panelPath: auth.panelPath,
+      domain: url.hostname,
+      nodeDomain,
+      dataHost: env.DATA_HOST ?? '',
+      colo: (request as unknown as { cf?: { colo?: string } }).cf?.colo ?? 'UNK',
+      coloLabel: coloLabel((request as unknown as { cf?: { colo?: string } }).cf?.colo ?? ''),
+      localIps: parsed.length,
+      generatedPassword: auth.generatedPassword,
+      version: BUILD_VERSION,
+      pkgVersion: PKG_VERSION,
+      readAt: Date.now(),
+    })
+  }
+
+  if (path === '/config' && method === 'GET') {
+    // ⚠️ 面板显示的是**用户层**（剥离出厂兜底行）：出厂兜底在读取时动态
+    // 合并、KV 里不存，显示合并值会让用户误以为兜底是「手填内容」，
+    // 全删保存的顾虑由此而来 —— 实际删了保存，运行时仍会自动补回兜底。
+    return json({ ok: true, config: stripFactoryOverlays(config) })
+  }
+
+  if (path === '/config' && method === 'PUT') {
+    const parsed = await parseJsonBody<{ config?: Partial<UserConfig> }>(request, MAX_CONFIG_BODY)
+    if ('response' in parsed) return parsed.response
+    const body = parsed.value
+    if (!body.config || typeof body.config !== 'object') return error('缺少配置对象', 400)
+    // 后端才是安全边界：前端校验只负责体验，任何值都能绕过前端直接打接口
+    const invalid = validateConfigPatch(body.config as Record<string, unknown>)
+    if (invalid.length > 0) return error(describeFieldErrors(invalid), 400)
+    const merged = stripFactoryOverlays(mergeConfig(config, body.config))
+    const mergedInvalid = validateConfigPatch(merged as unknown as Record<string, unknown>)
+    if (mergedInvalid.length > 0) return error(describeFieldErrors(mergedInvalid), 400)
+    await saveConfig(store, merged)
+    ctx.onConfigChanged()
+    return json({ ok: true, config: merged })
+  }
+
+  // ---- 配置导入导出（脱敏）----
+  //
+  // 导出用**白名单**：只有显式声明的字段才会出去，新增字段默认不导出。
+  // 同时返回 omitted 说明，让用户在导出那一刻就知道哪些要手工补。
+  if (path === '/config/export' && method === 'GET') {
+    // 导出的也是用户层：出厂兜底由内核动态合并，导出行只会固化成死数据
+    return json({ ok: true, ...buildConfigExport(stripFactoryOverlays(config)) })
+  }
+
+  // 导入分两步：先 dryRun 拿差异，用户确认后再真正写入。
+  // 直接从别人那里拿一份配置覆盖，会静默改掉节点来源、代理模式这类不显眼但影响大的项。
+  if (path === '/config/import' && method === 'POST') {
+    const parsed = await parseJsonBody<{ config?: unknown; dryRun?: boolean }>(request, MAX_CONFIG_BODY)
+    if ('response' in parsed) return parsed.response
+    const body = parsed.value
+    if (!body.config || typeof body.config !== 'object') return error('缺少配置对象', 400)
+
+    const incoming = pickImportable(body.config as Record<string, unknown>)
+    if (Object.keys(incoming).length === 0) {
+      return error('没有可导入的字段（确认是本项目导出的配置文件？）', 400)
+    }
+    const invalid = validateConfigPatch(incoming)
+    if (invalid.length > 0) return error(describeFieldErrors(invalid), 400)
+
+    const diff = diffConfig(config, incoming)
+    if (body.dryRun) return json({ ok: true, dryRun: true, diff, count: diff.length })
+    if (diff.length === 0) return json({ ok: true, applied: 0, diff: [], config })
+
+    const merged = mergeConfig(config, incoming as Partial<UserConfig>)
+    const mergedInvalid = validateConfigPatch(merged as unknown as Record<string, unknown>)
+    if (mergedInvalid.length > 0) return error(describeFieldErrors(mergedInvalid), 400)
+    await saveConfig(store, merged)
+    ctx.onConfigChanged()
+    return json({ ok: true, applied: diff.length, diff, config: merged })
+  }
+
+  if (path === '/ips' && method === 'GET') {
+    const text = await loadLocalIps(store)
+    const parsed = parseLocalList(text)
+    return json({ ok: true, raw: text, count: parsed.length, entries: parsed })
+  }
+
+  if (path === '/ips' && method === 'DELETE') {
+    await store.delete(LOCAL_IPS_KEY)
+    return json({ ok: true })
+  }
+
+  // 手动保存本地池
+  //
+  // ## 与「手动填写 ADD」的区别
+  //
+  //   LOCAL_PREFERRED_IPS（本地池）← 本地优选回填，可在面板里查看/编辑
+  //   config.add（手动填写）        ← 用户自己加的条目
+  //
+  // 两者在 collectNodes 里都会进入订阅（当 poolManual 勾选时）。
+  // 之前面板只能「清空」本地池，看不到也不能改 ——
+  // 用户跑完回填后在面板里找不到 IP，以为失败了。
+  //
+  // ⚠️ 语义：这里**无条件保存**，与 poolManual 勾选无关。
+  // poolManual 只决定这些 IP 是否成为订阅节点。
+  if (path === '/ips' && method === 'PUT') {
+    const parsed = await parseJsonBody<{ raw?: unknown }>(request, MAX_IP_POOL_BODY)
+    if ('response' in parsed) return parsed.response
+    const body = parsed.value
+    if (typeof body.raw !== 'string') return error('缺少 raw 字段', 400)
+
+    // 语法校验：解析层遇到看不懂的行会静默跳过，
+    // 用户只会看到「保存成功」但订阅里一条都没有 —— 必须在这里拦下并指出行号。
+    const issue = validateIpList(body.raw)
+    if (issue) return error(issue, 400)
+
+    const cleaned = body.raw
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .join('\n')
+
+    if (cleaned) {
+      await store.put(LOCAL_IPS_KEY, cleaned)
+    } else {
+      // delete 同样占一次写配额：本来就没有才跳过
+      if ((await store.get(LOCAL_IPS_KEY)) !== null) await store.delete(LOCAL_IPS_KEY)
+    }
+    return json({ ok: true, count: cleaned ? cleaned.split('\n').length : 0 })
+  }
+
+  if (path === '/nodes' && method === 'GET') {
+    // 预算建在 KV 读**之后**：墙钟近似含 I/O 等待，建早了会把等待算成 CPU，
+    // 预览永远显示"CPU 预算不足"（远程 fetch 期间另有 pause/resume 保护）。
+    const localIps = await loadLocalIps(store)
+    const domainPool = await loadDomainLibrary(store)
+    const budget = new CpuBudget(8)
+    const result = await collectNodes(config, localIps, {
+      budget,
+      domainPool: domainPool.length > 0 ? domainPool : undefined,
+      // 面板预览是「点一下就要看到最新结果」的场景，必须绕过远程池缓存。
+      // 订阅走 120 秒缓存（客户端会周期性重拉，缓存挡住突发）；
+      // 预览若也吃缓存，用户改完远端 CSV/TXT 池会以为没生效。
+      bypassRemoteCache: true,
+    })
+    // 收集结束后复核预算：collectNodes 内部的 check 只覆盖循环中段，
+    // 收尾的去重/截断/统计仍可能把墙钟推过上限。超限不抛 500，
+    // 而是把"已截断"写进 stats.errors —— 面板 warn 区直接展示。
+    const stats = { ...result.stats, errors: [...result.stats.errors] }
+    try {
+      budget.check()
+    } catch {
+      stats.errors.push('CPU 预算不足，预览结果可能已截断')
+    }
+    return json({
+      ok: true,
+      count: result.nodes.length,
+      // 附带机房中文名（`香港 HKG`）：面板表格直接显示，省得用户去查三字码。
+      // 映射表只在 worker-core 维护一份（data/pools.ts 的 COLO_CITIES）。
+      // 预览只下发前 200 条（面板表格只渲染前 100 行），全量在 count 里。
+      nodes: result.nodes.slice(0, 200).map((n) => ({
+        ...n,
+        coloLabel: n.colo ? coloLabel(n.colo) : '',
+      })),
+      groups: result.groups.map((g) => ({ key: g.key, name: g.name, count: g.entries.length })),
+      stats,
+    })
+  }
+
+  // ---- 优选库元信息 / 自定义域名库 ----
+  if (path === '/pool/meta' && method === 'GET') {
+    const custom = await loadDomainLibrary(store)
+    return json({
+      ok: true,
+      countries: SUPPORTED_COUNTRIES.map((code) => ({ code, name: COUNTRY_NAMES[code] ?? code })),
+      limits: { officialCount: 200, domainCount: 100 },
+      builtin: {
+        cidrs: CF_IPV4_CIDRS.length,
+        domains: PREFERRED_DOMAINS.length,
+      },
+      customDomains: custom,
+    })
+  }
+
+  if (path === '/pool/library' && method === 'PUT') {
+    const parsed = await parseJsonBody<{ domains?: unknown }>(request, MAX_DOMAINS_BODY)
+    if ('response' in parsed) return parsed.response
+    const body = parsed.value
+    const list = Array.isArray(body.domains) ? body.domains.map((v) => String(v)) : []
+    await saveDomainLibrary(store, list)
+    return json({ ok: true, count: list.filter((d) => d.trim()).length })
+  }
+
+  // ---- Clash 分流规则（ROUTE_PROFILE ini 原文，渲染进 clash 订阅的 rules/groups）----
+  //
+  // ## 返回的是**当前生效的规则**，不是 KV 里的原始值
+  //
+  // 用户没写自定义规则时，KV 里没有 `ROUTE_PROFILE` 键，
+  // 生效的却是内置的那一整套 GEOSITE/GEOIP 规则。
+  // 之前只回 KV 的原始值 → 面板拿到空串 → 用户以为「规则是空的」。
+  //
+  // 所以：
+  //   - `raw`：自定义原文（空 = 用内置）
+  //   - `text`：**生效中**的规则原文（自定义优先，否则内置）
+  //   - `isCustom`：是否用的是自定义
+  //
+  // 面板据此填充输入框，用户看到的就是真正生效的那份。
+  if (path === '/route-profile' && method === 'GET') {
+    const raw = await loadRouteProfile(store)
+    const isCustom = raw.trim().length > 0
+    return json({
+      ok: true,
+      raw,
+      text: isCustom ? raw : buildBuiltinProfileText(ROUTE_MAIN_GROUP),
+      isCustom,
+    })
+  }
+
+  if (path === '/route-profile' && method === 'PUT') {
+    const parsed = await parseJsonBody<{ raw?: unknown }>(request, MAX_CONFIG_BODY)
+    if ('response' in parsed) return parsed.response
+    const body = parsed.value
+    if (typeof body.raw !== 'string') return error('缺少 raw 字段', 400)
+    if (body.raw.length > 20000) return error('分流规则过长（上限 20000 字符）', 400)
+
+    const cleaned = body.raw.trim()
+    // 与内置规则完全一致 ⇒ 走删键，不留一份与内置重复的自定义副本
+    // （否则之后的内置规则更新永远不生效）。
+    const isBuiltin = cleaned === buildBuiltinProfileText(ROUTE_MAIN_GROUP).trim()
+    await saveRouteProfile(store, isBuiltin ? '' : cleaned)
+
+    // ⚠️ **不要回读 KV 确认结果**：KV 读是最终一致的（边缘缓存约 60 秒），
+    // 刚写完再读可能拿到旧值 —— 面板会显示「保存了但内容没变」，
+    // 用户以为没生效又改一遍。写入后的状态由这里直接给出。
+    const isCustom = !isBuiltin && cleaned.length > 0
+    return json({
+      ok: true,
+      raw: isCustom ? cleaned : '',
+      text: isCustom ? cleaned : buildBuiltinProfileText(ROUTE_MAIN_GROUP),
+      isCustom,
+    })
+  }
+
+  if (path === '/scanner-token' && method === 'POST') {
+    const token = await issueOneTimeToken(store)
+    return json({ ok: true, token, expiresIn: 600 })
+  }
+
+  // ---- 订阅签名令牌 ----
+  //
+  //   GET  /sub-token   查看当前模式并签发一条链接（不存在密钥时自动生成）
+  //   POST /sub-token   轮换密钥（**旧签名链接立即全部失效**）
+  //
+  // ⚠️ 刻意**不**提供「一键切换到签名模式」：模式切换走普通的 PUT /config，
+  // 必须由用户在面板上明确确认，避免任何自动化路径把订阅链接改坏。
+  if (path === '/sub-token' && (method === 'GET' || method === 'POST')) {
+    const rotated = method === 'POST'
+    const secret = rotated ? await rotateSubSecret(store) : await loadSubSecret(store)
+    const token = await signSubToken(secret, { ttlDays: config.subTokenTtlDays })
+    const verified = await verifySubToken(secret, token)
+    return json({
+      ok: true,
+      rotated,
+      mode: config.subToken,
+      ttlDays: config.subTokenTtlDays,
+      token,
+      link: `${url.origin}/sub/${token}`,
+      expiresAt: (verified.exp ?? 0) * 1000,
+    })
+  }
+
+  return error('接口不存在', 404)
+}

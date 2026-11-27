@@ -1,0 +1,75 @@
+apply plugin: 'com.android.application'
+apply plugin: 'org.jetbrains.kotlin.android'
+
+android {
+    namespace 'com.xmwengxing.cfpilot'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.xmwengxing.cfpilot'
+        // ⚠️ minSdk 26（Android 8.0）而不是更低：
+        //    通知的 channel 构造（Notification.Builder(Context, String)）是 API 26 才有的，
+        //    更低的版本要另写一套 legacy 分支 —— 覆盖到的设备只剩千分之几，不值当。
+        minSdk 26
+        targetSdk 34
+
+        // 版本号：唯一真相是**仓库根的 package.json**（AGENTS §6 单一版本源）。
+        //
+        // ⚠️ 路径要用 **rootDir**（根项目目录 = packages/android/），
+        //    不是 projectDir（= packages/android/app/）—— 两者差一级。
+        //    rootDir 再上两级才是仓库根：packages/android → packages → 仓库根。
+        //
+        //    （用 file('../../package.json') 是错的：file() 相对**项目目录**，
+        //      两级只到 packages/，那里没有 package.json。）
+        versionName new groovy.json.JsonSlurper()
+                .parseText(new File(rootDir, '../../package.json').text)
+                .version
+        // 只取主版本三段数字生成 versionCode（兼容 0.60.0-beta.1 等预发布后缀，避免拼成超范围整数）
+        def verCore = (versionName =~ /^(\d+)\.(\d+)\.(\d+)/)
+        versionCode verCore ? (verCore[0][1].toInteger() * 10000 + verCore[0][2].toInteger() * 100 + verCore[0][3].toInteger()) : 1
+    }
+
+    // ⚠️ 这里**不声明** ndk { abiFilters } / ndkVersion。
+    //
+    // .so 是 Go 侧编好放进 jniLibs 的（见 sourceSets），Gradle 只负责打包，
+    // 不参与原生编译 —— 声明 ndk 反而会让 AGP 要求一个本地 NDK 版本，
+    // 徒增环境依赖。APK 里有哪些 ABI 由 jniLibs 里有几个目录决定。
+    //
+    // .so 由 Go 侧 `go build -buildmode=c-shared` 编好后放进 jniLibs。
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
+    }
+
+    buildTypes {
+        release {
+            // 用 debug 签名：这是**侧载**用的包（不走应用商店）。
+            // 上架时才需要换成正式密钥。
+            signingConfig signingConfigs.debug
+            minifyEnabled false
+        }
+        debug {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    lint {
+        abortOnError false
+    }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'androidx.core:core-ktx:1.13.1'
+    implementation 'com.google.android.material:material:1.12.0'
+}

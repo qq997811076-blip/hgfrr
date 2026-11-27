@@ -1,0 +1,588 @@
+// Package update 实现应用内检查更新与下载。
+//
+// ## 为什么不用自动更新框架
+//
+// Electron 版曾经用 electron-updater，但它依赖代码签名与特定更新服务器配置。
+// 这里直接查 GitHub Releases API，下载新版本并替换自己 ——
+// 对本项目够用，且没有签名要求（用户手动确认后才执行）。
+//
+// ## 镜像回退（国内网络必需）
+//
+// GitHub 的 `objects.githubusercontent.com` 在国内经常连不上或极慢。
+// 因此下载按以下顺序尝试，任一个成功即停：
+//
+//  1. 直连 GitHub（browser_download_url）
+//  2. ghproxy 类镜像（前缀代理原 URL）
+//
+// ⚠️ 第三方镜像**可能失效或篡改内容**，因此：
+//   - 只在直连失败时才用；
+//   - 无论走直连还是镜像，都要比对**官方摘要清单**（见 verify.go）；
+//   - **必须校验 content-length**：镜像截断是常见故障，
+//     半截文件如果被当成完整包，用户装上去就是坏的。
+package update
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/proxy"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// Repo 是 GitHub 仓库。
+const Repo = "xmwengxing/CFPilot"
+
+// APIBase 是 GitHub Releases API（测试可覆盖）。
+//
+// 生产环境不要改；单元测试用 httptest 假服务器把它指向本地地址。
+var APIBase = "https://api.github.com/repos/" + Repo + "/releases"
+
+// Mirror 是一个下载镜像。
+type Mirror struct {
+	Name string
+	// Prefix 是 URL 前缀，用法：Prefix + 原始URL
+	Prefix string
+}
+
+// Mirrors 是下载镜像列表（按实测可用性排序）。
+//
+// 第一个成功的就用它，所以把实测可用的放前面。
+//
+// ⚠️ 与 CLI 版 packages/cli/src/shared/github-mirrors.ts 的 MIRRORS 一致。
+var Mirrors = []Mirror{
+	{Name: "ghfast.top", Prefix: "https://ghfast.top/"},
+	{Name: "ghproxy.net", Prefix: "https://ghproxy.net/"},
+	{Name: "gh-proxy.com", Prefix: "https://gh-proxy.com/"},
+}
+
+// CheckResult 是检查更新的结果。
+type CheckResult struct {
+	// Current 是当前版本
+	Current string `json:"current"`
+	// Latest 是最新版本（没找到时为 nil）
+	Latest string `json:"latest"`
+	// HasUpdate 表示是否有新版本
+	HasUpdate bool `json:"hasUpdate"`
+	// Prerelease 表示最新发行版是预发布（beta/rc 等）。
+	// 稳定用户也能收到它的更新提示（让用户知晓控制面/数据面的改进），
+	// 但必须在界面显著标注「测试版」，避免误当成正式稳定版。
+	Prerelease bool `json:"prerelease"`
+	// PrereleaseLabel 是预发布标识（如 "beta.1"），空串表示正式版。
+	PrereleaseLabel string `json:"prereleaseLabel,omitempty"`
+	// DownloadURL 是新版本下载地址
+	DownloadURL string `json:"downloadUrl"`
+	// Notes 是发行说明
+	Notes string `json:"notes"`
+	// Error 是错误信息（成功时为空）
+	Error string `json:"error,omitempty"`
+}
+
+// Release 是解析后的发行版信息。
+type Release struct {
+	Tag     string
+	Version string
+	URL     string
+	Notes   string
+	Assets  []Asset
+}
+
+// Asset 是发行版附件。
+type Asset struct {
+	Name string `json:"name"`
+	URL  string `json:"browser_download_url"`
+	Size int64  `json:"size"`
+}
+
+// versionRe 提取语义化版本号的核心三字段。
+var versionRe = regexp.MustCompile(`(\d+)\.(\d+)\.(\d+)`)
+
+// ParseVersion 解析版本号，返回 [major, minor, patch]。
+//
+// 找不到合法版本号时返回 [0,0,0]（与 Electron 版一致）。
+func ParseVersion(tag string) [3]int {
+	m := versionRe.FindStringSubmatch(tag)
+	if len(m) < 4 {
+		return [3]int{0, 0, 0}
+	}
+	a, _ := strconv.Atoi(m[1])
+	b, _ := strconv.Atoi(m[2])
+	c, _ := strconv.Atoi(m[3])
+	return [3]int{a, b, c}
+}
+
+// CompareVersion 比较两个版本号：a > b 返回正数，a < b 返回负数。
+func CompareVersion(a, b [3]int) int {
+	for i := 0; i < 3; i++ {
+		if d := a[i] - b[i]; d != 0 {
+			return d
+		}
+	}
+	return 0
+}
+
+// Check 检查是否有新版本。
+//
+// 只看非 draft、非 prerelease 的发行版。
+func Check(ctx context.Context, current string) *CheckResult {
+	res := &CheckResult{Current: current}
+
+	releases, err := fetchReleases(ctx)
+	if err != nil {
+		res.Error = err.Error()
+		return res
+	}
+	if len(releases) == 0 {
+		res.Error = "没有找到发行版"
+		return res
+	}
+
+	latest := releases[0]
+	res.Latest = latest.Version
+	res.DownloadURL = latest.URL
+	if len(latest.Notes) > 2000 {
+		res.Notes = latest.Notes[:2000]
+	} else {
+		res.Notes = latest.Notes
+	}
+	res.HasUpdate = CompareVersion(ParseVersion(latest.Tag), ParseVersion(current)) > 0
+	// 预发布标识（beta/rc 等）：让稳定用户也能收到提示，但界面必须标注「测试版」。
+	// 注意 ParseVersion 故意丢弃后缀 —— 这是为了让 0.50.0 用户能收到 1.0.0-beta.1
+	// 的提示（用户明确要求知晓新版本的改进），而非把它当正式版静默跳过。
+	res.PrereleaseLabel = prereleaseLabel(latest.Version)
+	res.Prerelease = res.PrereleaseLabel != ""
+	return res
+}
+
+// fetchReleases 拉取并按版本降序排列的发行版列表。
+//
+// 按平台筛选资产：
+//   - Windows 用 `windows-amd64.exe`
+//   - Linux 用 `linux-<arch>`
+//
+// tag 前缀同时兼容 `desktop-v*` 与旧的 `gui-v*`。
+func fetchReleases(ctx context.Context) ([]Release, error) {
+	all, err := FetchAllReleasesFallback(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Release, 0, len(all))
+	for _, r := range all {
+		asset := pickAsset(r.Assets)
+		if asset == nil {
+			continue // 这个发行版没有本平台的包，跳过
+		}
+		r.URL = asset.URL
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+// FetchReleases 查询全部有效发行版（按版本降序）。
+//
+// ## 与包内私有 fetchReleases 的区别
+//
+//   - fetchReleases：只保留**带本平台安装包**的发行版（检查更新用）
+//   - FetchReleases：保留全部有效发行版，并带上它们的**全部附件**
+//
+// kernel 包用它找「远程可用的内核产物」——
+// 内核产物（cfpilot-kernel-*.js）与平台无关，
+// 不能按平台过滤，否则会漏掉只发内核不发安装包的发行版。
+func FetchReleases(ctx context.Context) ([]Release, error) {
+	return FetchAllReleasesFallback(ctx)
+}
+
+// fetchAllReleases 拉取发行版列表，只做「tag 合法 + 非草稿 + 非预发布」的过滤。
+//
+// 不按平台过滤资产 —— 平台过滤留给调用方（见 fetchReleases）。
+func fetchAllReleases(ctx context.Context) ([]Release, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, APIBase+"?per_page=20", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "CFPilot-Desktop")
+	req.Header.Set("Accept", "application/vnd.github+json")
+
+	client := proxy.Resolve().Client(20 * time.Second)
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("无法连接 GitHub：%w", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GitHub API 返回 %d", res.StatusCode)
+	}
+
+	return parseReleases(res.Body)
+}
+
+// parseReleases 解析 GitHub Releases API 的响应，并过滤出有效发行版。
+//
+// 抽成独立函数是为了让「镜像回退」与「直连」共用同一套解析逻辑
+// （见 mirrors.go 的 fetchReleasesFrom）。
+func parseReleases(body io.Reader) ([]Release, error) {
+	var raw []struct {
+		Tag        string  `json:"tag_name"`
+		Draft      bool    `json:"draft"`
+		Prerelease bool    `json:"prerelease"`
+		Body       string  `json:"body"`
+		Assets     []Asset `json:"assets"`
+	}
+	if err := json.NewDecoder(body).Decode(&raw); err != nil {
+		return nil, fmt.Errorf("GitHub API 返回格式异常：%w", err)
+	}
+
+	out := make([]Release, 0, len(raw))
+	for _, r := range raw {
+		// 只认 v* / desktop-v* / gui-v*
+		//
+		// ⚠️ **`v*` 是当前的正式 tag**（2026-10-27 起 release-desktop.yml 用
+		// `tag_name: v<版本>`，与 npm 发布共用同一个 tag）。
+		// 早期这里只认 `desktop-v*` / `gui-v*`，于是**一个发行版都找不到** ——
+		// 界面的「检查更新」按钮永远显示「检查失败」。
+		//
+		// `desktop-v*` 是触发工作流的 git tag（不产生 Release），
+		// `gui-v*` 是 Electron 时代的过渡 tag，都保留兼容。
+		if !isReleaseTag(r.Tag) {
+			continue
+		}
+		if r.Draft || r.Prerelease {
+			continue
+		}
+
+		rel := Release{
+			Tag:     r.Tag,
+			Version: releaseVersion(r.Tag),
+			Notes:   r.Body,
+			Assets:  r.Assets,
+		}
+		// URL 尽力填成本平台安装包（没有就留空，调用方按需自己找资产）
+		if asset := pickAsset(r.Assets); asset != nil {
+			rel.URL = asset.URL
+		}
+		out = append(out, rel)
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		return CompareVersion(ParseVersion(out[i].Tag), ParseVersion(out[j].Tag)) > 0
+	})
+	return out, nil
+}
+
+// pickAsset 按当前平台与构建变体（普通版 / +mesh 版）挑合适的附件。
+func pickAsset(assets []Asset) *Asset {
+	return pickAssetFor(assets, runtime.GOOS, runtime.GOARCH)
+}
+
+// pickAssetFor 是 pickAsset 的平台无关版本（便于单元测试覆盖每个平台）。
+//
+// ⚠️ 同一 Release 里同时包含普通版（cfpilot-<ver>-windows-amd64.exe）和
+// +mesh 版（cfpilot-<ver>+mesh-windows-amd64-setup.exe / .deb），
+// 普通版更新器绝不能误选带 `+mesh` 的安装包。
+//
+// ⚠️ macOS 特殊：应用是 .app，更新必须换**整个包**，所以只认 dmg。
+// 裸的 `cfpilot-<ver>-darwin-<arch>` 是给手动使用的，拿它去替换
+// .app 里的可执行文件会直接破坏代码签名（这正是之前的老问题）。
+func pickAssetFor(assets []Asset, wantOS, wantArch string) *Asset {
+	if wantOS == "darwin" {
+		// Release 里的 macOS 资产写的是 macos（不是 goos 的 darwin），
+		// 因为用户看到的是「macOS 安装包」而不是 Go 的构建目标名。
+		isDMG := func(name string) bool {
+			if !strings.HasSuffix(name, ".dmg") || strings.Contains(name, "+mesh") {
+				return false
+			}
+			return strings.Contains(name, "macos")
+		}
+		// 1) universal 优先：一份包同时管 Intel 与 Apple Silicon
+		for i := range assets {
+			name := strings.ToLower(assets[i].Name)
+			if isDMG(name) && strings.Contains(name, "universal") {
+				return &assets[i]
+			}
+		}
+		// 2) 本架构的 dmg（只发布过单架构包的版本）
+		for i := range assets {
+			name := strings.ToLower(assets[i].Name)
+			if isDMG(name) && strings.Contains(name, "-"+wantArch) {
+				return &assets[i]
+			}
+		}
+		// 3) 其它架构的 dmg 也不行 —— 装上去架构不匹配，直接报「没有本平台包」
+		return nil
+	}
+
+	isStandard := func(name string) bool {
+		return !strings.Contains(name, "+mesh") && !strings.HasSuffix(name, ".deb") && !strings.Contains(name, "-setup.")
+	}
+
+	// 1) 精确匹配：当前 OS + 架构 + 普通版
+	for i := range assets {
+		name := strings.ToLower(assets[i].Name)
+		if !isStandard(name) || !strings.Contains(name, wantOS) {
+			continue
+		}
+		if strings.Contains(name, wantArch) {
+			return &assets[i]
+		}
+	}
+	// 2) 回落：当前 OS + 普通版（兼容不带架构名的历史包）
+	for i := range assets {
+		name := strings.ToLower(assets[i].Name)
+		if isStandard(name) && strings.Contains(name, wantOS) {
+			return &assets[i]
+		}
+	}
+	return nil
+}
+
+// ------------------------------------------------------------------
+// 下载
+// ------------------------------------------------------------------
+
+// Progress 是下载进度。
+type Progress struct {
+	Received int64  `json:"received"`
+	Total    int64  `json:"total"`
+	Source   string `json:"source"`
+	Attempt  int    `json:"attempt"`
+}
+
+// Download 下载新版本，按「直连 → 镜像」顺序尝试。
+//
+// 返回下载后的本地路径。
+//
+// ## 关键约束
+//
+//  1. **失败要删掉半截文件**：否则下次会被误判成「已下载」。
+//  2. **必须校验 content-length**：镜像截断是常见故障。
+//  3. 每个源的失败原因都要回传，用户能看到「卡在哪个源」。
+func Download(
+	ctx context.Context,
+	url string,
+	targetPath string,
+	onProgress func(Progress),
+	onLog func(string, string),
+) (string, error) {
+	if onLog == nil {
+		onLog = func(string, string) {}
+	}
+	if onProgress == nil {
+		onProgress = func(Progress) {}
+	}
+
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+		return "", fmt.Errorf("无法创建下载目录：%w", err)
+	}
+
+	// 下载前先取**官方**摘要清单：拿不到就不下载（fail-closed）。
+	//
+	// 顺序很重要 —— 先校验后下载，才不会出现「已经跑了 300MB 才发现没法校验」。
+	// 清单的地址由下载 URL 里的 tag 推导，不信任调用方另传的字段。
+	assetName := assetNameFromURL(url)
+	tag := releaseTagFromURL(url)
+	sums, err := fetchDesktopChecksums(ctx, tag)
+	if err != nil {
+		return "", err
+	}
+	expected, ok := sums[strings.ToLower(assetName)]
+	if !ok {
+		return "", fmt.Errorf("摘要清单里没有 %s，已拒绍下载未校验的安装包", assetName)
+	}
+
+	// 候选源：直连 + 各镜像
+	sources := []struct {
+		Name string
+		URL  string
+	}{{Name: "GitHub", URL: url}}
+	for _, m := range Mirrors {
+		sources = append(sources, struct {
+			Name string
+			URL  string
+		}{Name: m.Name, URL: m.Prefix + url})
+	}
+
+	var errors []string
+	for i, src := range sources {
+		attempt := i + 1
+		onLog(fmt.Sprintf("尝试从 %s 下载（第 %d 次）…", src.Name, attempt), "info")
+
+		err := downloadOne(ctx, src.URL, targetPath, src.Name, attempt, onProgress)
+		if err == nil {
+			// 镜像能替换文件：**每个源**下载完都要重新比对官方摘要。
+			if vErr := verifyFileSHA256(targetPath, expected); vErr != nil {
+				cleanup(targetPath)
+				errors = append(errors, fmt.Sprintf("%s: %v", src.Name, vErr))
+				onLog(fmt.Sprintf("%s 下发的文件校验失败：%v", src.Name, vErr), "warn")
+				continue
+			}
+			onLog(fmt.Sprintf("下载完成（%s，已校验 SHA-256）", src.Name), "ok")
+			return targetPath, nil
+		}
+		errors = append(errors, fmt.Sprintf("%s: %v", src.Name, err))
+		onLog(fmt.Sprintf("%s 下载失败：%v", src.Name, err), "warn")
+	}
+
+	return "", fmt.Errorf("所有下载源均失败 —— %s", strings.Join(errors, "；"))
+}
+
+// downloadOne 从单个 URL 下载。
+func downloadOne(
+	ctx context.Context,
+	url, targetPath, sourceName string,
+	attempt int,
+	onProgress func(Progress),
+) error {
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", "CFPilot-Desktop")
+
+	client := proxy.Resolve().Client(10 * time.Minute)
+	res, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = res.Body.Close() }()
+
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %d", res.StatusCode)
+	}
+
+	total := res.ContentLength
+	out, err := os.Create(targetPath)
+	if err != nil {
+		return err
+	}
+
+	received := int64(0)
+	buf := make([]byte, 64*1024)
+	for {
+		n, readErr := res.Body.Read(buf)
+		if n > 0 {
+			if _, wErr := out.Write(buf[:n]); wErr != nil {
+				_ = out.Close()
+				cleanup(targetPath)
+				return wErr
+			}
+			received += int64(n)
+			onProgress(Progress{Received: received, Total: total, Source: sourceName, Attempt: attempt})
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			_ = out.Close()
+			cleanup(targetPath)
+			return readErr
+		}
+	}
+	if err := out.Close(); err != nil {
+		cleanup(targetPath)
+		return err
+	}
+
+	// 校验完整性（镜像截断是常见故障）
+	if total > 0 && received != total {
+		cleanup(targetPath)
+		return fmt.Errorf("下载不完整：%d/%d 字节", received, total)
+	}
+	if received == 0 {
+		cleanup(targetPath)
+		return fmt.Errorf("下载内容为空")
+	}
+	return nil
+}
+
+// cleanup 删掉半截文件。
+func cleanup(path string) {
+	_ = os.Remove(path)
+}
+
+// DefaultDownloadPath 返回新版本的落盘位置（配置目录下的 updates/）。
+func DefaultDownloadPath(version string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = "."
+	}
+	dir := filepath.Join(home, ".cfpilot-gui", "updates")
+	name := "cfpilot-" + version
+	switch runtime.GOOS {
+	case "windows":
+		name += ".exe"
+	case "darwin":
+		// macOS 下载的是 dmg：更新要换整个 .app，不是换里面的可执行文件。
+		// 后缀同时决定 ApplyUpdate 走哪条分支（看后缀认不出来时按单二进制处理）。
+		name += ".dmg"
+	}
+	return filepath.Join(dir, name)
+}
+
+/**
+ * isReleaseTag 判断 tag 是否是有效的发行版 tag。
+ *
+ * 接受的���缀（去掉前缀后须是合法 semver）：
+ *   v         —— 当前正式（release-desktop.yml 的 tag_name）
+ *   desktop-v —— Go 版工作流触发用
+ *   gui-v     —— Electron 时代过渡
+ */
+func isReleaseTag(tag string) bool {
+	return releaseVersion(tag) != ""
+}
+
+/**
+ * releaseVersion 从 tag 里提取版本号（不含前缀）。
+ *
+ * 不是合法 semver 时返回空串。
+ */
+func releaseVersion(tag string) string {
+	t := strings.TrimSpace(tag)
+	for _, prefix := range []string{"desktop-v", "gui-v", "v"} {
+		if strings.HasPrefix(t, prefix) {
+			v := strings.TrimPrefix(t, prefix)
+			if semverRe.MatchString(v) {
+				return v
+			}
+			return ""
+		}
+	}
+	return ""
+}
+
+// prereleaseLabel 从版本号里提取预发布标识（"1.0.0-beta.1" → "beta.1"，正式版返回 ""）。
+// 用于界面标注「测试版」，避免把 beta 误当成正式稳定版。
+func prereleaseLabel(version string) string {
+	i := strings.IndexByte(version, '-')
+	if i < 0 {
+		return ""
+	}
+	label := version[i+1:]
+	// 去掉 build 元数据（+xxx）
+	if j := strings.IndexByte(label, '+'); j >= 0 {
+		label = label[:j]
+	}
+	return label
+}
+
+// semverRe 匹配 x.y.z 形式的版本号。
+//
+// ⚠️ 必须**锚定整段**（审计 D6，与 CLI versionFromTag 一致）：旧实现只判前缀
+// `^\d+\.\d+\.\d+`，会把 `1.2.3-rc1/../../evil` 的剩余串整体当版本号返回，
+// 后续 kernel.cacheDir(version) 据此建目录 → 路径穿越写到缓存根之外。
+// 现在只接受纯 semver（可带 -prerelease / +build），拒绝任何尾随垃圾。
+var semverRe = regexp.MustCompile(`^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$`)

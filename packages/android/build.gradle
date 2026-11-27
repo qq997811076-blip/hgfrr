@@ -1,0 +1,28 @@
+// CFPilot 安卓版 —— 顶层构建脚本。
+//
+// 只保留插件声明与仓库配置，具体配置在 app/build.gradle。
+//
+// ⚠️ 版本矩阵是**钉死**的，不要随手升：
+//
+//   Gradle 8.9  ←→  Android Gradle Plugin 8.7.3  ←→  Kotlin 1.9.24
+//
+// runner 上装的是 Gradle 9.x，与 AGP 8.x 不兼容（AGP 8.7 要求 Gradle ≥ 8.9）。
+// 所以 CI 里用 wrapper 固定到 8.9 —— 见 release-desktop.yml 的「编译 APK」步骤。
+//
+// ⚠️ 也不要用 `allprojects { repositories { … } }`：
+// settings.gradle 里已经用 dependencyResolutionManagement 声明了仓库，
+// 两边都写会被 Gradle 判为「优先用 settings 的仓库却又被项目覆盖」而告警。
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.7.3'
+        classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.24'
+    }
+}
+
+tasks.register('clean', Delete) {
+    delete rootProject.layout.buildDirectory
+}

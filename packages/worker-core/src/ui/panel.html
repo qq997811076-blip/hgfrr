@@ -1,0 +1,1909 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<!--
+  页面标题与页面内可见标题保持一致（都是「CFPilot 管理控制台」）——
+  packages/worker-core/test/panel.test.ts 断言解压后的面板包含该字面量，
+  改名会打破该冒烟测试。页面内可见标题仍是新版的「CFPilot 管理控制台」。
+-->
+<title>CFPilot 管理控制台</title>
+<style>
+  :root {
+    --bg-base: #090d16;
+    --bg-elevated: #111827;
+    --bg-card: rgba(17, 24, 39, 0.82);
+    --bg-input: #0b111e;
+    --bg-hover: rgba(255, 255, 255, 0.04);
+    --border: rgba(255, 255, 255, 0.08);
+    --border-focus: #3b82f6;
+    --text-main: #f3f4f6;
+    --text-secondary: #9ca3af;
+    --text-muted: #6b7280;
+    --primary: #3b82f6;
+    --primary-hover: #2563eb;
+    --primary-glow: rgba(59, 130, 246, 0.18);
+    --accent: #6366f1;
+    --ok: #10b981;
+    --ok-bg: rgba(16, 185, 129, 0.12);
+    --warn: #f59e0b;
+    --warn-bg: rgba(245, 158, 11, 0.12);
+    --err: #ef4444;
+    --err-bg: rgba(239, 68, 68, 0.12);
+    --radius-sm: 8px;
+    --radius-md: 12px;
+    --radius-lg: 16px;
+    --shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.5);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background-color: var(--bg-base);
+    background-image:
+      radial-gradient(ellipse 80% 50% at 50% -15%, rgba(59, 130, 246, 0.18), transparent),
+      radial-gradient(ellipse 50% 40% at 85% 10%, rgba(99, 102, 241, 0.1), transparent);
+    background-attachment: fixed;
+    color: var(--text-main);
+    font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--primary); text-decoration: none; transition: color .15s; }
+  a:hover { color: #60a5fa; text-decoration: underline; }
+
+  .wrap { max-width: 1140px; margin: 0 auto; padding: 24px 20px 72px; }
+
+  /* === Top Header === */
+  header.top {
+    display: flex; align-items: center; gap: 14px;
+    padding-bottom: 20px; margin-bottom: 22px;
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  .logo {
+    width: 42px; height: 42px; border-radius: 11px;
+    display: grid; place-items: center;
+    background: linear-gradient(135deg, var(--primary), var(--accent));
+    box-shadow: 0 4px 14px rgba(59, 130, 246, 0.35);
+    font-weight: 700; font-size: 16px; letter-spacing: .5px; color: #fff;
+  }
+  /* logo 下方的版本号：一眼看清跑的是哪个版本 */
+  .logo-box { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+  .logo-ver {
+    font-size: 10.5px; line-height: 1; color: var(--text-secondary);
+    font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
+  header.top h1 { font-size: 18px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+  header.top p { margin: 2px 0 0; color: var(--text-secondary); font-size: 12.5px; }
+  .spacer { flex: 1; }
+
+  /* === Navigation Tabs (Segmented Bar) === */
+  nav.tabs {
+    display: inline-flex; gap: 4px; flex-wrap: wrap;
+    background: #0d1322; border: 1px solid var(--border);
+    padding: 5px; border-radius: var(--radius-md);
+    margin-bottom: 22px; width: 100%;
+    position: sticky; top: 0; z-index: 50;
+    box-shadow: 0 6px 18px -10px rgba(0, 0, 0, 0.55);
+  }
+  nav.tabs button {
+    flex: 1; min-width: 110px;
+    background: transparent; color: var(--text-secondary);
+    border: none; border-radius: var(--radius-sm);
+    padding: 9px 14px; font-size: 13.5px; font-weight: 500;
+    display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+    transition: all .15s ease;
+  }
+  nav.tabs button:hover { color: var(--text-main); background: var(--bg-hover); transform: none; }
+  nav.tabs button.active {
+    background: linear-gradient(135deg, var(--primary), var(--accent));
+    color: #fff; font-weight: 600;
+    box-shadow: 0 2px 10px rgba(59, 130, 246, 0.3);
+  }
+
+  /* === Buttons === */
+  button {
+    cursor: pointer; border: 1px solid transparent; border-radius: var(--radius-sm);
+    padding: 8px 15px; background: #1e293b; color: var(--text-main);
+    font-size: 13.5px; font-weight: 500; font-family: inherit;
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    transition: background .15s, border-color .15s, transform .1s;
+    /* 按钮文字不换行：flex 子项默认会被压缩，窄按钮里的中文会折成两行 */
+    white-space: nowrap;
+  }
+  button:hover:not(:disabled) { background: #334155; }
+  button:active:not(:disabled) { transform: translateY(1px); }
+  button.primary {
+    background: linear-gradient(135deg, var(--primary), var(--accent));
+    color: #fff; border-color: rgba(255,255,255,0.1);
+    box-shadow: 0 2px 10px rgba(59, 130, 246, 0.25);
+  }
+  button.primary:hover:not(:disabled) { filter: brightness(1.08); }
+  button.ghost { background: rgba(255,255,255,0.03); border-color: var(--border); color: var(--text-main); }
+  /* 内核通道有更新时的横幅按钮（橙色提示态） */
+  button.warn-btn { color: var(--warn); border-color: var(--warn); font-weight: 600; }
+  button.ghost:hover:not(:disabled) { background: rgba(255,255,255,0.08); border-color: rgba(255,255,255,0.18); }
+  button.danger { background: var(--err-bg); border-color: rgba(239,68,68,0.3); color: #fca5a5; }
+  button.danger:hover:not(:disabled) { background: rgba(239,68,68,0.2); }
+  button.sm { padding: 5px 10px; font-size: 12px; border-radius: 6px; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+
+  /* === Inputs & Forms === */
+  input, select, textarea {
+    width: 100%; background: var(--bg-input); color: var(--text-main);
+    border: 1px solid var(--border); border-radius: var(--radius-sm);
+    padding: 9px 12px; font-size: 13.5px; font-family: inherit; outline: none;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  input:focus, select:focus, textarea:focus {
+    border-color: var(--border-focus);
+    box-shadow: 0 0 0 3px var(--primary-glow);
+  }
+  input[readonly] { background: rgba(11, 17, 30, 0.6); color: #cbd5e1; }
+  textarea { resize: vertical; min-height: 92px; line-height: 1.6; font-size: 13px; }
+  label { display: block; font-size: 12.5px; font-weight: 500; color: #cbd5e1; margin: 0 0 6px; }
+  .field { margin-bottom: 16px; }
+  .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); }
+  .grid-3 { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+  #tab-advanced .grid, #tab-advanced .grid-3, #tab-sub .grid, #tab-sub .grid-3 { gap: 10px; }
+  #tab-advanced .grid-2col, #tab-inbound .grid-2col { grid-template-columns: 1fr 1fr; }
+  @media (max-width: 760px) { #tab-advanced .grid-2col, #tab-inbound .grid-2col { grid-template-columns: 1fr; } }
+  #tab-advanced .grid-2col > div, #tab-inbound .grid-2col > div { display: grid; gap: 16px; align-content: start; }
+  #tab-advanced .grid-pair, #tab-inbound .grid-pair { display: grid; gap: 16px; grid-template-columns: 1fr 1fr; align-content: start; }
+  @media (max-width: 760px) { #tab-advanced .grid-pair, #tab-inbound .grid-pair { grid-template-columns: 1fr; } }
+  #tab-advanced .field .tip { font-size: 11px; line-height: 1.35; margin-top: 4px; }
+
+  /* === Cards === */
+  .card {
+    background: var(--bg-card);
+    backdrop-filter: blur(12px);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: 22px; margin-bottom: 18px;
+    box-shadow: var(--shadow);
+  }
+  .card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; flex-wrap: wrap; }
+  .card h2 { margin: 0 0 6px; font-size: 15.5px; font-weight: 600; display: flex; align-items: center; gap: 9px; }
+  .card h2 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--primary); box-shadow: 0 0 8px var(--primary); }
+  .card .hint, .tip { color: var(--text-secondary); font-size: 12.5px; line-height: 1.65; margin: 0 0 14px; }
+  .tip { background: rgba(255,255,255,0.025); border-left: 3px solid var(--primary); padding: 8px 12px; border-radius: 0 6px 6px 0; margin-top: 8px; }
+
+  /* === Stat Metrics === */
+  .stat { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr)); margin-top: 12px; }
+  .stat .item {
+    background: rgba(255,255,255,.025); border: 1px solid var(--border);
+    border-radius: var(--radius-md); padding: 14px 16px;
+  }
+  .stat .k { color: var(--text-secondary); font-size: 12px; }
+  .stat .v { font-size: 16px; font-weight: 600; margin-top: 6px; word-break: break-all; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+  /* === Source Cards & Toggle Switches === */
+  .source {
+    border: 1px solid var(--border); border-radius: var(--radius-md);
+    padding: 16px; margin-bottom: 12px; background: rgba(255,255,255,.015);
+    transition: border-color .2s, background .2s;
+  }
+  .source.on { border-color: rgba(59, 130, 246, 0.5); background: rgba(59, 130, 246, 0.05); }
+  .source-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+  .source .chk { display: flex; align-items: center; gap: 10px; margin: 0; color: var(--text-main); font-size: 14.5px; font-weight: 600; cursor: pointer; }
+  .source .chk input { width: 16px; height: 16px; accent-color: var(--primary); cursor: pointer; }
+  .source .desc { color: var(--text-secondary); font-size: 12.5px; margin-left: 26px; margin-top: 4px; line-height: 1.55; }
+  .source .src-body { margin-top: 14px; padding-top: 14px; border-top: 1px dashed var(--border); display: none; }
+  .source.on .src-body { display: block; }
+
+  /* === Check-pills (Ports & Variants) === */
+  .check-group { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+  label.check-pill {
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 7px 13px; border-radius: var(--radius-sm);
+    border: 1px solid var(--border); background: var(--bg-input);
+    font-size: 13px; color: var(--text-secondary); cursor: pointer;
+    user-select: none; margin: 0; transition: all .15s;
+  }
+  label.check-pill:hover { border-color: rgba(255,255,255,0.2); color: var(--text-main); }
+  label.check-pill input { width: 14px; height: 14px; margin: 0; accent-color: var(--primary); }
+  label.check-pill:has(input:checked) {
+    background: var(--primary-glow); border-color: var(--primary); color: #fff; font-weight: 500;
+  }
+
+  /* === Switch Rows === */
+  .switch-box {
+    display: flex; align-items: flex-start; justify-content: space-between; gap: 14px;
+    padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+    background: rgba(255,255,255,0.015); margin-bottom: 10px;
+  }
+  .switch-box .sw-info { flex: 1; }
+  .switch-box .sw-title { font-size: 13.5px; font-weight: 500; color: var(--text-main); cursor: pointer; }
+  .switch-box .sw-desc { font-size: 12px; color: var(--text-secondary); margin-top: 3px; line-height: 1.5; }
+  .switch-box input[type="checkbox"] { width: 18px; height: 18px; margin-top: 2px; accent-color: var(--primary); cursor: pointer; }
+
+  /* === Accordion / Fold === */
+  .fold { border: 1px solid var(--border); border-radius: var(--radius-md); margin: 14px 0; background: rgba(11, 17, 30, 0.65); overflow: hidden; }
+  .fold > summary {
+    cursor: pointer; padding: 12px 16px; font-size: 13.5px; font-weight: 500; color: #cbd5e1;
+    list-style: none; user-select: none; display: flex; align-items: center; justify-content: space-between;
+  }
+  .fold > summary::-webkit-details-marker { display: none; }
+  .fold > summary::after { content: '展开设置 ▾'; font-size: 12px; color: var(--text-secondary); font-weight: 400; }
+  .fold[open] > summary::after { content: '收起 ▴'; }
+  .fold > summary:hover { background: var(--bg-hover); color: #fff; }
+  .fold-body { padding: 16px; border-top: 1px solid var(--border); }
+
+  /* === Terminal & Code Blocks === */
+  .cmd-box { position: relative; margin-bottom: 12px; }
+  pre.cmd {
+    background: #060911; border: 1px solid var(--border); border-radius: var(--radius-sm);
+    padding: 13px 14px; overflow-x: auto; white-space: pre-wrap; word-break: break-all;
+    color: #93c5fd; margin: 0; font-size: 12.5px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  /* === Tables === */
+  .table-wrap { max-height: 400px; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-input); }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--border); }
+  th { color: var(--text-secondary); font-weight: 500; font-size: 12px; position: sticky; top: 0; background: #111827; z-index: 1; }
+  tbody tr:hover { background: rgba(255,255,255,0.025); }
+
+  /* === Badges & Pills === */
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 500; border: 1px solid var(--border); }
+  .tag.official { color: var(--ok); background: var(--ok-bg); border-color: rgba(16,185,129,.3); }
+  .tag.domain { color: #60a5fa; background: rgba(59,130,246,.12); border-color: rgba(59,130,246,.3); }
+  .tag.manual, .tag.local, .tag.add { color: var(--warn); background: var(--warn-bg); border-color: rgba(245,158,11,.3); }
+  .tag.api, .tag.addapi, .tag.csv, .tag.addcsv { color: #a78bfa; background: rgba(139,92,246,.12); border-color: rgba(139,92,246,.3); }
+  .summary-bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
+  .pill { padding: 4px 12px; border-radius: 999px; background: rgba(255,255,255,.04); border: 1px solid var(--border); font-size: 12.5px; }
+
+  /* === Alerts === */
+  .warn {
+    border: 1px solid rgba(245,158,11,.35); background: var(--warn-bg);
+    color: #fde68a; border-radius: var(--radius-sm); padding: 10px 14px; font-size: 12.5px; line-height: 1.65; margin-bottom: 12px;
+  }
+  .warn.err { border-color: rgba(239,68,68,.4); background: var(--err-bg); color: #fca5a5; }
+
+  /* === Helpers === */
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .row.end { justify-content: flex-end; }
+  .row.nowrap { flex-wrap: nowrap; }
+  .muted { color: var(--text-secondary); font-size: 12.5px; }
+  .muted.err, .err { color: #fca5a5; font-size: 12.5px; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+  code.inline, code { background: var(--bg-input); padding: 2px 6px; border-radius: 5px; border: 1px solid var(--border); font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; color: #93c5fd; }
+  .hidden { display: none !important; }
+
+  /* === Login View === */
+  .login-wrap { max-width: 400px; margin: 14vh auto; padding: 0 16px; }
+  .login-head { text-align: center; margin-bottom: 20px; }
+  .login-head .logo { margin: 0 auto 12px; width: 48px; height: 48px; font-size: 18px; }
+
+  /* === Toast === */
+  .toast {
+    position: fixed; right: 20px; bottom: 20px; background: #1e293b; border: 1px solid rgba(255,255,255,0.12);
+    border-left: 4px solid var(--primary); padding: 12px 16px; border-radius: var(--radius-sm); font-size: 13px;
+    box-shadow: var(--shadow); opacity: 0; transform: translateY(10px); transition: .2s; pointer-events: none; z-index: 99; max-width: 360px;
+  }
+  .toast.show { opacity: 1; transform: none; }
+  .toast.err { border-left-color: var(--err); }
+
+  /* === Step Guide Cards === */
+  .steps { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); margin-top: 10px; }
+  .step-card { background: rgba(255,255,255,0.02); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 14px; }
+  .step-num { display: inline-block; width: 22px; height: 22px; line-height: 22px; text-align: center; border-radius: 6px; background: var(--primary-glow); color: #60a5fa; font-weight: 700; font-size: 12px; margin-bottom: 8px; }
+  .step-card h4 { margin: 0 0 4px; font-size: 13.5px; }
+  .step-card p { margin: 0; color: var(--text-secondary); font-size: 12px; line-height: 1.55; }
+</style>
+</head>
+<body>
+
+<!-- ==================== 主控台视图 ==================== -->
+<div id="app" class="wrap hidden">
+  <header class="top">
+    <div class="logo-box">
+      <div class="logo">CP</div>
+      <span class="logo-ver" id="logoVer" title="内核版本"></span>
+    </div>
+    <div>
+      <h1>CFPilot 管理控制台</h1>
+      <p>Cloudflare 边缘网络数据面 · 节点池编排与真连接优选中心</p>
+    </div>
+    <div class="spacer"></div>
+    <button class="ghost" id="btnKernelCheck" title="检查官方内核通道是否有新内核">内核检查</button>
+    <button class="ghost" id="btnRefresh">↻ 刷新状态</button>
+    <button class="ghost" id="btnLogout">退出登录</button>
+    <button class="ghost" id="btnTheme" title="切换亮色 / 暗色主题" aria-label="切换主题" style="padding:8px 12px">🎨</button>
+  </header>
+  <div id="kernelHint" class="hint" hidden style="margin:-6px 0 10px"></div>
+
+  <nav class="tabs" id="tabs">
+    <button data-tab="overview" class="active">📊 运行概览</button>
+    <button data-tab="pool">🌐 节点来源</button>
+    <button data-tab="sub">🔗 订阅中心</button>
+    <button data-tab="optimize">⚡ 本地优选</button>
+    <button data-tab="inbound">🛡️ 入站配置</button>
+    <button data-tab="advanced">⚙️ 出站与高级</button>
+  </nav>
+
+  <!-- Tab 1: 运行概览 -->
+  <section class="tab-page" id="tab-overview">
+    <div class="card">
+      <h2><span class="dot"></span>系统运行状态</h2>
+      <div class="stat" id="statusBox"></div>
+      <p class="hint" id="statusMeta" style="margin:12px 0 0"></p>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2><span class="dot"></span>自适应订阅地址（推荐）</h2>
+        <button class="ghost sm" data-goto="sub">更多订阅选项 →</button>
+      </div>
+      <p class="hint">
+        通吃链接：客户端 User-Agent 自动获取对应格式 ——
+        识别不出类型时回落到 Base64（通用）。
+      </p>
+      <div class="field" style="margin-bottom:0">
+        <div class="row nowrap">
+          <input class="mono" id="subAdaptive" readonly />
+          <button class="primary" data-copy="subAdaptive">复制订阅链接</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2><span class="dot"></span>当前活跃节点池分布</h2>
+        <button class="ghost sm" data-goto="pool">管理节点来源 →</button>
+      </div>
+      <p class="hint">下表展示当前订阅链接实际下发的节点构成与去重统计。</p>
+      <div class="summary-bar" id="overviewSummary"></div>
+    </div>
+
+    <div class="card">
+      <h2><span class="dot"></span>快速配置指南</h2>
+      <div class="steps">
+        <div class="step-card">
+          <span class="step-num">1</span>
+          <h4>编排节点来源</h4>
+          <p>在「节点来源」中按需启用官方 IP、优选域名或手动池。未勾选任何来源时系统将自动启用 20+10 保底策略。</p>
+        </div>
+        <div class="step-card">
+          <span class="step-num">2</span>
+          <h4>执行本地真连接优选</h4>
+          <p>在「本地优选」中以您的专属数据面域名作为 SNI 完成 WebSocket 101 实测，筛选本机直连质量最佳的边缘 IP。</p>
+        </div>
+        <div class="step-card">
+          <span class="step-num">3</span>
+          <h4>导入客户端订阅</h4>
+          <p>前往「订阅中心」复制自适应链接（支持 V2Ray / Clash Mihomo / Sing-box），粘贴至客户端即可使用。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Tab 2: 节点来源 -->
+  <section class="tab-page hidden" id="tab-pool">
+    <div class="card">
+      <h2><span class="dot"></span>节点池来源编排</h2>
+      <p class="hint">
+        · 三种节点来源自由组合，系统按 <b>官方优选 IP → 优选域名 → 手动指定 IP</b> 顺序合并去重。<br>
+        · 若三项均未勾选，系统将自动生成 <b>20 个官方优选 IP + 10 个优选域名</b> 确保订阅始终可用。<br>
+        · <b>独立来源</b>：<b>远程第三方优选订阅源</b>（TXT 列表 / CSV 测速表）——
+        「订阅中心」页填写，<b>不受本页三个勾选项影响</b>，配置即生效。
+      </p>
+
+      <!-- 来源 1：官方优选 -->
+      <div class="source" id="src-official">
+        <label class="chk"><input type="checkbox" id="poolOfficial" /> 1. 官方 Anycast 随机优选 IP</label>
+        <div class="desc">从 Cloudflare 官方发布的 IPv4 网段中按权重随机抽样生成，避免固定静态 IP 表失效。</div>
+        <div class="src-body">
+          <div class="grid">
+            <div class="field" style="margin-bottom:0">
+              <label>抽样生成数量（1–200）</label>
+              <input id="officialCount" type="number" min="1" max="200" step="1" />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 来源 2：优选域名 -->
+      <div class="source" id="src-domain">
+        <label class="chk"><input type="checkbox" id="poolDomain" /> 2. 优选 CNAME 域名库</label>
+        <div class="desc">通过接入 Cloudflare 的知名高可用域名动态解析边缘 IP（客户端实际握手 SNI 与 Host 仍保持为您的数据面域名）。</div>
+        <div class="src-body">
+          <div class="grid">
+            <div class="field">
+              <label>随机抽取数量（1–100）</label>
+              <input id="domainCount" type="number" min="1" max="100" step="1" />
+            </div>
+            <div class="field">
+              <label>系统内置库统计</label>
+              <input id="builtinDomains" readonly />
+            </div>
+          </div>
+          <div class="field" style="margin-bottom:0">
+            <label>自定义优选域名库（每行一个域名）</label>
+            <textarea id="domainLib" placeholder="cf.example.com&#10;bestcf.example.net"></textarea>
+            <p class="tip">与内置库随机域名互补下发，重复自动合并。</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- 来源 3：手动与本地优选 -->
+      <div class="source" id="src-manual">
+        <label class="chk"><input type="checkbox" id="poolManual" /> 3. 手动指定 IP</label>
+        <div class="desc">「本地真连接池」持久化保存自动回填的实测 IP；手动静态节点为动态增补 IP。</div>
+        <div class="src-body">
+          <div class="field">
+            <label>手动静态节点（每行一条，支持格式：<code class="inline">IP</code> / <code class="inline">IP:端口</code> / <code class="inline">IP:端口#备注</code>）</label>
+            <textarea id="cfgAdd" class="mono" placeholder="104.16.1.1:443#US-SJC&#10;[2606:4700::1]:443#US-LAX"></textarea>
+            <p class="tip" id="cfgAddHint" style="display:none"></p>
+          </div>
+          <div class="row" style="background:rgba(0,0,0,0.2);padding:10px 12px;border-radius:8px;border:1px solid var(--border)">
+            <span class="muted" id="localState" style="color:var(--text-main);font-weight:500">本地真连接池：0 条</span>
+            <div class="spacer"></div>
+            <button class="ghost sm" id="btnToggleLocal">查看 / 编辑明细</button>
+            <button class="danger sm" id="btnClearIps">清空本地池</button>
+          </div>
+
+          <div id="localBox" class="hidden" style="margin-top: 12px">
+            <div class="field">
+              <label>本地真连接池存储内容 <span class="muted" id="localCount"></span></label>
+              <textarea
+                id="localIpsText"
+                class="mono"
+                placeholder="暂无本地优选记录 —— 请用 CLI 或桌面版完成优选后回填，或直接在此手动录入"
+                style="min-height: 140px"
+              ></textarea>
+              <p class="muted" style="margin: 6px 0 0">
+                格式规范：<code class="inline">IP:端口#机房_延迟_速度</code>。此处展示的是存储在 KV（<code>LOCAL_PREFERRED_IPS</code>）中的实测回填数据，与上方「手动静态节点」合并生效。
+              </p>
+            </div>
+            <div class="row">
+              <button class="ghost sm" id="btnReloadLocal">↻ 重新读取 KV</button>
+              <div class="spacer"></div>
+              <button class="primary sm" id="btnSaveLocal">保存本地池修改</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="row end" style="margin-top:16px">
+        <button class="ghost" id="btnPreview">↻ 刷新下方预览</button>
+        <button class="primary" id="btnSavePool">保存并应用节点来源</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2><span class="dot"></span>实时下发节点预览 <span class="muted" id="previewSummary" style="font-weight:400"></span></h2>
+      <div id="previewWarn" class="warn hidden"></div>
+      <div class="table-wrap">
+        <table id="nodeTable">
+          <thead><tr><th>#</th><th>来源类型</th><th>节点地址</th><th>边缘机房</th><th>延迟 (ms)</th><th>下行速度 (MB/s)</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- Tab 3: 本地优选 -->
+  <section class="tab-page hidden" id="tab-optimize">
+    <div class="card">
+      <h2><span class="dot"></span>本地真连接优选（True-Connect Scanner）</h2>
+      <p class="hint">
+        在本机以<b>数据面专属域名</b>作 TLS SNI 与 HTTP Host，实测 TCP / TLS / WebSocket 101 握手，
+        把高速 IP 回填到「本地真连接池」。
+        优选由 <b>CLI</b> 完成，本页只给出用法说明。
+      </p>
+
+      <div class="grid" style="margin-top:14px">
+        <div>
+          <label>① 安装并运行（推荐）</label>
+          <div class="cmd-box">
+            <pre class="cmd">npm i -g cfpilot
+cfpilot scan --host &lt;数据面域名&gt; --panel &lt;控制面域名&gt;</pre>
+          </div>
+          <p class="muted" style="margin:6px 0 0">
+            免安装：把 <code class="inline">npm i -g cfpilot</code> 换成 <code class="inline">npx -y cfpilot@latest scan …</code> 即可。
+            需要 Node.js 18+；扫描期间请关闭本机代理的 TUN 模式与系统代理，确保测的是真实直连质量。
+          </p>
+        </div>
+        <div>
+          <label>② 查看全部参数</label>
+          <div class="cmd-box">
+            <pre class="cmd">cfpilot scan --help</pre>
+          </div>
+          <p class="muted" style="margin:6px 0 0">
+            常用：<code class="inline">--top</code> 保留节点数、<code class="inline">--sample</code> 抽样规模、
+            <code class="inline">--countries</code> 地区过滤、<code class="inline">--no-callback</code> 只输出不回填。
+          </p>
+        </div>
+      </div>
+
+      <div class="row" style="margin:16px 0 0;padding:12px 14px;background:rgba(59,130,246,0.06);border:1px solid rgba(59,130,246,0.25);border-radius:10px">
+        <span class="muted" style="color:var(--text-main)">
+          不想用命令行？下载桌面版：内置优选与一键部署，图形界面操作。
+        </span>
+        <div class="spacer"></div>
+        <a class="ghost sm" href="https://github.com/xmwengxing/CFPilot/releases" target="_blank" rel="noopener">桌面版下载 ↗</a>
+      </div>
+
+      <p class="tip">
+        <b>数据面 / 控制面别填反</b>：<code class="inline">--host</code> 是数据面（客户端实际连接的域名），
+        <code class="inline">--panel</code> 是控制面（面板所在域名）。填反会出现「令牌校验失败」或回填不生效。
+      </p>
+    </div>
+  </section>
+
+  <!-- Tab 4: 订阅中心 -->
+  <section class="tab-page hidden" id="tab-sub">
+    <div class="card">
+      <div class="card-head">
+        <h2><span class="dot"></span>客户端订阅地址</h2>
+        <button class="primary sm" id="btnRefreshSub">↻ 刷新订阅与节点</button>
+      </div>
+      <p class="hint">复制下方对应客户端格式的订阅链接导入。「节点来源」或「入站配置」修改参数后，客户端更新订阅即可同步最新节点。</p>
+
+      <div class="field">
+        <label>通用 Base64 订阅（适用于 v2rayN / v2rayNG / Shadowrocket / Nekoray）</label>
+        <div class="row nowrap"><input class="mono" id="subBase64" readonly /><button class="ghost" data-copy="subBase64">复制链接</button></div>
+      </div>
+      <div class="field">
+        <label>Clash / Mihomo 专用订阅（YAML 格式，自动按节点来源分组）</label>
+        <div class="row nowrap"><input class="mono" id="subClash" readonly /><button class="ghost" data-copy="subClash">复制链接</button></div>
+      </div>
+      <div class="field" style="margin-bottom:0">
+        <label>Sing-box 专用订阅（JSON 1.12+ 规范，自动按节点来源分组）</label>
+        <div class="row nowrap"><input class="mono" id="subSingbox" readonly /><button class="ghost" data-copy="subSingbox">复制链接</button></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2><span class="dot"></span>远程第三方优选订阅源（可选扩展）</h2>
+      <p class="hint">
+        挂载外部维护的优选节点来源，订阅生成时会自动拉取并**独立成池**追加。<br>
+        <b>TXT 列表</b>：每行一个 <code>IP:端口</code> 或 <code>IP:端口#备注</code>，按行解析。<br>
+        <b>CSV 测速表</b>：第三方优选器导出的 <code>result.csv</code>。<br>
+        ⚠️ 远程池<b>不受</b>「节点来源」页那三个勾选项影响。
+        拉取失败会在「节点来源 → 实时下发节点预览」中显示。
+      </p>
+      <div class="grid">
+        <div class="field"><label>远程 TXT 列表地址（ADDAPI，每行一个 https URL）</label><textarea id="cfgAddApi" class="mono" placeholder="https://example.com/ips.txt"></textarea></div>
+        <div class="field"><label>远程 CSV 测速表地址（ADDCSV，每行一个 URL）</label><textarea id="cfgAddCsv" class="mono" placeholder="https://example.com/result.csv"></textarea></div>
+      </div>
+      <div class="row end"><button class="primary" id="btnSaveRemote">保存远程订阅源配置</button></div>
+    </div>
+
+    <div class="card">
+      <h2><span class="dot"></span>Clash 分流规则（进阶）</h2>
+      <p class="hint">
+        编辑 Clash 订阅 <code class="inline">rules</code> / <code class="inline">proxy-groups</code> 来源（ini 格式）。
+        「清空（回落内置）」可退回内置 GEOSITE/GEOIP 规则。建议「刷新预览」（需等待加载显示）确认后导入客户端。
+      </p>
+      <div class="field">
+        <label>分流规则原文 <span class="muted" id="routeProfileState"></span></label>
+        <textarea id="cfgRouteProfile" class="mono" rows="8" placeholder="[custom]&#10;ruleset=🎯 全球直连,[]GEOIP,CN&#10;custom_proxy_group=🚀 节点选择`select`[]♻️ 自动选择`[]DIRECT"></textarea>
+        <p class="tip">格式：<code class="inline">ruleset=&lt;策略组&gt;,&lt;规则URL或[]内联规则&gt;</code> / <code class="inline">custom_proxy_group=&lt;组名&gt;`&lt;类型&gt;`[正则]`&lt;URL&gt;`&lt;间隔&gt;[`成员...]</code>。远端 ruleset 会被忽略（只用内联 GEOIP/GEOSITE 类规则，避免整份订阅加载失败）。</p>
+      </div>
+      <div class="row">
+        <button class="ghost" id="btnReloadRouteProfile">↻ 重新读取</button>
+        <button class="ghost" id="btnClearRouteProfile">清空（回落内置）</button>
+        <div class="spacer"></div>
+        <button class="primary" id="btnSaveRouteProfile">保存分流规则</button>
+      </div>
+      <div class="field" style="margin-top:14px">
+        <label>Clash 订阅 YAML 预览（只读）</label>
+        <textarea id="clashYamlPreview" class="mono" rows="10" readonly placeholder="点「刷新预览」查看当前 Clash 订阅的 YAML 全文"></textarea>
+      </div>
+      <div class="row">
+        <button class="ghost" id="btnPreviewClashYaml">↻ 刷新预览</button>
+        <button class="ghost" data-copy="clashYamlPreview">复制 YAML</button>
+        <div class="spacer"></div>
+        <button class="ghost" id="btnGotoRelay">填写反代入口池 →</button>
+      </div>
+    </div>
+
+    <div class="card" id="subTokenCard">
+      <h2><span class="dot"></span>订阅链接安全（进阶）· 切换前请先读风险</h2>
+      <div class="warn err"><b>⚠ 切到「签名模式」后，经典链接（/sub/&lt;UUID&gt;）立即返回 403，每台设备都要重新导入；「轮换密钥」不可撤销。</b><br>正确顺序：① 签发 → ② 逐台导入验证 → ③ 再切模式。绝大多数用户不需要开启本功能。</div>
+      <div class="field">
+        <label>签名链接 <span class="muted" id="subTokenState"></span></label>
+        <div class="row nowrap"><input class="mono" id="subSigned" readonly placeholder="点「① 签发」生成" /><button class="ghost" data-copy="subSigned">复制</button></div>
+      </div>
+      <div class="row">
+        <button class="ghost" id="btnSignSub">① 签发</button>
+        <button class="danger" id="btnRotateSub">轮换密钥</button>
+        <button class="primary" id="btnToggleSubMode">② 切换模式</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Tab 5: 入站配置 -->
+  <section class="tab-page hidden" id="tab-inbound">
+    <div class="card">
+      <h2><span class="dot"></span>核心鉴权与传输路径</h2>
+      <p class="hint">配置数据面支持的入站协议凭证与 WebSocket / XHTTP 监听路径。建议自定义复杂的路径以提升隐蔽性。</p>
+
+      <div class="grid grid-2col">
+        <div>
+          <div class="grid-pair">
+            <div class="field">
+              <label>Clash 订阅名</label>
+              <input id="cfgSubName" placeholder="CFPilot" maxlength="64" />
+            </div>
+            <div class="field">
+              <label>Trojan 认证密码</label>
+              <input id="cfgTrojan" class="mono" placeholder="留空保存将自动生成随机密码" />
+            </div>
+          </div>
+          <div class="grid-pair">
+            <div class="field">
+              <label>VLESS-XHTTP 监听路径</label>
+              <input id="cfgXhttpPath" class="mono" placeholder="/xhttp" />
+            </div>
+            <div class="field">
+              <label>自定义订阅域名（SNI / Host）</label>
+              <input id="cfgSubDomain" class="mono" placeholder="留空则默认使用当前数据面域名" />
+            </div>
+          </div>
+        </div>
+        <div>
+          <div class="grid-pair">
+            <div class="field">
+              <label>VLESS-WS 监听路径</label>
+              <input id="cfgWsPath" class="mono" placeholder="/vless" />
+            </div>
+            <div class="field">
+              <label>Trojan-WS 监听路径</label>
+              <input id="cfgTrojanPath" class="mono" placeholder="/trojan" />
+            </div>
+          </div>
+          <div class="field">
+            <label>VLESS UUID（用户凭证）</label>
+            <div class="row nowrap">
+              <input id="cfgUuid" class="mono" placeholder="留空保存将自动生成随机 UUID" />
+              <button type="button" class="ghost" id="btnGenUuid" title="随机生成 UUID">🎲 随机</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="field">
+        <div class="row" style="margin-bottom:6px">
+          <label style="margin:0">订阅下发 TLS 端口（支持多选，每个候选 IP 将按所选端口分别生成节点）</label>
+          <div class="spacer"></div>
+          <button type="button" class="ghost sm" id="btnAllSubPorts">全选端口</button>
+          <button type="button" class="ghost sm" id="btnClearSubPorts">清空端口</button>
+        </div>
+        <div class="check-group">
+          <label class="check-pill"><input type="checkbox" name="subPort" value="443" checked /> 443（推荐）</label>
+          <label class="check-pill"><input type="checkbox" name="subPort" value="2053" /> 2053</label>
+          <label class="check-pill"><input type="checkbox" name="subPort" value="2083" /> 2083</label>
+          <label class="check-pill"><input type="checkbox" name="subPort" value="2087" /> 2087</label>
+          <label class="check-pill"><input type="checkbox" name="subPort" value="2096" /> 2096</label>
+          <label class="check-pill"><input type="checkbox" name="subPort" value="8443" /> 8443</label>
+        </div>
+        <p class="tip">
+          当标准 443 端口在特定地区受阻时，可勾选 Cloudflare 官方支持的备用 HTTPS 端口。手动优选池中已显式指定端口的条目将保持原端口不变。
+          <br>清空后保存等价于只保留 443（后端对空端口列表回落默认值，订阅不会为空）。
+        </p>
+      </div>
+
+      <div class="field">
+        <div class="row" style="margin-bottom:6px">
+          <label style="margin:0">订阅包含的协议形态（支持多选）</label>
+          <div class="spacer"></div>
+          <button type="button" class="ghost sm" id="btnAllSubVariants">全选形态</button>
+          <button type="button" class="ghost sm" id="btnClearSubVariants">清空形态</button>
+        </div>
+        <div class="check-group">
+          <label class="check-pill"><input type="checkbox" id="cfgVarVlessWs" /> VLESS + WebSocket（全客户端通用）</label>
+<label class="check-pill"><input type="checkbox" id="cfgVarVlessXhttp" /> VLESS + XHTTP（新版 mihomo 1.19+ 支持）</label>
+          <label class="check-pill"><input type="checkbox" id="cfgVarTrojan" /> Trojan + WebSocket</label>
+        </div>
+        <p class="tip">
+          订阅仅会为上方勾选的协议形态生成节点。若勾选 Trojan 或 XHTTP，请确保下方对应的服务端入站开关处于启用状态。
+          <br>全部未勾选，后端会回落到 VLESS + WebSocket（保证订阅不为空）。
+          <br>⚠️ <b>XHTTP 已可用</b>：上行改用 packet-up 分包、关闭 gRPC 头伪装（边缘不再返回 403），支持上下行分离与 H3 降级。
+        </p>
+      </div>
+
+      <div class="grid" style="margin-top:12px">
+        <div class="switch-box" style="margin-bottom:0">
+          <div class="sw-info">
+            <label class="sw-title" for="cfgEnableTrojan">启用服务端 Trojan 入站监听</label>
+            <div class="sw-desc">允许数据面接收并处理 Trojan over WebSocket 流量。</div>
+          </div>
+          <input type="checkbox" id="cfgEnableTrojan" />
+        </div>
+        <div class="switch-box" style="margin-bottom:0">
+          <div class="sw-info">
+            <label class="sw-title" for="cfgEnableXhttp">启用服务端 XHTTP 入站监听</label>
+            <div class="sw-desc">允许数据面接收并处理 VLESS XHTTP 流式 POST 请求。</div>
+          </div>
+          <input type="checkbox" id="cfgEnableXhttp" />
+        </div>
+      </div>
+
+      <div class="row end" style="margin-top:18px"><button class="primary" id="btnSaveInbound">保存入站配置</button></div>
+    </div>
+  </section>
+
+  <!-- Tab 6: 出站与高级 -->
+  <section class="tab-page hidden" id="tab-advanced">
+    <div class="card">
+      <h2><span class="dot"></span>出站路由、链式代理与抗封锁策略</h2>
+      <p class="hint">
+        配置 SOCKS5 / HTTP(S) 代理或反代池可解除 Cloudflare 禁止连回自家网段的限制，并改善出站 IP 纯净度。
+      </p>
+
+      <div class="grid grid-2col">
+        <div>
+          <div class="grid-pair">
+            <div class="field">
+              <label>SOCKS5 出站代理</label>
+              <input id="cfgSocks5" class="mono" placeholder="user:pass@1.2.3.4:1080" />
+              <p class="tip">支持 user:pass@host:port。</p>
+            </div>
+            <div class="field">
+              <label>HTTP / HTTPS 出站代理</label>
+              <input id="cfgHttpProxy" class="mono" placeholder="https://user:pass@proxy.example.com:8443#sni=proxy.example.com" />
+              <p class="tip">支持 https:// 与 #sni=。</p>
+            </div>
+          </div>
+        </div>
+        <div>
+          <div class="grid-pair">
+            <div class="field">
+              <label>NAT64 转换前缀</label>
+              <input id="cfgNat64" class="mono" placeholder="64:ff9b::" />
+              <p class="tip">IPv6 出站回退前缀。</p>
+            </div>
+            <div class="field">
+              <label>客户端 TLS 指纹伪装</label>
+              <input id="cfgFingerprint" class="mono" placeholder="chrome" />
+              <p class="tip">uTLS Fingerprint 指纹名。</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!--
+        三个出站映射填写框并列一行（2026-11-14）：链式代理 / 自定义反代入口池 /
+        固定落地 IP 同属「出站地址改写」，原来分散在两列里不易对照。
+        窄屏（auto-fit）自动落成单列。
+      -->
+      <div class="grid-3">
+        <div class="field">
+          <label>链式代理</label>
+          <textarea id="cfgProxyIp" class="mono" rows="3" placeholder="1.2.3.4:443"></textarea>
+          <p class="tip">连接此地址、转发到目标站（按下方调度模式参与选路）。</p>
+        </div>
+        <div class="field">
+          <label>自定义反代入口池</label>
+          <textarea id="cfgRelayPool" class="mono" rows="3" placeholder="1.2.3.4:443&#10;relay.example.com:443"></textarea>
+          <p class="tip">自配第三方反代入口，优先于内置反代；直连/优选失败、Cloudflare 网段目标时启用。此处留空时内核自带一批实测可用的出厂入口（与你写的条目按行合并），所以删空保存也不会失去兜底。</p>
+        </div>
+        <div class="field">
+          <label>固定落地 IP / 固定反代入口</label>
+          <textarea id="cfgPinnedHosts" class="mono" rows="3" placeholder="example.com=203.0.113.10&#10;cloudflare.com=r:198.51.100.7"></textarea>
+          <p class="tip">按域名写死落地地址，<code>r:</code> 前缀 = 固定反代入口（只能把 TLS 按 SNI 转给 Cloudflare 承载的域名）。<b>默认不固定任何域名</b>：留空时完全走 DoH 优选与内置反代池。固定入口是单点，失效 IP 现在会熔断（连续失败 2 次进冷却、直接走池，冷却到期自动重试），但每次请求仍可能多等一次短超时，所以只建议在确有实测收益时填。</p>
+          <button class="ghost" type="button" id="btnPinnedSuggest">填入建议值</button>
+        </div>
+      </div>
+
+      <!--
+        代理调度模式（PROXY_MODE）
+
+        语义见 packages/worker-core/src/config.ts 的 normalizeProxyMode()：
+        只有 'global' / 'fallback' / 'smart' 三个值有意义，其余一律回落 'only'。
+        'only' 是最保守的语义 —— 配了代理就只走代理，绝不静默改走直连。
+      -->
+      <div class="field">
+        <label for="cfgProxyMode">代理调度模式（PROXY_MODE）</label>
+        <select id="cfgProxyMode">
+          <option value="only">仅代理（默认）—— 配了代理就只走代理，绝不直连</option>
+          <option value="global">全局代理优先 —— 代理挂了回退直连</option>
+          <option value="fallback">仅回退兜底 —— 先直连，失败再走代理</option>
+          <option value="smart">智能分流 —— CF 网段目标走代理，其它先直连</option>
+        </select>
+        <p class="tip">
+          「仅代理」保证出口 IP 与配置一致（直连会暴露 Cloudflare 原生出口）。
+          代理全部失败时会尝试<b>反代入口池</b>（同样是第三方出口），仍失败则报错。
+          四种模式改变的是<b>候选优先级与回退顺序</b>，不是简单开关：代理与直连不会混进同一竞速池，
+          因此不会出现「直连先成功、出口 IP 与预期不符」。
+        </p>
+        <p class="tip">
+          IPv6 支持边界：入站可解析 IPv6 目标，SOCKS5 与 HTTP CONNECT 上游也可写 IPv6 地址；
+          但 Worker 本身<b>不支持直接连接 IPv6 目标出站</b>，此类目标需经代理落地或 NAT64 转换。
+        </p>
+      </div>
+
+      <div class="switch-box">
+        <div class="sw-info">
+          <label class="sw-title" for="cfgConcurrent">启用 TCP 并发竞速拨号（TCP_CONCURRENT_DIAL）</label>
+          <div class="sw-desc">存在多个候选出站地址时并发发起连接，取最先完成握手的通道以降低首包延迟。</div>
+        </div>
+        <input type="checkbox" id="cfgConcurrent" />
+      </div>
+
+      <div class="switch-box">
+        <div class="sw-info">
+          <label class="sw-title" for="cfgBuiltinRelay">启用内置社区反代兜底池（USE_BUILTIN_RELAY）</label>
+          <div class="sw-desc">当访问同样接入 Cloudflare 的目标网站且未配置私有代理时，自动借道内置反代池按 SNI 转发。</div>
+        </div>
+        <input type="checkbox" id="cfgBuiltinRelay" />
+      </div>
+
+      <div class="switch-box">
+        <div class="sw-info">
+          <label class="sw-title" for="cfgResolvePreferred">出站前执行 DoH 预解析与网段识别（RESOLVE_PREFERRED）</label>
+          <div class="sw-desc">开启后出站前通过 DoH 识别目标 IP 是否属于 Cloudflare 网段并自动调整拨号优先级（关闭可节省子请求配额并降低常规站点延迟）。</div>
+        </div>
+        <input type="checkbox" id="cfgResolvePreferred" />
+      </div>
+
+      <div class="switch-box">
+        <div class="sw-info">
+          <label class="sw-title" for="cfgAggressiveRedial">放宽无响应自动重拨（AGGRESSIVE_REDIAL）</label>
+          <div class="sw-desc">默认关闭：只在「直连出口 + 443/80 端口」且发出请求后一个字节都收不到时，才自动换到内置反代入口重试。开启后即使配了落地代理 / ProxyIP 或访问其它端口也会重拨；同一请求可能在另一条上游被重复执行，并绕过你指定的出口。仅排查「连上但没数据」时临时开启。</div>
+        </div>
+        <input type="checkbox" id="cfgAggressiveRedial" />
+      </div>
+
+      <div class="switch-box">
+        <div class="sw-info">
+          <label class="sw-title" for="cfgEchOn">下发客户端 ECH（Encrypted Client Hello）配置</label>
+          <div class="sw-desc">在订阅中注入 ECH 参数以加密 TLS 握手中的真实 SNI 域名（需 Mihomo / Sing-box 1.13+ / v2rayN 等客户端内核支持）。</div>
+        </div>
+        <input type="checkbox" id="cfgEchOn" />
+      </div>
+
+      <div class="grid" style="margin-top:12px">
+        <div class="field">
+          <label>单连接流量上限（MB，0 = 不限制）</label>
+          <input id="cfgDataBudget" type="number" min="0" max="102400" step="1" placeholder="512" />
+          <p class="tip">
+            <b>默认 512</b>。单条连接累计传输超过这个值就断开，客户端重连后
+            内核 CPU 从头重新计算。
+            正常浏览网页、看视频基本不受影响（播放器按分片请求，单连接的数据量很小）；
+            <b>下载大文件</b>时单条连接超过上限会断开一次，支持断点续传的客户端
+            （浏览器 / IDM / aria2 等）会自动续上，不确定是否支持续传就调大。
+            多连接下载器（如 aria2 8 线程）是<b>每条连接各自计算</b>，不是整次下载合计。
+            填 0 = 不限制，此时慢速客户端的数据会一直堆积，极端情况下触发内存上限（1101）。
+          </p>
+        </div>
+        <div class="field">
+          <label>无响应换入口上限（1-8，默认 2）</label>
+          <input id="cfgRelayRedial" type="number" min="1" max="8" step="1" placeholder="2" />
+          <p class="tip">
+            直连「能连上但一个字节都收不到」时，最多换几次反代入口重试。
+            每次重试都是一次完整拨号（解析 + 建连竞速），会叠加延迟与 CPU。
+            调大能提高极少数难连目标的成功率，但更慢更费资源；调小更省资源。
+            <b>正常访问不受影响</b>，只在直连假活（连上无数据）时才会用到。
+          </p>
+        </div>
+        <div class="field">
+          <label>ECH 公共引导域名（留空默认 cloudflare-ech.com）</label>
+          <input id="cfgEchHost" class="mono" placeholder="cloudflare-ech.com" /><p class="tip">留空使用默认域名。</p>
+        </div>
+        <div class="field"><label>ECH DoH 查询地址（留空使用客户端默认）</label><input id="cfgEchDns" class="mono" placeholder="https://223.5.5.5/dns-query" /><p class="tip">留空使用客户端默认。</p></div>
+      </div>
+
+      <!--
+        隐藏同步复选框
+
+        保留旧版 DOM ID（#cfgTrojanOn / #cfgXhttpOn）以维持 100% 兼容，
+        但不再作为用户可操作控件 —— 真正的开关只有「入站配置」页那一份，
+        这里单向跟随它（见 bind() 里的 change 监听）。
+      -->
+      <div class="hidden">
+        <input type="checkbox" id="cfgTrojanOn" />
+        <input type="checkbox" id="cfgXhttpOn" />
+      </div>
+
+      <div class="row end" style="margin-top:12px"><button class="primary" id="btnSaveAdvanced">保存出站与高级配置</button></div>
+    </div>
+
+    <div class="card">
+      <h2><span class="dot"></span>配置备份与迁移</h2>
+      <p class="hint">导出<b>脱敏配置</b>：不含 UUID、Trojan 口令、入站路径、自定义域名，以及带口令的落地代理。导入前显示差异，确认后写入。</p>
+      <div class="field">
+        <label>配置 JSON</label>
+        <textarea class="mono" id="cfgTransfer" rows="5" placeholder="点「导出当前配置」生成，或把备份粘贴到这里"></textarea>
+      </div>
+      <div class="row">
+        <button class="ghost" id="btnCfgExport">导出当前配置</button>
+        <button class="ghost" id="btnCfgPreview">预览导入差异</button>
+        <button class="primary" id="btnCfgApply">应用导入</button>
+      </div>
+      <p class="hint" id="cfgTransferHint"></p>
+    </div>
+  </section>
+</div>
+
+<!-- ==================== 登录视图 ==================== -->
+<div id="login" class="login-wrap hidden">
+  <div class="card">
+    <div class="login-head">
+      <div class="logo">CP</div>
+      <span class="logo-ver" title="内核版本"></span>
+      <h2 style="justify-content:center;font-size:18px">CFPilot 管理控制台</h2>
+      <p class="muted" style="margin:4px 0 0">请输入管理员密码以解锁面板配置</p>
+    </div>
+    <div class="field">
+      <label for="loginPassword">管理密码</label>
+      <input id="loginPassword" type="password" placeholder="请输入面板密码（PANEL_PASSWORD）" autocomplete="current-password" />
+    </div>
+    <button class="primary" id="btnLogin" style="width:100%;padding:10px">登录控制台</button>
+    <p class="muted" id="loginHint" style="margin:10px 0 0;text-align:center"></p>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<style id="theme-light">
+  /* ===== 亮色主题：body.light 下覆盖变量与硬编码颜色 ===== */
+  body.light {
+    --bg-base: #f2f5fa;
+    --bg-elevated: #ffffff;
+    --bg-card: rgba(255, 255, 255, 0.92);
+    --bg-input: #eef2f7;
+    --bg-hover: rgba(0, 0, 0, 0.04);
+    --border: rgba(15, 23, 42, 0.12);
+    --border-focus: #2563eb;
+    --text-main: #0f172a;
+    --text-secondary: #475569;
+    --text-muted: #94a3b8;
+    --primary: #2563eb;
+    --primary-hover: #1d4ed8;
+    --primary-glow: rgba(37, 99, 235, 0.14);
+    --accent: #4f46e5;
+    --ok: #059669; --ok-bg: rgba(5, 150, 105, 0.12);
+    --warn: #d97706; --warn-bg: rgba(217, 119, 6, 0.14);
+    --err: #dc2626; --err-bg: rgba(220, 38, 38, 0.12);
+    --shadow: 0 10px 30px -12px rgba(15, 23, 42, 0.18);
+    background-color: var(--bg-base);
+    background-image:
+      radial-gradient(ellipse 80% 50% at 50% -15%, rgba(37, 99, 235, 0.10), transparent),
+      radial-gradient(ellipse 50% 40% at 85% 10%, rgba(79, 70, 229, 0.07), transparent);
+  }
+  body.light nav.tabs { background: #ffffff; }
+  body.light button:not(.primary):not(.danger) { background: #e5eaf2; color: var(--text-main); }
+  body.light button:not(.primary):not(.danger):hover:not(:disabled) { background: #d5dde8; }
+  body.light button.ghost { background: #ffffff; border-color: var(--border); }
+  body.light button.ghost:hover:not(:disabled) { background: #eef2f7; border-color: rgba(15, 23, 42, 0.22); }
+  body.light button.primary { color: #fff; }
+  body.light label { color: #334155; }
+  body.light input[readonly] { background: #eef2f7; color: #334155; }
+  body.light th { background: #f6f8fc; color: var(--text-secondary); }
+  body.light tbody tr:hover { background: rgba(15, 23, 42, 0.035); }
+  body.light pre.cmd { background: #f6f8fc; color: #1d4ed8; }
+  body.light code, body.light code.inline { color: #1d4ed8; background: var(--bg-input); }
+  body.light .fold { background: rgba(255, 255, 255, 0.75); }
+  body.light .fold > summary { color: #334155; }
+  body.light .fold > summary:hover { background: var(--bg-hover); color: var(--text-main); }
+  body.light .stat .item,
+  body.light .step-card,
+  body.light .source,
+  body.light .switch-box { background: rgba(15, 23, 42, 0.02); }
+  body.light .source.on { background: rgba(37, 99, 235, 0.06); border-color: rgba(37, 99, 235, 0.45); }
+  body.light .pill { background: rgba(15, 23, 42, 0.04); }
+  body.light .tip { background: rgba(37, 99, 235, 0.06); }
+  body.light .toast { background: #ffffff; border-color: rgba(15, 23, 42, 0.12); color: var(--text-main); }
+  body.light .tag { border-color: var(--border); }
+</style>
+<script>
+/* ===== 主题切换：右上角色盘按钮，选择持久化到 localStorage ===== */
+(function () {
+  var KEY = 'cfpilot.theme';
+  function apply(light) { document.body.classList.toggle('light', light); }
+  try { apply(localStorage.getItem(KEY) === 'light'); } catch (e) {}
+  var btn = document.getElementById('btnTheme');
+  if (btn) {
+    btn.addEventListener('click', function () {
+      var light = !document.body.classList.contains('light');
+      apply(light);
+      try { localStorage.setItem(KEY, light ? 'light' : 'dark'); } catch (e) {}
+    });
+  }
+})();
+</script>
+<script>
+(function () {
+  'use strict';
+
+  // === [Module 1: Application State & DOM Helpers] ===
+  var state = {
+    config: null,
+    status: null,
+    nodes: []
+  };
+
+  var toastTimer = null;
+  function $(id) { return document.getElementById(id); }
+
+  function toast(msg, isErr) {
+    var t = $('toast');
+    t.textContent = msg;
+    t.className = 'toast show' + (isErr ? ' err' : '');
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { t.className = 'toast'; }, 3000);
+  }
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  // IPv6 直接拼 `:端口` 会显示成 `2606:4700::1:443` —— 分不清地址到哪结束，
+  // 与订阅里 `[…]:443` 的写法也不一致，复制出去会被解析成另一个地址。
+  function hostTxt(ip) {
+    var v = String(ip == null ? '' : ip);
+    return v.indexOf(':') >= 0 ? '[' + v + ']' : v;
+  }
+
+  // === [Module 2: HTTP API Client] ===
+  function api(path, options) {
+    options = options || {};
+    options.credentials = 'same-origin';
+    options.headers = Object.assign({ 'Content-Type': 'application/json' }, options.headers || {});
+    return fetch(path, options).then(function (r) {
+      var isLogin = /\/api\/v1\/login$/.test(path);
+      // ⚠️ quiet401：等待会话生效时不弹登录页（见 waitSession 的说明）。
+      if (r.status === 401 && !isLogin && !options.quiet401) {
+        showLogin();
+        throw new Error('会话已过期，请重新登录');
+      }
+      return r.json().then(function (data) {
+        if (!r.ok || data.ok === false) {
+          throw new Error(data.error || ('请求失败 (HTTP ' + r.status + ')'));
+        }
+        return data;
+      }).catch(function (e) {
+        if (e instanceof SyntaxError) throw new Error('服务端返回了非 JSON 响应 (' + r.status + ')');
+        throw e;
+      });
+    });
+  }
+
+  // === [Module 3: Authentication & Bootstrap] ===
+  function showLogin() {
+    $('app').classList.add('hidden');
+    $('login').classList.remove('hidden');
+    $('loginPassword').focus();
+  }
+
+  function showApp() {
+    $('login').classList.add('hidden');
+    $('app').classList.remove('hidden');
+  }
+
+  function doLogin() {
+    var pwd = $('loginPassword').value;
+    var hint = $('loginHint');
+    if (!pwd) { toast('请输入管理密码', true); return; }
+    if (hint) { hint.textContent = '正在验证身份…'; hint.className = 'muted'; }
+    api('/api/v1/login', { method: 'POST', body: JSON.stringify({ password: pwd }) })
+      .then(function () {
+        // ⚠️ 登录成功**不等于**会话立刻可用。
+        //
+        // 会话存在 KV 里，而 KV 的读是最终一致的（边缘缓存约 60 秒）。
+        // 登录请求刚写进去，紧接着的「查会话」可能读不到 ——
+        // 于是 authenticated=false，界面把用户弹回登录页。
+        //
+        // 表现就是「密码输对了，又回到登录页面」。
+        //
+        // 这里等一下会话生效再进主界面：宁可多等几秒，
+        // 也不要让用户以为自己密码错了。
+        if (hint) { hint.textContent = '正在验证身份…'; hint.className = 'muted'; }
+        return waitSession();
+      })
+      .then(function () {
+        if (hint) hint.textContent = '';
+        showApp();
+        boot();
+        toast('欢迎回来，登录成功');
+      })
+      .catch(function (e) {
+        toast(e.message, true);
+        if (hint) { hint.textContent = e.message; hint.className = 'err'; }
+      });
+  }
+
+  /**
+   * 等会话真正生效（KV 传播到位）。
+   *
+   * 登录接口返回成功只说明密码对了；会话能不能被查到还取决于 KV 的传播。
+   * 这里最多等约 12 秒 —— 期间**不弹登录页**（quiet401），
+   * 只在最终仍失败时才当作登录失败。
+   */
+  function waitSession(attempt) {
+    attempt = attempt || 0;
+    return api('/api/v1/session', { quiet401: true })
+      .then(function (s) {
+        if (s.authenticated) return true;
+        throw new Error('会话尚未生效');
+      })
+      .catch(function (e) {
+        if (attempt >= 10) throw e;
+        return new Promise(function (resolve) { setTimeout(resolve, 1200); })
+          .then(function () { return waitSession(attempt + 1); });
+      });
+  }
+
+  function boot() {
+    loadKernelVersion();
+    api('/api/v1/session').then(function (s) {
+      if (!s.authenticated) { showLogin(); return; }
+      showApp();
+      loadAll();
+    }).catch(function () { showLogin(); });
+  }
+
+  // === logo 旁的内核版本号 ===
+  //
+  // 用公开的版本端点（免鉴权）而不是 /api/v1/status ——
+  // 后者要登录，登录页上的 logo 就没版本号了。
+  // 取不到就留空：版本号只是锦上添花，不能因此报错或挡住登录。
+  function loadKernelVersion() {
+    var targets = document.querySelectorAll('.logo-ver');
+    if (!targets.length) return;
+    fetch('/__cfp_version', { credentials: 'same-origin' })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        if (!d) return;
+        var label = d.version && d.version !== 'dev' ? 'v' + d.version : '';
+        var tip = d.build ? ('内核版本 ' + (d.version || '') + ' · 构建 ' + d.build) : '';
+        for (var i = 0; i < targets.length; i++) {
+          targets[i].textContent = label;
+          if (tip) targets[i].title = tip;
+        }
+      })
+      .catch(function () { /* 取不到就留空 */ });
+  }
+
+  function loadStatus() {
+    return api('/api/v1/status').then(function (s) {
+      state.status = s;
+      renderStatus(s);
+      return s;
+    }).catch(function (e) { toast(e.message, true); });
+  }
+
+  function loadAll() {
+    loadStatus();
+
+    api('/api/v1/pool/meta').then(function (m) {
+      $('builtinDomains').value = '内置 ' + m.builtin.domains + ' 个优选域名 / ' + m.builtin.cidrs + ' 个官方 CIDR 网段';
+      $('domainLib').value = (m.customDomains || []).join('\n');
+    }).catch(function () {});
+
+    api('/api/v1/config').then(function (r) {
+      state.config = r.config;
+      fillConfig(r.config);
+      // 先取令牌再拼链接：签名模式下身份段是令牌而不是 UUID
+      refreshSubToken();
+    }).catch(function (e) { toast(e.message, true); });
+
+    loadNodes();
+    loadRouteProfile();
+  }
+
+  function loadRouteProfile() {
+    return api('/api/v1/route-profile').then(function (r) {
+      // 显示**生效中**的规则（自定义优先，否则内置），而不是 KV 的原始值。
+      // 之前只填 raw：没写自定义规则时 raw 是空串，用户看到「什么都没有」，
+      // 但订阅里其实有一整套内置 GEOSITE/GEOIP 规则 —— 读到的东西和生效的不是一回事。
+      $('cfgRouteProfile').value = r.text || '';
+      $('routeProfileState').textContent = r.isCustom ? '（自定义规则生效中）' : '（当前用内置规则，改动后保存即生效）';
+    }).catch(function () {});
+  }
+
+  function saveRouteProfile(raw, okMsg) {
+    return api('/api/v1/route-profile', { method: 'PUT', body: JSON.stringify({ raw: raw }) })
+      .then(function (r) {
+        $('cfgRouteProfile').value = r.text || '';
+        $('routeProfileState').textContent = r.isCustom ? '（自定义规则生效中）' : '（当前用内置规则，改动后保存即生效）';
+        toast(okMsg || '分流规则已保存');
+      })
+      .catch(function (e) { toast(e.message, true); });
+  }
+
+  function previewClashYaml() {
+    var url = $('subClash').value;
+    if (!url || url.indexOf('/sub/') < 0) { toast('订阅链接尚未就绪，请先刷新订阅', true); return; }
+    fetch(url).then(function (r) { return r.text(); }).then(function (t) {
+      $('clashYamlPreview').value = t;
+      toast('YAML 预览已更新');
+    }).catch(function (e) { toast('预览失败：' + e.message, true); });
+  }
+
+  // === [Module 4: View Renderers & Form Binding] ===
+  function renderStatus(s) {
+    // 版本显示成「0.9.4 · 7e75bc4-29e1702c」：
+    // 前半是人读的语义版本（构建期从 package.json 注入），后半精确到源码内容。
+    // 早期这里显示的是服务端写死的 '0.1.0'，用户以为卡片是摆设（2026-10-28 报障）。
+    var ver = '-';
+    if (s.pkgVersion && s.pkgVersion !== 'dev') {
+      ver = s.pkgVersion + (s.version && s.version !== 'dev' ? ' · ' + s.version : '');
+    } else if (s.version && s.version !== 'dev') {
+      ver = s.version;
+    }
+    var items = [
+      ['控制面域名（当前面板）', location.hostname],
+      ['数据面域名（节点 SNI/Host）', s.nodeDomain || s.domain || location.hostname],
+      ['当前接入边缘机房', s.coloLabel || s.colo || 'UNK'],
+      ['本地真连接优选池', (s.localIps || 0) + ' 条'],
+      ['系统内核版本', ver]
+    ];
+    $('statusBox').innerHTML = items.map(function (it) {
+      return '<div class="item"><div class="k">' + esc(it[0]) + '</div><div class="v">' + esc(it[1]) + '</div></div>';
+    }).join('');
+    // 读取时刻：证明这些值是现读的（「边缘机房」随当前网络的就近路由变化，
+    // 长期停在同一页不会自己更新，切回本页才会重新读取）。
+    var meta = $('statusMeta');
+    if (meta) {
+      var t = s.readAt ? new Date(s.readAt) : new Date();
+      meta.textContent = '以上数据读取于 ' + t.toLocaleTimeString()
+        + '（每次切回本页自动刷新；「当前接入边缘机房」跟随你当前网络的就近路由）';
+    }
+  }
+
+  function fillConfig(c) {
+    $('cfgUuid').value = c.uuid || '';
+    $('cfgTrojan').value = c.trojanPassword || '';
+    $('cfgWsPath').value = c.wsPath || '';
+    $('cfgTrojanPath').value = c.trojanPath || '';
+    $('cfgXhttpPath').value = c.xhttpPath || '';
+    $('cfgSubDomain').value = c.subDomain || '';
+    $('cfgSubName').value = c.subName || 'CFPilot';
+
+    var ports = String(c.subPorts || '443').split(/[,\s]+/).filter(Boolean);
+    Array.prototype.forEach.call(document.querySelectorAll('input[name="subPort"]'), function (cb) {
+      cb.checked = ports.indexOf(cb.value) >= 0;
+    });
+
+    var variants = String(c.subVariants || '').split(/[,;\s]+/).filter(Boolean);
+    if (!variants.length) {
+      var legacy = [];
+      if (c.subProtocol === 'vless' || c.subProtocol === 'both') {
+        if (c.subTransport === 'ws' || c.subTransport === 'both') legacy.push('vless-ws');
+        if (c.subTransport === 'xhttp' || c.subTransport === 'both') legacy.push('vless-xhttp');
+      }
+      if (c.subProtocol === 'trojan' || c.subProtocol === 'both') legacy.push('trojan');
+      variants = legacy.length ? legacy : ['vless-ws','vless-xhttp'];
+    }
+    $('cfgVarVlessWs').checked = variants.indexOf('vless-ws') >= 0;
+    $('cfgVarVlessXhttp').checked = variants.indexOf('vless-xhttp') >= 0;
+    $('cfgVarTrojan').checked = variants.indexOf('trojan') >= 0;
+
+    // 两个开关的默认值都按「未显式关闭即为开启」判断：
+    // 早期 XHTTP 用 `=== true`，而部署默认写的是 false，于是新建实例里这个开关永远是关的，
+    // 用户在面板里勾了也不生效（2026-10-28 报障）。现在部署默认 true，面板可随时关。
+    var trojanEnabled = c.enableTrojan !== false;
+    var xhttpEnabled = c.enableXhttp !== false;
+    $('cfgEnableTrojan').checked = trojanEnabled;
+    $('cfgEnableXhttp').checked = xhttpEnabled;
+    $('cfgTrojanOn').checked = trojanEnabled;
+    $('cfgXhttpOn').checked = xhttpEnabled;
+
+    $('cfgAdd').value = c.add || '';
+    $('cfgAddApi').value = c.addApi || '';
+    $('cfgAddCsv').value = c.addCsv || '';
+    $('cfgProxyIp').value = c.proxyIp || '';
+    $('cfgSocks5').value = c.socks5 || '';
+    $('cfgHttpProxy').value = c.httpProxy || '';
+    $('cfgNat64').value = c.nat64 || '';
+    $('cfgRelayPool').value = c.relayPool || '';
+    $('cfgPinnedHosts').value = c.pinnedHosts || '';
+    // 代理调度模式：读不懂的值一律回落 'only'（与后端 normalizeProxyMode 一致）
+    $('cfgProxyMode').value = c.proxyMode || 'only';
+    $('cfgBuiltinRelay').checked = c.useBuiltinRelay !== false;
+    $('cfgFingerprint').value = c.clientFingerprint || 'chrome';
+    $('cfgEchOn').checked = !!c.ech;
+    $('cfgEchHost').value = c.echHost || 'cloudflare-ech.com';
+    $('cfgEchDns').value = c.echDns || '';
+    $('cfgConcurrent').checked = !!c.concurrentDial;
+    $('cfgResolvePreferred').checked = c.resolvePreferred !== false;
+    $('cfgAggressiveRedial').checked = !!c.aggressiveRedial;
+    $('cfgDataBudget').value = c.dataBudgetMB || 0;
+    $('cfgRelayRedial').value = c.relayRedialMax || 2;
+
+    $('poolOfficial').checked = !!c.poolOfficial;
+    $('poolDomain').checked = !!c.poolDomain;
+    $('poolManual').checked = !!c.poolManual;
+    $('officialCount').value = c.officialCount || 20;
+    $('domainCount').value = c.domainCount || 10;
+    syncSourceCards();
+  }
+
+  function syncSourceCards() {
+    [['official', 'poolOfficial'], ['domain', 'poolDomain'], ['manual', 'poolManual']].forEach(function (pair) {
+      var card = $('src-' + pair[0]);
+      if (card) card.classList.toggle('on', $(pair[1]).checked);
+    });
+  }
+
+  function saveConfig(patch, okMsg) {
+    return api('/api/v1/config', { method: 'PUT', body: JSON.stringify({ config: patch }) })
+      .then(function (r) {
+        state.config = r.config;
+        fillConfig(r.config);
+        toast(okMsg || '配置已保存并生效');
+        loadNodes();
+        refreshSubLinks();
+        return r;
+      })
+      .catch(function (e) { toast(e.message, true); throw e; });
+  }
+
+  /**
+   * 在输入框下方显示一条提示。
+   *
+   * 手动指定 IP 的语法判据**只在后端**（`config-validate.ts` 的 `validateIpList`，
+   * 以解析器 `cleanIpLine` 为准），面板不重复实现 ——
+   * 两边判据不一致会出现「前端说没问题、后端却丢掉了」。
+   * 面板只负责把后端返回的「哪一行、为什么」显示出来。
+   */
+  function showIpHint(text, isErr) {
+    var hint = $('cfgAddHint');
+    if (!hint) return;
+    hint.style.display = text ? '' : 'none';
+    hint.textContent = text || '';
+    hint.style.color = isErr ? 'var(--danger)' : 'var(--text-dim)';
+  }
+
+  function loadNodes() {
+    api('/api/v1/nodes').then(function (r) {
+      state.nodes = r.nodes || [];
+      renderNodes(r);
+      renderSummary(r);
+    }).catch(function (e) { toast(e.message, true); });
+  }
+
+  function renderNodes(r) {
+    var list = (r.nodes || []).slice(0, 100);
+    var rows = list.map(function (n, i) {
+      return '<tr><td>' + (i + 1) + '</td><td><span class="tag ' + esc(n.source) + '">' + esc(n.source) + '</span></td>' +
+        '<td class="mono">' + hostTxt(n.ip) + ':' + n.port + '</td><td>' + esc(n.coloLabel || n.colo || '-') + '</td>' +
+        '<td>' + (n.latency ? n.latency + ' ms' : '-') + '</td><td>' + (n.speed ? n.speed + ' MB/s' : '-') + '</td></tr>';
+    }).join('');
+    $('nodeTable').querySelector('tbody').innerHTML = rows || '<tr><td colspan="6" class="muted">当前暂无可用节点</td></tr>';
+
+    $('previewSummary').textContent = '（共生成 ' + (r.count || 0) + ' 个节点）';
+
+    var warn = $('previewWarn');
+    var errors = (r.stats && r.stats.errors) || [];
+    if (errors.length) {
+      warn.className = 'warn';
+      warn.innerHTML = errors.map(function (e) { return '• ' + esc(e); }).join('<br>');
+      warn.classList.remove('hidden');
+    } else {
+      warn.classList.add('hidden');
+    }
+  }
+
+  function renderSummary(r) {
+    var groups = r.groups || [];
+    var html = groups.map(function (g) {
+      return '<span class="pill"><b>' + esc(g.name) + '</b> · ' + g.count + ' 条</span>';
+    }).join('');
+    if (!html) html = '<span class="muted">暂无节点分布数据</span>';
+    html += '<span class="pill">合并去重 -' + ((r.stats && r.stats.deduped) || 0) + '</span>';
+    if (r.stats && r.stats.limited) {
+      html += '<span class="pill">节点上限截断 -' + r.stats.limited + '</span>';
+    }
+    if (r.stats && r.stats.errors && r.stats.errors.length) {
+      html += '<span class="pill">提示 ' + r.stats.errors.length + ' 条</span>';
+    }
+    if (r.stats && r.stats.countries && r.stats.countries.length) {
+      html += '<span class="pill">地区过滤 ' + esc(r.stats.countries.join('/')) + '</span>';
+    }
+    $('overviewSummary').innerHTML = html;
+    var local = state.status ? state.status.localIps : 0;
+    $('localState').textContent = '本地真连接池：' + local + ' 条';
+  }
+
+  // === [Module 4a: 配置备份与迁移] ===
+  //
+  // 导出用白名单（后端负责），面板只负责展示与确认。
+  // 「未包含」的字段必须明确告诉用户 —— 否则他迁移后才发现连不上。
+  function parseTransferJson() {
+    var text = $('cfgTransfer').value.trim();
+    if (!text) { toast('请先导出，或把配置 JSON 粘贴到这里', true); return null; }
+    try {
+      var data = JSON.parse(text);
+      var cfg = (data && data.config) ? data.config : data;
+      if (!cfg || typeof cfg !== 'object') throw new Error('不是配置对象');
+      return cfg;
+    } catch (e) {
+      toast('配置 JSON 解析失败：' + (e && e.message ? e.message : String(e)), true);
+      return null;
+    }
+  }
+
+  function showTransferDiff(diff) {
+    if (!diff || diff.length === 0) {
+      $('cfgTransferHint').textContent = '没有差异，无需导入。';
+      return;
+    }
+    var html = diff.map(function (d) {
+      return '<div>' + esc(d.field) + '：' + esc(d.from) + ' → <b>' + esc(d.to) + '</b></div>';
+    }).join('');
+    $('cfgTransferHint').innerHTML = '将改动 ' + diff.length + ' 项：' + html;
+  }
+
+  // === [Module 4b: 订阅签名令牌] ===
+  // 三种链接（base64 / clash / singbox）的「身份段」随模式变化：
+  //   经典模式 → UUID；签名模式 → v1.<exp>.<nonce>.<sig>
+  // 所以刷新链接前必须先知道当前令牌，否则签名模式下会拼出必然 403 的旧链接。
+  var subTokenState = { token: '', mode: 'legacy', expiresAt: 0 };
+
+  function fmtExpire(ms) {
+    if (!ms) return '永久有效';
+    var d = new Date(ms);
+    var p = function (n) { return (n < 10 ? '0' : '') + n; };
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' 到期';
+  }
+
+  function renderSubTokenState() {
+    var signed = subTokenState.mode === 'signed';
+    $('subTokenState').textContent = signed
+      ? '（签名模式 · ' + fmtExpire(subTokenState.expiresAt) + '）'
+      : '（当前为经典模式，下方签名链接仅供切换前验证）';
+    var btn = $('btnToggleSubMode');
+    btn.textContent = signed ? '回退到经典链接' : '② 切换到签名模式';
+    btn.className = signed ? 'ghost' : 'primary';
+  }
+
+  function refreshSubToken() {
+    return api('/api/v1/sub-token').then(function (r) {
+      subTokenState = { token: r.token || '', mode: r.mode || 'legacy', expiresAt: r.expiresAt || 0 };
+      $('subSigned').value = r.link || '';
+      renderSubTokenState();
+      refreshSubLinks();
+    }).catch(function (e) { toast(e.message, true); });
+  }
+
+  function refreshSubLinks() {
+    var cfg = state.config || {};
+    var signedMode = cfg.subToken === 'signed';
+    var token = subTokenState.token || '';
+    var uuid = ($('cfgUuid').value || cfg.uuid || '').trim();
+
+    if (signedMode && !token) {
+      var pending = '（正在签发签名链接，请稍候…）';
+      $('subAdaptive').value = pending;
+      $('subBase64').value = pending;
+      $('subClash').value = pending;
+      $('subSingbox').value = pending;
+      return;
+    }
+    var ident = signedMode ? token : uuid;
+    if (!ident) {
+      var hint = '（正在等待系统初始化 UUID，请稍候或刷新页面）';
+      $('subAdaptive').value = hint;
+      $('subBase64').value = hint;
+      $('subClash').value = hint;
+      $('subSingbox').value = hint;
+      return;
+    }
+    var base = location.origin + '/sub/' + encodeURIComponent(ident);
+    // 自适应地址：不带 target 参数，由服务端按 User-Agent 判定格式
+    // （见 worker-core 的 resolveFormatByUserAgent：Clash→YAML、Sing-box→JSON、其余→Base64）
+    $('subAdaptive').value = base;
+    $('subBase64').value = base + '?target=base64';
+    $('subClash').value = base + '?target=clash';
+    $('subSingbox').value = base + '?target=singbox';
+  }
+
+  // === [Module 5: Event Listeners & User Actions] ===
+  function switchTab(tab) {
+    Array.prototype.forEach.call($('tabs').children, function (b) {
+      b.classList.toggle('active', b.getAttribute('data-tab') === tab);
+    });
+    Array.prototype.forEach.call(document.querySelectorAll('.tab-page'), function (p) {
+      p.classList.toggle('hidden', p.id !== 'tab-' + tab);
+    });
+    // 概览页的「边缘机房 / 优选池 / 内核版本」是**实时**数据：
+    // 每次切回概览都重新读一次，否则停在同一页时会一直看着加载时那一刻的值
+    // （用户曾因此以为这几张卡是硬编码的）。
+    if (tab === 'overview') loadStatus();
+    if (tab === 'sub' || tab === 'pool') loadNodes();
+  }
+
+  /**
+   * 「出站与高级」页的统一保存。
+   *
+   * 该页包含两张卡片（出站路由 / 远程订阅源），历史上各有一个保存按钮，
+   * 用户改完上半部分顺手点底部的按钮就会漏存上半部分。
+   * 现在两个按钮都调用本函数 —— 一次性提交本页**全部**字段。
+   */
+  function saveAllAdvancedAndRemote(msg) {
+    return saveConfig({
+      proxyIp: $('cfgProxyIp').value,
+      socks5: $('cfgSocks5').value.trim(),
+      httpProxy: $('cfgHttpProxy').value.trim(),
+      nat64: $('cfgNat64').value.trim(),
+      relayPool: $('cfgRelayPool').value.trim(),
+      pinnedHosts: $('cfgPinnedHosts').value.trim(),
+      proxyMode: $('cfgProxyMode').value,
+      useBuiltinRelay: $('cfgBuiltinRelay').checked,
+      clientFingerprint: $('cfgFingerprint').value.trim() || 'chrome',
+      resolvePreferred: $('cfgResolvePreferred').checked,
+      aggressiveRedial: $('cfgAggressiveRedial').checked,
+      ech: $('cfgEchOn').checked,
+      echHost: $('cfgEchHost').value.trim() || 'cloudflare-ech.com',
+      echDns: $('cfgEchDns').value.trim(),
+      concurrentDial: $('cfgConcurrent').checked,
+      dataBudgetMB: Math.max(0, Number($('cfgDataBudget').value) || 0),
+      // 1-8 与 config-validate 同口径：面板先夹紧，后端再校验一次。
+      relayRedialMax: Math.min(8, Math.max(1, Number($('cfgRelayRedial').value) || 2)),
+      enableTrojan: $('cfgEnableTrojan').checked,
+      enableXhttp: $('cfgEnableXhttp').checked,
+      addApi: $('cfgAddApi').value,
+      addCsv: $('cfgAddCsv').value
+      // ⚠️ 订阅准入参数（dls / maxLatency / maxNodes）**不再从这里提交**：
+      // 它们的输入框随「订阅生成参数」卡片一起移除了，而本函数是
+      // 「出站与高级」页与「远程订阅源」页共用的保存入口。
+      // 不提交 ⇒ `mergeConfig` 不覆盖 ⇒ 用户原先设过的值原样保留
+      // （这三个字段仍可通过配置导入 / API 修改）。
+    }, msg || '出站与远程池配置已保存');
+  }
+
+  function bind() {
+    $('btnLogin').addEventListener('click', doLogin);
+    $('loginPassword').addEventListener('keydown', function (e) { if (e.key === 'Enter') doLogin(); });
+
+    $('tabs').addEventListener('click', function (e) {
+      var btn = e.target.closest('button[data-tab]');
+      if (btn) switchTab(btn.getAttribute('data-tab'));
+    });
+
+    Array.prototype.forEach.call(document.querySelectorAll('[data-goto]'), function (btn) {
+      btn.addEventListener('click', function () { switchTab(btn.getAttribute('data-goto')); });
+    });
+
+    $('btnRefresh').addEventListener('click', function () { loadAll(); toast('状态已刷新'); });
+// 固定入口建议值（**默认不生效**）：与 packages/worker-core/src/config.ts 的
+// SUGGESTED_PINNED_HOSTS 保持一致 —— 改一处必须同步另一处。
+// 只放 CF 承载的域名：pbs.twimg.com 在 Fastly，r: 转发给 CF 不可能生效。
+;(function bindPinnedSuggest() {
+  const btn = $('btnPinnedSuggest');
+  const SUGGESTED_PINNED_HOSTS =
+    '*.x.com=r:155.248.181.189\n*.twitter.com=r:155.248.181.189';
+  if (!btn) return;
+  btn.addEventListener('click', function () {
+    const el = $('cfgPinnedHosts');
+    if (!el) return;
+    el.value = el.value.trim()
+      ? el.value.trim() + '\n' + SUGGESTED_PINNED_HOSTS
+      : SUGGESTED_PINNED_HOSTS;
+  });
+})();
+    $('btnLogout').addEventListener('click', function () {
+      api('/api/v1/logout', { method: 'POST' }).finally(function () { showLogin(); });
+    });
+
+    // ---- 顶部横幅：内核通道检查 ----
+    //
+    // 进面板 2 秒后静默查一次；按钮文字随结论变化，有更新时点击展开
+    // 两种更新方法的说明（部署维护工具 / 手动替换内核文件）。
+    var kernelCheckBusy = false;
+    function runKernelCheck(expand) {
+      if (kernelCheckBusy) return;
+      kernelCheckBusy = true;
+      var btn = $('btnKernelCheck'), hint = $('kernelHint');
+      btn.textContent = '检查中…';
+      api('/api/v1/kernel-check', { method: 'GET' }).then(function (r) {
+        kernelCheckBusy = false;
+        if (!r.ok) {
+          btn.textContent = '内核检查';
+          btn.title = '检查失败：' + (r.error || '网络问题');
+          if (expand) { hint.hidden = false; hint.textContent = '内核检查失败：' + (r.error || '网络问题，稍后再试'); }
+          return;
+        }
+        if (r.hasUpdate) {
+          btn.textContent = '⬆ 有新内核';
+          btn.classList.add('warn-btn');
+          btn.title = '官方内核通道有新内核 ' + r.latestBuild;
+          if (expand) {
+            hint.hidden = false;
+            hint.innerHTML = '检测到官方内核通道有新内核 <b>' + (r.latestBuild || 'k' + r.latestSeq) +
+              '</b>（当前部署 ' + (r.currentBuild || '未知') + '）。两种更新方式：<br>' +
+              '1. <b>下载部署维护工具</b>：用最新桌面版一键更新内核 —— ' +
+              '<a href="' + r.toolRelease + '" target="_blank" rel="noopener">' + r.toolRelease + '</a><br>' +
+              '2. <b>手动更新内核文件</b>：下载下面两个文件，在 Cloudflare Pages 控制台替换部署 ——<br>' +
+              '&nbsp;&nbsp;&nbsp;控制面 <a href="' + r.assetBase + '/cfpilot-kernel-control.js" target="_blank" rel="noopener">cfpilot-kernel-control.js</a>' +
+              ' · 数据面 <a href="' + r.assetBase + '/cfpilot-kernel-dataplane.js" target="_blank" rel="noopener">cfpilot-kernel-dataplane.js</a>';
+          }
+        } else {
+          btn.textContent = '内核已最新';
+          btn.title = '当前部署的内核与官方通道一致（' + (r.currentBuild || '') + '）';
+          if (expand) { hint.hidden = false; hint.textContent = '✓ 当前部署的内核与官方通道一致，无需更新。'; }
+        }
+      }).catch(function (e) {
+        kernelCheckBusy = false;
+        btn.textContent = '内核检查';
+        if (expand) { hint.hidden = false; hint.textContent = '内核检查失败：' + (e && e.message ? e.message : e); }
+      });
+    }
+    $('btnKernelCheck').addEventListener('click', function () {
+      var hint = $('kernelHint');
+      if (hint.hidden === false && $('btnKernelCheck').textContent.indexOf('⬆') === -1) { hint.hidden = true; return; }
+      runKernelCheck(true);
+    });
+    // 进面板 2 秒后静默查一次（不打扰，按钮文字静默变化）
+    setTimeout(function () { runKernelCheck(false); }, 2000);
+
+
+    ['poolOfficial', 'poolDomain', 'poolManual'].forEach(function (id) {
+      $(id).addEventListener('change', syncSourceCards);
+    });
+
+    // 入站协议开关：收敛到「入站配置」页的唯一入口
+    //
+    // #cfgTrojanOn / #cfgXhttpOn 是旧版「高级」页里的同义开关，
+    // 与本页的 #cfgEnableTrojan / #cfgEnableXhttp 状态不同步会互相覆盖。
+    // 现在它们退化为隐藏的同步影子：**单向**跟随本页开关，
+    // 保存时也只读本页开关（见 saveAllAdvancedAndRemote）。
+    $('cfgEnableTrojan').addEventListener('change', function () { $('cfgTrojanOn').checked = this.checked; });
+    $('cfgEnableXhttp').addEventListener('change', function () { $('cfgXhttpOn').checked = this.checked; });
+
+    // 随机生成 UUID 按钮
+    $('btnGenUuid').addEventListener('click', function () {
+      var u = (window.crypto && window.crypto.randomUUID) ? window.crypto.randomUUID() : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+        var r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+      });
+      $('cfgUuid').value = u;
+      toast('已生成新的随机 UUID，请点击「保存入站配置」生效');
+    });
+
+    // 订阅端口：全选 / 清空
+    function setSubPortsChecked(checked) {
+      Array.prototype.forEach.call(document.querySelectorAll('input[name="subPort"]'), function (cb) {
+        cb.checked = checked;
+      });
+    }
+    $('btnAllSubPorts').addEventListener('click', function () { setSubPortsChecked(true); });
+    $('btnClearSubPorts').addEventListener('click', function () { setSubPortsChecked(false); });
+
+    // 订阅协议形态：全选 / 清空
+    var SUB_VARIANT_IDS = ['cfgVarVlessWs', 'cfgVarVlessXhttp', 'cfgVarTrojan'];
+    function setSubVariantsChecked(checked) {
+      SUB_VARIANT_IDS.forEach(function (id) {
+        var el = $(id);
+        if (el) el.checked = checked;
+      });
+    }
+    $('btnAllSubVariants').addEventListener('click', function () { setSubVariantsChecked(true); });
+    $('btnClearSubVariants').addEventListener('click', function () { setSubVariantsChecked(false); });
+
+    $('btnSavePool').addEventListener('click', function () {
+      var domains = $('domainLib').value.split(/\r?\n/).map(function (s) { return s.trim(); }).filter(Boolean);
+      api('/api/v1/pool/library', { method: 'PUT', body: JSON.stringify({ domains: domains }) })
+        .catch(function (e) { toast('域名库保存失败：' + e.message, true); })
+        .then(function () {
+          return saveConfig({
+            poolOfficial: $('poolOfficial').checked,
+            poolDomain: $('poolDomain').checked,
+            poolManual: $('poolManual').checked,
+            officialCount: Number($('officialCount').value || 20),
+            domainCount: Number($('domainCount').value || 10),
+            poolCountries: '',
+            add: $('cfgAdd').value
+          }, '节点来源配置已保存');
+          showIpHint('');
+        })
+        .catch(function (e) {
+          // 后端是唯一判据（前端不重复实现解析规则，避免两边判据不一致）。
+          // 错误信息里已经带了行号与原因 —— 显示在输入框下面，别只弹一下就没了。
+          showIpHint(e.message, true);
+        });
+    });
+
+    $('btnPreview').addEventListener('click', function () { loadNodes(); toast('节点预览已更新'); });
+
+    $('btnSaveInbound').addEventListener('click', function () {
+      var subPorts = Array.prototype.map.call(
+        document.querySelectorAll('input[name="subPort"]:checked'),
+        function (cb) { return cb.value; }
+      ).join(',');
+      saveConfig({
+        uuid: $('cfgUuid').value.trim(),
+        trojanPassword: $('cfgTrojan').value.trim(),
+        wsPath: $('cfgWsPath').value.trim(),
+        trojanPath: $('cfgTrojanPath').value.trim(),
+        xhttpPath: $('cfgXhttpPath').value.trim(),
+        subDomain: $('cfgSubDomain').value.trim(),
+        subName: $('cfgSubName').value.trim() || 'CFPilot',
+        subPorts: subPorts || '443',
+        subVariants: [
+          $('cfgVarVlessWs').checked ? 'vless-ws' : '',
+          $('cfgVarVlessXhttp').checked ? 'vless-xhttp' : '',
+          $('cfgVarTrojan').checked ? 'trojan' : ''
+        ].filter(Boolean).join(','),
+        enableTrojan: $('cfgEnableTrojan').checked,
+        enableXhttp: $('cfgEnableXhttp').checked
+      }, '入站配置已保存');
+    });
+
+    // 高级页两个保存按钮均统一提交当前页全部字段，防止用户改了上半部分点下半部分按钮漏存
+    $('btnSaveAdvanced').addEventListener('click', function () { saveAllAdvancedAndRemote('出站与高级配置已保存'); });
+    $('btnSaveRemote').addEventListener('click', function () { saveAllAdvancedAndRemote('远程订阅源配置已保存'); });
+    $('btnReloadRouteProfile').addEventListener('click', function () { loadRouteProfile(); toast('已重新读取分流规则'); });
+    $('btnSaveRouteProfile').addEventListener('click', function () { saveRouteProfile($('cfgRouteProfile').value); });
+    $('btnClearRouteProfile').addEventListener('click', function () { if (confirm('清空自定义规则、回落内置规则？')) saveRouteProfile('', '已清空，回落内置规则'); });
+    $('btnPreviewClashYaml').addEventListener('click', previewClashYaml);
+    $('btnGotoRelay').addEventListener('click', function () {
+      switchTab('advanced');
+      var el = $('cfgRelayPool');
+      if (el) { el.focus(); el.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
+    });
+
+    $('btnClearIps').addEventListener('click', function () {
+      if (!confirm('确定要清空本地真连接优选池中的所有 IP 吗？')) return;
+      api('/api/v1/ips', { method: 'DELETE' }).then(function () { loadAll(); toast('本地优选池已清空'); })
+        .catch(function (e) { toast(e.message, true); });
+    });
+
+    // ---- 配置备份与迁移 ----
+    $('btnCfgExport').addEventListener('click', function () {
+      api('/api/v1/config/export').then(function (r) {
+        $('cfgTransfer').value = JSON.stringify(
+          { schemaVersion: r.schemaVersion, exportedAt: r.exportedAt, config: r.config },
+          null,
+          2
+        );
+        var omitted = r.omitted || [];
+        $('cfgTransferHint').innerHTML = omitted.length
+          ? '已导出。以下内容<b>未包含</b>，迁移后需手工填写：' +
+            omitted.map(function (o) { return esc(o.field) + '（' + esc(o.reason) + '）'; }).join('、')
+          : '已导出（不含任何敏感字段）。';
+        toast('配置已导出到文本框');
+      }).catch(function (e) { toast(e.message, true); });
+    });
+
+    $('btnCfgPreview').addEventListener('click', function () {
+      var cfg = parseTransferJson();
+      if (!cfg) return;
+      api('/api/v1/config/import', { method: 'POST', body: JSON.stringify({ config: cfg, dryRun: true }) })
+        .then(function (r) { showTransferDiff(r.diff); })
+        .catch(function (e) { toast(e.message, true); });
+    });
+
+    $('btnCfgApply').addEventListener('click', function () {
+      var cfg = parseTransferJson();
+      if (!cfg) return;
+      if (!confirm('导入会覆盖下列配置项（凭据与入站路径不会被覆盖）。确定继续？')) return;
+      api('/api/v1/config/import', { method: 'POST', body: JSON.stringify({ config: cfg }) })
+        .then(function (r) {
+          if (r.config) {
+            state.config = r.config;
+            fillConfig(r.config);
+          }
+          showTransferDiff(r.diff);
+          toast('已导入 ' + (r.applied || 0) + ' 项配置');
+        })
+        .catch(function (e) { toast(e.message, true); });
+    });
+
+    // ---- 订阅链接安全（签名令牌）----
+    $('btnSignSub').addEventListener('click', function () {
+      refreshSubToken().then(function () {
+        toast('已签发新链接：先导入验证，确认能正常更新后再切换模式');
+      });
+    });
+
+    $('btnRotateSub').addEventListener('click', function () {
+      if (!confirm(
+        '轮换密钥会让【所有已签发】的订阅链接立即失效，且无法恢复。\n\n' +
+        '已经导入的客户端只是「更新订阅」失败，节点本身仍然可用；\n' +
+        '但你需要为每一台设备重新导入新链接。\n\n确定继续？'
+      )) return;
+      if (!confirm('最后确认：现在轮换密钥？（旧链接将立刻作废）')) return;
+      api('/api/v1/sub-token', { method: 'POST' }).then(function (r) {
+        subTokenState = { token: r.token || '', mode: r.mode || 'legacy', expiresAt: r.expiresAt || 0 };
+        $('subSigned').value = r.link || '';
+        renderSubTokenState();
+        refreshSubLinks();
+        toast('密钥已轮换，旧链接已全部失效');
+      }).catch(function (e) { toast(e.message, true); });
+    });
+
+    $('btnToggleSubMode').addEventListener('click', function () {
+      var signed = subTokenState.mode === 'signed';
+      if (!signed) {
+        if (!subTokenState.token) {
+          toast('请先点「① 签发新链接」，把新链接导入设备验证通过后再切换', true);
+          return;
+        }
+        if (!confirm(
+          '即将切换到「签名模式」。\n\n切换后：\n' +
+          '· 经典链接（/sub/<UUID>）立即返回 403\n' +
+          '· 每台设备都必须改用上面那条签名链接重新导入\n\n' +
+          '请确认你已经把签名链接导入并验证过。\n\n确定切换？'
+        )) return;
+        saveConfig({ subToken: 'signed' }, '已切换到签名模式').then(function () { refreshSubToken(); });
+      } else {
+        if (!confirm(
+          '即将回退到「经典模式」。\n\n回退后：\n' +
+          '· 经典链接（/sub/<UUID>）恢复可用\n' +
+          '· 签名链接仍然可用，但「泄露后一键作废」的能力随之失效\n\n确定回退？'
+        )) return;
+        saveConfig({ subToken: 'legacy' }, '已回退到经典模式').then(function () { refreshSubToken(); });
+      }
+    });
+
+    function loadLocalIps() {
+      api('/api/v1/ips').then(function (r) {
+        var text = (r && r.raw) || '';
+        var count = (r && r.count) || 0;
+        $('localIpsText').value = text;
+        $('localCount').textContent = count > 0 ? '（当前共 ' + count + ' 条）' : '（当前为空）';
+      }).catch(function (e) { toast(e.message, true); });
+    }
+
+    $('btnToggleLocal').addEventListener('click', function () {
+      var box = $('localBox');
+      var hidden = box.classList.toggle('hidden');
+      $('btnToggleLocal').textContent = hidden ? '查看 / 编辑明细' : '收起明细';
+      if (!hidden) loadLocalIps();
+    });
+
+    $('btnReloadLocal').addEventListener('click', function () {
+      loadLocalIps();
+      toast('已从 KV 重新读取');
+    });
+
+    $('btnSaveLocal').addEventListener('click', function () {
+      api('/api/v1/ips', {
+        method: 'PUT',
+        body: JSON.stringify({ raw: $('localIpsText').value })
+      }).then(function (r) {
+        toast('已成功保存 ' + ((r && r.count) || 0) + ' 条本地优选 IP');
+        loadAll();
+        loadLocalIps();
+      }).catch(function (e) { toast(e.message, true); });
+    });
+
+    $('btnRefreshSub').addEventListener('click', function () { refreshSubToken(); loadNodes(); toast('订阅链接与节点已刷新'); });
+
+    Array.prototype.forEach.call(document.querySelectorAll('[data-copy]'), function (btn) {
+      btn.addEventListener('click', function () { copy($(btn.getAttribute('data-copy')).value); });
+    });
+  }
+
+  function copy(text) {
+    if (!text) { toast('没有可复制的内容', true); return; }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { toast('✓ 已复制到剪贴板'); })
+        .catch(function () { fallbackCopy(text); });
+    } else {
+      fallbackCopy(text);
+    }
+  }
+
+  function fallbackCopy(text) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); toast('✓ 已复制到剪贴板'); }
+    catch (e) { toast('复制失败，请手动全选复制', true); }
+    document.body.removeChild(ta);
+  }
+
+  bind();
+  boot();
+})();
+</script>
+</body>
+</html>
+

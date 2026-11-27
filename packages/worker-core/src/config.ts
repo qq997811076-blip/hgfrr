@@ -1,0 +1,644 @@
+/**
+ * 配置加载：KV CONFIG > 环境变量 > 内置默认值
+ */
+import type { Env, UserConfig, ProxyMode
+} from './types'
+import { randomUuid } from './util'
+import { parsePinnedHosts } from './outbound/pinned'
+import type { Store } from './store'
+import { KvStore } from './store'
+
+export const CONFIG_KEY = 'CONFIG'
+export const LOCAL_IPS_KEY = 'LOCAL_PREFERRED_IPS'
+export const SCANNER_TOKEN_KEY = 'SCANNER_TOKEN'
+/** KV 中热更新的优选域名库（每行一个域名；为空则用内置库） */
+export const POOL_DOMAIN_KEY = 'POOL_DOMAIN_LIBRARY'
+/**
+ * KV 中的分流规则配置（route-profile ini 原文）。
+ *
+ * 为空时用内置配置（构建期内联的 assets/route-profiles.ini）。
+ * 用户想换一套分组时，在面板「订阅」页或直接写 KV 覆盖。
+ */
+export const ROUTE_PROFILE_KEY = 'ROUTE_PROFILE'
+export const ONE_TIME_TOKEN_PREFIX = 'ONETIME:'
+export const SESSION_PREFIX = 'SESSION:'
+export const PANEL_PATH_KEY = 'PANEL_PATH'
+export const ADMIN_PW_HASH_KEY = 'ADMIN_PW_HASH'
+export const ADMIN_PW_PLAIN_KEY = 'ADMIN_PW_PLAIN'
+export const PANEL_PATH_DEFAULT = '/cfpilot'
+
+export const DEFAULT_CONFIG: UserConfig = {
+  uuid: '',
+  trojanPassword: '',
+  wsPath: '/vless',
+  trojanPath: '/trojan',
+  xhttpPath: '/xhttp',
+  add: '',
+  addApi: '',
+  addCsv: '',
+  poolOfficial: true,
+  officialCount: 20,
+  poolDomain: true,
+  domainCount: 10,
+  poolManual: true,
+  poolCountries: '',
+  dls: 0,
+  maxLatency: 0,
+  maxNodes: 0,
+  proxyIp: '',
+  socks5: '',
+  httpProxy: '',
+  proxyMode: 'only' as ProxyMode,
+  nat64: '',
+  concurrentDial: true,
+  // 单连接流量熔断（512MB）：数据面不受 CpuBudget 约束，WS/XHTTP 长连接
+  // 在同一 invocation 里持续累积 CPU，Free 版 10ms 上限撞穿就是 1102。
+  // 512MB 对单连接是很大的量（正常浏览/视频不会触及），超限主动断流让
+  // 客户端重连，CPU 随新 invocation 归零。显式设 0 可恢复旧的不限制行为。
+  dataBudgetMB: 512,
+  // 出站拨号时序（P1 #11）：此前散落在 4 个调用点的硬编码常量，
+  // 统一到这里，经 configFromEnv / mergeConfig 走 KV > env > default 三层。
+  dialConnectMs: 5000,
+  dialBudgetMs: 15_000,
+  dohBudgetMs: 1200,
+  dialStallMs: 2500,
+  // 假活换入口上限 4→2：每轮重拨都是一次完整 dial（DoH + 6 路 TCP/TLS），
+  // 是数据面 CPU 的最大放大器。配合 pinnedHosts 固定反代入口已能覆盖
+  // 已知假活目标；保留 2 轮作为兜底，避免 4 轮累积 10~18s 的 CPU 开销。
+  relayRedialMax: 2,
+  resolvePreferred: true,
+  // 默认保守：只修「直连假活」，不替用户在代理出口上擅自换路
+  aggressiveRedial: false,
+  // 出厂反代入口池（2026-11-21 真机双通复核）：
+  // 全部条目均经实测确认「cloudflare.com 200 且 api.x.com / x.com 直达 X 后端、无 403 拦截」，
+  // 已剔除全部老化（超时 / TLS Fatal Alert 40/80）与被 X WAF 拦截（403 IPv6）的旧入口。
+  // 与用户配置的 relayPool **按行合并**（用户条目优先，出厂条目补充）；运行期另有
+  // 低频动态清单（data/relay-ips.txt）在内存中自动保活补充。
+  relayPool: '216.36.82.11\n137.184.228.85\n216.167.16.112\n128.121.31.252\n23.144.20.184\n38.84.201.228\n155.248.181.189\n38.244.150.113\n64.181.255.215',
+  // 出厂**不再内置**任何固定落地 / 固定反代入口（2026-11-19）。
+  //
+  // 早前这里写死了 5 条，其中 3 条是手机 app 的 `r:` 通配
+  // （`*.x.com` / `*.twitter.com` / `*.twimg.com` = r:155.248.181.189）。
+  // 把它们做成出厂默认有两个致命问题：
+  //   1. **全用户共享单点**：IP 一失效，所有部署同时受影响，只能等发新版；
+  //      而客户端 app 的网络超时约 10~15s，每次请求先白等一次 pin 超时
+  //      就足以表现为「一直转圈 / 打不开」。
+  //   2. **其中至少一条本来就不成立**：`pbs.twimg.com` 解析到 Fastly
+  //      （146.75.x），而 `r:` 是把 TLS 按 SNI 转给 **Cloudflare**，
+  //      CF 无法服务 Fastly 承载的域名 —— 这条 pin 无论如何都不会生效。
+  //
+  // 现在改为**建议值**（见 SUGGESTED_PINNED_HOSTS）：默认不生效，
+  // 面板里作为可选推荐展示，用户确认后才写入。这样失效只影响
+  // 「自己填了这条」的用户，且随时可删。
+  //
+  // 另外，pin 现在已纳入熔断（dial.ts）：即使填了失效的 pin，
+  // 连续失败 2 次后进入冷却、直接走池，冷却到期自动半开重试。
+  pinnedHosts: '',
+  useBuiltinRelay: true,
+  enableTrojan: true,
+  enableXhttp: true,
+  subDomain: '',
+  subProtocol: 'vless',
+  subTransport: 'ws',
+  subVariants: 'vless-ws,vless-xhttp',
+  subName: 'CFPilot',
+  subPorts: '443',
+  clientFingerprint: 'chrome',
+  ech: false,
+  echHost: 'cloudflare-ech.com',
+  echDns: '',
+  tlsFragment: false,
+  tlsFragmentSize: '10-20',
+  tlsFragmentDelay: '10-20',
+  subToken: 'legacy',
+  subTokenTtlDays: 0,
+  unlockProbe: false,
+  udpDns: 'off',
+  // ⚠️ 必须是**非 Cloudflare** 的 DoH 端点：Worker 连回 CF 自家网段会被拒
+  // （TCP Loop detected，见 AGENTS 铁律 9）。
+  udpDnsEndpoint: 'https://dns.google/dns-query',
+}
+
+function num(value: unknown, fallback: number): number {
+  // 注意：不能直接用 Number('')，它等于 0，会把「未配置」错误地变成 0。
+  // 历史上这里导致 officialCount/domainCount 在没设环境变量时变成 0，订阅直接为空。
+  if (value === undefined || value === null) return fallback
+  const text = String(value).trim()
+  if (text === '') return fallback
+  const n = Number(text)
+  return Number.isFinite(n) ? n : fallback
+}
+
+function bool(value: unknown, fallback: boolean): boolean {
+  if (value === undefined || value === null || value === '') return fallback
+  const text = String(value).trim().toLowerCase()
+  if (['1', 'true', 'yes', 'on'].includes(text)) return true
+  if (['0', 'false', 'no', 'off'].includes(text)) return false
+  return fallback
+}
+
+/**
+ * 数值夹取：时序参数必须落在安全区间。
+ *
+ * 填 0 会把代理握手超时关掉（铁律 15）、让会话永久挂起；
+ * 填超大值会顶穿 §31 的 6 连接预算与 CPU 配额。
+ * 非法/缺失一律回落默认值，绝不把用户脏数据带进运行时。
+ */
+function clampNum(value: unknown, fallback: number, min: number, max: number): number {
+  const n = num(value, fallback)
+  if (!Number.isFinite(n)) return fallback
+  return Math.max(min, Math.min(max, Math.round(n)))
+}
+
+/** 合法的代理调度模式 */
+export const PROXY_MODES: ProxyMode[] = ['only', 'global', 'fallback', 'smart']
+
+/**
+ * 归一化代理调度模式。
+ *
+ * 读不懂的值一律回落 `only` —— 那是**最保守**的语义
+ * （有代理只走代理，绝不静默改走直连）。
+ */
+export function normalizeProxyMode(value: string): ProxyMode {
+  const text = value.trim().toLowerCase()
+  if (text === 'global' || text === 'fallback' || text === 'smart') return text
+  return 'only'
+}
+
+/** 归一化订阅令牌模式；读不懂一律回落 `legacy`（最保守：不改变既有行为） */
+export function normalizeSubTokenMode(value: string): 'legacy' | 'signed' {
+  return value.trim().toLowerCase() === 'signed' ? 'signed' : 'legacy'
+}
+
+/** 归一化 UDP 处理模式；读不懂一律 `off`（保持历史行为：明确拒绝） */
+export function normalizeUdpDns(value: string): 'off' | 'doh' {
+  return value.trim().toLowerCase() === 'doh' ? 'doh' : 'off'
+}
+
+function text(value: unknown, fallback: string): string {
+  if (value === undefined || value === null) return fallback
+  return String(value)
+}
+
+/** 环境变量路径也必须与面板配置保持前导斜杠语义。 */
+function normalizeConfigPath(value: string): string {
+  const trimmed = value.trim()
+  if (!trimmed) return DEFAULT_CONFIG.wsPath
+  return `/${trimmed.replace(/^\/+/, '')}`
+}
+
+/** 从环境变量构造默认配置 */
+export function configFromEnv(env: Env): UserConfig {
+  return {
+    uuid: text(env.UUID, ''),
+    trojanPassword: text(env.TROJAN_PASSWORD, ''),
+    // WS 路径：PATH 是 旧版的历史命名，WS_PATH 是本项目的命名。
+    // 两者都读，避免部署向导注入的 PATH 被静默忽略。
+    wsPath: normalizeConfigPath(text(env.WS_PATH || env.PATH, DEFAULT_CONFIG.wsPath)),
+    trojanPath: DEFAULT_CONFIG.trojanPath,
+    xhttpPath: DEFAULT_CONFIG.xhttpPath,
+    add: text(env.ADD, ''),
+    addApi: text(env.ADDAPI, ''),
+    addCsv: text(env.ADD_CSV, ''),
+    poolOfficial: bool(env.OFFICIAL_IP, DEFAULT_CONFIG.poolOfficial),
+    officialCount: num(env.OFFICIAL_IP_COUNT, DEFAULT_CONFIG.officialCount),
+    poolDomain: bool(env.PREFERRED_DOMAIN, DEFAULT_CONFIG.poolDomain),
+    domainCount: num(env.PREFERRED_DOMAIN_COUNT, DEFAULT_CONFIG.domainCount),
+    poolManual: bool(env.MANUAL_IP, DEFAULT_CONFIG.poolManual),
+    poolCountries: text(env.POOL_COUNTRIES, DEFAULT_CONFIG.poolCountries),
+    dls: num(env.DLS, 0),
+    maxLatency: num(env.MAX_LATENCY, 0),
+    maxNodes: 0,
+    proxyIp: text(env.PROXYIP, ''),
+    socks5: text(env.SOCKS5, ''),
+    httpProxy: text(env.HTTP_PROXY, ''),
+    proxyMode: normalizeProxyMode(text(env.PROXY_MODE, '')),
+    nat64: text(env.NAT64, ''),
+    concurrentDial: bool(env.TCP_CONCURRENT_DIAL, true),
+    dataBudgetMB: num(env.DATA_BUDGET_MB, DEFAULT_CONFIG.dataBudgetMB),
+    dialConnectMs: num(env.DIAL_CONNECT_MS, DEFAULT_CONFIG.dialConnectMs),
+    dialBudgetMs: num(env.DIAL_BUDGET_MS, DEFAULT_CONFIG.dialBudgetMs),
+    dohBudgetMs: num(env.DOH_BUDGET_MS, DEFAULT_CONFIG.dohBudgetMs),
+    dialStallMs: num(env.DIAL_STALL_MS, DEFAULT_CONFIG.dialStallMs),
+    relayRedialMax: num(env.RELAY_REDIAL_MAX, DEFAULT_CONFIG.relayRedialMax),
+    resolvePreferred: bool(env.RESOLVE_PREFERRED, DEFAULT_CONFIG.resolvePreferred),
+    aggressiveRedial: bool(env.AGGRESSIVE_REDIAL, DEFAULT_CONFIG.aggressiveRedial),
+    relayPool: text(env.RELAY_POOL, ''),
+    pinnedHosts: text(env.PINNED_HOSTS, DEFAULT_CONFIG.pinnedHosts),
+    useBuiltinRelay: bool(env.USE_BUILTIN_RELAY, DEFAULT_CONFIG.useBuiltinRelay),
+    enableTrojan: bool(env.ENABLE_TROJAN ?? env.TROJAN, DEFAULT_CONFIG.enableTrojan),
+    enableXhttp: bool(env.ENABLE_XHTTP ?? env.XHTTP, DEFAULT_CONFIG.enableXhttp),
+    subDomain: '',
+    subProtocol: 'both',
+    subTransport: 'both',
+    subVariants: text(env.SUB_VARIANTS, DEFAULT_CONFIG.subVariants),
+    subName: text(env.SUB_NAME, DEFAULT_CONFIG.subName).trim() || DEFAULT_CONFIG.subName,
+    subPorts: text(env.SUB_PORTS, DEFAULT_CONFIG.subPorts),
+    clientFingerprint: DEFAULT_CONFIG.clientFingerprint,
+    ech: bool(env.ECH, DEFAULT_CONFIG.ech),
+    echHost: text(env.ECH_HOST, DEFAULT_CONFIG.echHost),
+    echDns: text(env.ECH_DNS, DEFAULT_CONFIG.echDns),
+    tlsFragment: false,
+    tlsFragmentSize: DEFAULT_CONFIG.tlsFragmentSize,
+    tlsFragmentDelay: DEFAULT_CONFIG.tlsFragmentDelay,
+    subToken: normalizeSubTokenMode(text(env.SUB_TOKEN_MODE, '')),
+    subTokenTtlDays: num(env.SUB_TOKEN_TTL_DAYS, DEFAULT_CONFIG.subTokenTtlDays),
+    unlockProbe: bool(env.UNLOCK_PROBE, DEFAULT_CONFIG.unlockProbe),
+    udpDns: normalizeUdpDns(text(env.UDP_DNS, '')),
+    udpDnsEndpoint: text(env.UDP_DNS_ENDPOINT, DEFAULT_CONFIG.udpDnsEndpoint),
+  }
+}
+
+/** 通用行列表合并：用户行在前，fallback 里用户没写的行原样保留（去重、跳过注释/空行）。 */
+function mergeLineList(fallback: string, user: string): string {
+  const userText = String(user ?? '').trim()
+  if (!userText) return String(fallback ?? '')
+  const fallbackText = String(fallback ?? '').trim()
+  if (!fallbackText) return userText
+  const key = (line: string): string => line.trim().toLowerCase()
+  const userKeys = new Set(userText.split(/\r?\n/).map(key))
+  const extra = String(fallback)
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith('#') && !userKeys.has(key(l)))
+  return extra.length > 0 ? [userText, ...extra].join('\n') : userText
+}
+
+/**
+ * 固定落地映射的合并：用户条目优先，fallback 里用户没写的域名条目补在后面。
+ *
+ * 按「条目键」去重（与 pinned.ts 的 entryKey 同语义）：
+ * 直连条目键 = 域名；反代入口条目键 = `relay:域名`。
+ * 同域名的直连条目与反代条目是两个不同的键 —— 用户把 cloudflare.com 从
+ * 反代形态改成直连形态时，出厂的反代条目会保留（两类分池存放，互不覆盖），
+ * 出站直连失败后仍可经出厂反代入口兜底。
+ *
+ * 行文本原样保留（含逗号分隔多 IP 的写法），不重新格式化。
+ */
+// 已移除的出厂固定值（IP 失效会导致被 pin 域名完全断掉，2026-11-19）。
+// 旧用户的 KV 里可能仍存着它们，读取时主动剔除，避免继续 pin 到失效 IP。
+const STALE_FACTORY_PINS = new Set([
+  // 2026-11-19 起出厂不再 pin 任何入口；下列是历史出厂值，
+  // 旧用户 KV 里可能仍残留（面板保存时写入过合并值），读取时统一剔除。
+  'x.com=151.101.194.146',
+  'cloudflare.com=r:45.76.246.192',
+  '*.x.com=r:155.248.181.189',
+  '*.twitter.com=r:155.248.181.189',
+  '*.twimg.com=r:155.248.181.189',
+])
+
+/**
+ * 建议值（**默认不生效**）：面板里作为可选推荐展示，用户确认后才写入。
+ *
+ * 为什么不做出厂默认：固定入口是单点，IP 失效即全网受影响，且客户端
+ * 每次请求都要先等一次 pin 超时（表现为 app 一直转圈）。
+ * 实测（2026-11-19）：`pbs.twimg.com` 解析到 Fastly，而 `r:` 只能把 TLS
+ * 按 SNI 转给 Cloudflare，这条对 twimg 的建议本身不成立，只适合
+ * **CF 承载**的域名（如 api.x.com）。
+ */
+export const SUGGESTED_PINNED_HOSTS =
+  '*.x.com=r:155.248.181.189\n*.twitter.com=r:155.248.181.189'
+
+function dropStaleFactoryPins(text: string): string {
+  return String(text ?? '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l && !STALE_FACTORY_PINS.has(l))
+    .join('\n')
+}
+
+function mergePinnedHosts(fallback: string, user: string): string {
+  // ⚠️ 这里**不做**历史出厂值剔除：剔除放在 loadConfig 的一次性迁移里。
+  // 否则用户永远无法把「建议值」重新填回来（会被当成残留删掉）。
+  const userText = String(user ?? '').trim()
+  if (!userText) return String(fallback ?? '')
+  const fallbackText = String(fallback ?? '').trim()
+  if (!fallbackText) return userText
+  const entryKey = (e: { host: string; relay: boolean }): string =>
+    e.relay ? `relay:${e.host}` : e.host
+  const userKeys = new Set(parsePinnedHosts(userText).map(entryKey))
+  const extra = String(fallback)
+    .split(/\r?\n/)
+    .filter((line) => {
+      const trimmed = line.trim()
+      if (!trimmed || trimmed.startsWith('#')) return false
+      const entries = parsePinnedHosts(trimmed)
+      if (entries.length === 0) return false
+      return !entries.some((e) => userKeys.has(entryKey(e)))
+    })
+  return extra.length > 0 ? [userText, ...extra].join('\n') : userText
+}
+
+/** 合并配置：KV 覆盖环境变量覆盖默认值 */
+export function mergeConfig(base: UserConfig, override: Partial<UserConfig>): UserConfig {  const merged: UserConfig = { ...base }
+  for (const [key, value] of Object.entries(override)) {
+    if (value === undefined || value === null) continue
+    if (
+      key === 'dls' ||
+      key === 'maxLatency' ||
+      key === 'maxNodes' ||
+      key === 'officialCount' ||
+      key === 'domainCount' ||
+      key === 'dataBudgetMB' ||
+      key === 'subTokenTtlDays'
+    ) {
+      ;(merged as unknown as Record<string, number>)[key] = num(value, 0)
+    } else if (
+      key === 'dialConnectMs' ||
+      key === 'dialBudgetMs' ||
+      key === 'dohBudgetMs' ||
+      key === 'dialStallMs' ||
+      key === 'relayRedialMax'
+    ) {
+      // 时序参数单独 clamp（见 clampNum 注释），不能走上面的 num(value, 0)：
+      // 那会把「0」当成合法值，等于关掉超时。
+      const bounds: Record<string, readonly [number, number, number]> = {
+        dialConnectMs: [1000, 20000, DEFAULT_CONFIG.dialConnectMs],
+        dialBudgetMs: [3000, 60000, DEFAULT_CONFIG.dialBudgetMs],
+        dohBudgetMs: [200, 5000, DEFAULT_CONFIG.dohBudgetMs],
+        dialStallMs: [500, 15000, DEFAULT_CONFIG.dialStallMs],
+        relayRedialMax: [1, 8, DEFAULT_CONFIG.relayRedialMax],
+      }
+      const [min, max, fb] = bounds[key]!
+      ;(merged as unknown as Record<string, number>)[key] = clampNum(value, fb, min, max)
+    } else if (
+      key === 'concurrentDial' ||
+      key === 'resolvePreferred' ||
+      key === 'aggressiveRedial' ||
+      key === 'useBuiltinRelay' ||
+      key === 'enableTrojan' ||
+      key === 'enableXhttp' ||
+      key === 'tlsFragment' ||
+      key === 'ech' ||
+      key === 'poolOfficial' ||
+      key === 'poolDomain' ||
+      key === 'poolManual' ||
+      key === 'unlockProbe'
+    ) {
+      ;(merged as unknown as Record<string, boolean>)[key] = bool(value, false)
+    } else if (key === 'proxyMode') {
+      ;(merged as unknown as Record<string, string>)[key] = normalizeProxyMode(String(value))
+    } else if (key === 'subProtocol') {
+      const v = String(value)
+      ;(merged as unknown as Record<string, string>)[key] = v === 'vless' || v === 'trojan' || v === 'both' ? v : 'both'
+    } else if (key === 'subTransport') {
+      const v = String(value)
+      ;(merged as unknown as Record<string, string>)[key] = v === 'ws' || v === 'xhttp' || v === 'both' ? v : 'both'
+    } else if (key === 'subToken') {
+      ;(merged as unknown as Record<string, string>)[key] = normalizeSubTokenMode(String(value))
+    } else if (key === 'pinnedHosts') {
+      // 固定落地映射**按域名合并**（2026-11-14）：
+      // 用户条目优先；出厂修复（x.com / cloudflare.com 等）永远保留 ——
+      // 用户只为 jable.tv 配一条时，出厂修复不会被顶掉。
+      //
+      // ⚠️ 兜底来源必须是 **DEFAULT_CONFIG（纯出厂清单）**，不能是 base：
+      // base 是运行时合并值（出厂 + 用户历史条目混在一起），拿它当兜底
+      // 会让用户**删除的旧条目在下一次保存时复活** —— jable.tv 删不掉
+      // 就是这个 bug（2026-11-15 用户实测）。
+      merged.pinnedHosts = mergePinnedHosts(DEFAULT_CONFIG.pinnedHosts, String(value ?? ''))
+    } else if (key === 'relayPool') {
+      // 反代入口池**按行合并**（2026-11-15）：同上，兜底只认纯出厂清单。
+      merged.relayPool = mergeLineList(DEFAULT_CONFIG.relayPool, String(value ?? ''))
+    } else if (key === 'udpDns') {
+      ;(merged as unknown as Record<string, string>)[key] = normalizeUdpDns(String(value))
+    } else {
+      ;(merged as unknown as Record<string, string>)[key] = String(value)
+    }
+  }
+  return merged
+}
+
+/**
+ * 加载完整配置。
+ * 若尚无 UUID / Trojan 密码，则生成随机值并写回 KV，保证开箱即用。
+ */
+export async function loadConfig(store: Store, env: Env): Promise<UserConfig> {
+  const fromEnv = configFromEnv(env)
+  const raw = await store.get(CONFIG_KEY)
+  let stored: Partial<UserConfig> = {}
+  if (raw) {
+    try {
+      stored = JSON.parse(raw) as Partial<UserConfig>
+    } catch {
+      stored = {}
+    }
+  }
+  const config = mergeConfig(fromEnv, stored)
+
+  let dirty = false
+  // 一次性迁移：旧版本会把出厂固定入口**合并进用户 KV**（面板保存过就会写入），
+  // 而出厂已不再 pin 任何入口。这里把残留的历史出厂值清掉并写回一次；
+  // 之后用户手动填同样条目不会再被删（merge 层已不做剔除）。
+  // 只在值真的变化时才写入，避免无谓的 KV 写配额消耗。
+  if (raw && typeof stored.pinnedHosts === 'string') {
+    const migrated = dropStaleFactoryPins(stored.pinnedHosts)
+    if (migrated !== stored.pinnedHosts.trim()) {
+      stored = { ...stored, pinnedHosts: migrated }
+      config.pinnedHosts = migrated
+      dirty = true
+    }
+  }
+  // ⚠️ 只有**持久化存储（KV）**才允许自动生成凭据并写回：
+  // 生产上未绑定 KV 时 `createStore` 每个请求都 `new MemoryStore()`，
+  // 「生成并写回」等于每个请求/每个隔离体都得到不同的随机 UUID ——
+  // 客户端按面板显示的 UUID 连接会随机失败，且完全无从排查
+  // （2026-10-27 实测核实）。
+  // 未配置时保持空值 fail-closed：所有实例行为一致（一律拒绝认证，
+  // 含 Trojan 空口令防护），面板显示空 UUID 提示用户补配置。
+  const canPersist = store instanceof KvStore
+
+  // ⚠️ **「读不到键」有两种含义，必须分开处理**：
+  //
+  // 1. 键**从来没存在过** —— 真·首次引导，该生成凭据；
+  // 2. 键**存在，但这次读没读到** —— Cloudflare KV 的读是**最终一致**的
+  //    （边缘缓存约 60 秒）。部署流程刚把 CONFIG（含正确的 uuid）写进 KV，
+  //    本隔离体的头几次读**仍可能读不到**。
+  //
+  // 若把 2 当成 1，就会：重新生成一个**随机 UUID** 并把整份 CONFIG 写回
+  // ⇒ 部署时写进 KV 的正确 uuid 被覆盖（客户端全部掉线），
+  // 而且每次陈旧读都产生一次写 ⇒ 写配额放大。
+  // ⚠️ 这类写是**内核自己写的、用户点不到也拦不住**的。
+  //
+  // 办法：**要求键持续缺失超过 KV 的传播窗口**才引导（60 秒 ⇒ 等 90 秒），
+  // 期间只读不写。真正的首次引导会在 90 秒后正常完成。
+  const now = Date.now()
+  if (raw) {
+    configAbsentSince = 0
+  } else if (configAbsentSince === 0) {
+    configAbsentSince = now
+  }
+  const absentLongEnough = now - configAbsentSince > CONFIG_ABSENT_GRACE_MS
+  if (canPersist && absentLongEnough) {
+    if (!config.uuid) {
+      config.uuid = randomUuid()
+      dirty = true
+    }
+    if (!config.trojanPassword) {
+      config.trojanPassword = randomUuid().replace(/-/g, '').slice(0, 16)
+      dirty = true
+    }
+    configAbsentSince = 0
+  }
+
+  // 自愈：历史上 num() 的 bug 把未配置的官方 IP / 域名数量写成了 0，
+  // 导致订阅为空。这里把「小于 1」视为未配置并回落到默认值。
+  //
+  // ⚠️ **只在「键确实存在」时**做：读不到键时（陈旧读）这两个值本来就来自
+  // 默认值，不需要自愈；而此时写回会把随机 uuid 一并写进 KV。
+  // 键存在但字段为 0 才是真的坏数据（历史 bug 的残留），必须修。
+  if (raw && (config.officialCount < 1 || config.domainCount < 1)) {
+    if (config.officialCount < 1) {
+      config.officialCount = DEFAULT_CONFIG.officialCount
+      dirty = true
+    }
+    if (config.domainCount < 1) {
+      config.domainCount = DEFAULT_CONFIG.domainCount
+      dirty = true
+    }
+  }
+  if (dirty) await saveConfig(store, config)
+  return config
+}
+
+/**
+ * CONFIG 键「持续缺失」的起始时刻（隔离体级）。
+ *
+ * 0 = 当前键存在（正常状态）。
+ */
+let configAbsentSince = 0
+
+/**
+ * 键缺失后要等多久才允许引导（毫秒）。
+ *
+ * 必须**大于** Cloudflare KV 的读传播窗口（约 60 秒），
+ * 否则一次陈旧读就会触发「重新生成 UUID + 写回」。
+ * 取 90 秒留出余量。
+ */
+const CONFIG_ABSENT_GRACE_MS = 90_000
+
+/** 只给测试隔离用：重置「键缺失」计时。 */
+export function resetConfigBootstrapState(): void {
+  configAbsentSince = 0
+}
+
+/**
+ * 把「读时合并的出厂兜底」从 KV 存储值里剥掉：KV 只存**用户层**。
+ *
+ * pinnedHosts / relayPool 的出厂条目是在**读配置时**动态合并的
+ * （mergeConfig 的对应分支）——绝不能被持久化进 KV：
+ * 写入路径到处都是 `saveConfig(mergeConfig(fresh, patch))`，只要合并发生在
+ * 写之前，出厂条目就会跟着固化进 KV，之后出厂条目更新（比如入口失效换新）
+ * 时，KV 里的旧条目永远残留且无法通过面板清除。
+ *
+ * 剥离判据：整行与出厂值一致 → 视为出厂行（用户显式写同一条时，读时合并
+ * 会补回来，最终生效值不变，无信息丢失）。
+ */
+export function stripFactoryOverlays(config: UserConfig): UserConfig {
+  const out: UserConfig = { ...config }
+  const factoryLines = (key: 'pinnedHosts' | 'relayPool'): Set<string> =>
+    new Set(
+      DEFAULT_CONFIG[key]
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean)
+    )
+  for (const key of ['pinnedHosts', 'relayPool'] as const) {
+    const factory = factoryLines(key)
+    const lines = String(config[key] ?? '')
+      .split('\n')
+      .map((l) => l.trim())
+    out[key] = lines.filter((l) => l && !factory.has(l)).join('\n')
+  }
+  return out
+}
+
+/** 持久化配置到 KV */
+export async function saveConfig(store: Store, config: UserConfig): Promise<void> {
+  await store.put(CONFIG_KEY, JSON.stringify(stripFactoryOverlays(config)))
+}
+
+/**
+ * 重新读一次 KV 里的配置（**绕过 15 秒缓存**）。
+ *
+ * ## 为什么需要
+ *
+ * getConfig 的模块级缓存有 15 秒（见 CACHE_MS）。拿缓存里的旧值去写回，
+ * 会把用户刚在面板上改的东西覆盖掉 —— 表现是「我明明刚改完，怎么又变回去了」。
+ *
+ * 回填反代入口池这类「后台改配置」的动作必须用最新值合并。
+ */
+export async function readFreshConfig(store: Store, fallback: UserConfig): Promise<UserConfig> {
+  try {
+    const raw = await store.get(CONFIG_KEY)
+    if (!raw) return fallback
+    const parsed = JSON.parse(raw) as unknown
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as UserConfig
+    }
+  } catch {
+    // 读失败（键不存在 / 不是合法 JSON）→ 用兜底值
+  }
+  return fallback
+}
+
+/** 读取本地真连接优选池原始文本 */
+export async function loadLocalIps(store: Store): Promise<string> {
+  return (await store.get(LOCAL_IPS_KEY)) ?? ''
+}
+
+/**
+ * 读取 KV 中热更新的优选域名库。
+ * 返回空数组表示「没有自定义库」，调用方应回落到内置域名库。
+ */
+export async function loadDomainLibrary(store: Store): Promise<string[]> {
+  const raw = await store.get(POOL_DOMAIN_KEY)
+  if (!raw) return []
+  return raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+}
+
+/** 读取 KV 中自定义分流规则原文（空串 = 用内置规则） */
+export async function loadRouteProfile(store: Store): Promise<string> {
+  return (await store.get(ROUTE_PROFILE_KEY)) ?? ''
+}
+
+/**
+ * 保存分流规则。
+ *
+ * 空串 = 清空自定义、回落内置（删键）。
+ *
+ * ⚠️ **删键前不要先读**：KV 的读是最终一致的（边缘缓存约 60 秒），
+ * 陈旧读会把「其实有值」误判成「没有」→ 跳过删除 → 自定义规则留在 KV 里，
+ * 用户点了「清空（回落至内置）」却没清掉。
+ * 删除本身是幂等的，多写一次配额换来**行为正确** ——
+ * 而这是用户显式点击的动作（不是每请求都会走的路径），配额代价可以接受。
+ *
+ * ⚠️ 「与内置规则完全一致」也走删键（由调用方判断后传空串）：
+ * 面板的输入框显示的是**生效中的规则**（没自定义时就是内置那一份），
+ * 用户原样点「保存」不该在 KV 里留下一份与内置重复的自定义副本
+ * （那会让之后的内置规则更新永远不生效）。
+ */
+export async function saveRouteProfile(store: Store, raw: string): Promise<void> {
+  const cleaned = raw.trim()
+  if (!cleaned) {
+    await store.delete(ROUTE_PROFILE_KEY)
+    return
+  }
+  await store.put(ROUTE_PROFILE_KEY, cleaned)
+}
+
+/** 保存优选域名库（空数组表示清空自定义库、回落到内置库） */
+export async function saveDomainLibrary(store: Store, domains: string[]): Promise<void> {
+  const cleaned = domains
+    .map((d) => d.trim())
+    .filter((d) => d.length > 0)
+  if (cleaned.length === 0) {
+    await store.delete(POOL_DOMAIN_KEY)
+    return
+  }
+  await store.put(POOL_DOMAIN_KEY, cleaned.join('\n'))
+}
+
+

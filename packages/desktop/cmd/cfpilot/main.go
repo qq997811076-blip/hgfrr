@@ -1,0 +1,726 @@
+// CFPilot 桌面版入口。
+//
+// ## 这是什么
+//
+// 一个 ~10 MB 的 Go 单文件程序，替代 78 MB 的 Electron 版：
+//   - 托盘常驻，提供「服务状态 / 打开界面 / 换端口 / 启动停止 / 退出」
+//   - 本地 HTTP 服务监听 127.0.0.1，界面用系统浏览器打开
+//   - 界面源码与 Electron 版同一份（packages/gui/src/renderer），一字不改
+//
+// ## 为什么不内置浏览器内核
+//
+// Electron 的 78 MB 里 77.8 MB 是 Chromium + Node，而我们只用到了
+// DOM + CSS 渲染一个表单页。改用系统浏览器后体积降到个位数 MB，
+// 代价是界面变成浏览器标签页（用户已确认接受）。
+//
+// ## 启动参数
+//
+//	--port <n>       覆盖监听端口（不写入配置，只对本次生效）
+//	--no-browser     启动后不自动打开浏览器
+//	--console        前台运行并输出日志（默认 Windows 下无控制台窗口）
+//	--check          只做自检（配置可读 / 端口可用），不启动托盘
+package main
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/url"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/config"
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/kernel"
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/logfile"
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/mesh"
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/notify"
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/server"
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/shell"
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/tray"
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/update"
+)
+
+// Version 由构建时通过 -ldflags 注入（见 scripts/build-desktop.mjs）。
+var Version = "dev"
+
+// panel 是内嵌面板窗口（不可用时为 nil，界面回退到系统浏览器）。
+//
+// 放在包级是因为托盘回调与页面跳转都要用它，而它们定义在 main 之外。
+var panel shell.Panel
+
+// panelTitles 返回窗口标题与「唤醒其它实例」要查找的标题。
+//
+// 两个变体（普通版 / +mesh）监听同一个端口，同一时刻只能有一个在跑；
+// 端口被占用时，要能找到那个正在托盘里运行的窗口并把它唤出来，
+// 而不是让用户看到「端口已被占用」。变体不同，窗口标题也不同
+// （见 panel_title_stub.go / panel_title_mesh.go），所以要按标题逐个尝试。
+//
+// 旧标题「CFPilot 部署与维护工具」保留一个发布周期：
+// 升级前启动、仍在托盘里的实例用的是旧标题，也要能被唤醒。
+func panelTitles() (own, peer, legacy string) {
+	return panelWindowTitle, panelPeerTitle, "CFPilot 部署与维护工具"
+}
+
+// runUpdateHelper 是「重启并更新应用」的收尾进程（--update-helper 模式）。
+//
+// 它由旧主进程 spawn（此时运行的是**新版 exe**，swap 已完成）：
+//
+//  1. 轮询删除 .old 备份 —— Windows 上旧进程还活着时删除会失败，
+//     删除成功即代表旧进程已退出（这是无需 pid 的跨平台退出信号）；
+//  2. 以正常模式（无参数）重启主程序 —— 用户显式给过的启动参数
+//     在旧进程的 apply 路由里已透传给本进程，这里再原样传下去；
+//  3. helper 自己退出。
+//
+// 30 秒内旧进程没退出就放弃清理（.old 留着，下次启动的更新流程会再清）。
+func runUpdateHelper(oldExe string, passArgs []string) {
+	deadline := time.Now().Add(30 * time.Second)
+	removed := false
+	for time.Now().Before(deadline) {
+		if err := os.Remove(oldExe); err == nil {
+			removed = true
+			break
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	if !removed {
+		log.Printf("[cfpilot] 更新收尾：旧版备份 %s 暂无法删除（旧进程退出超时），下次启动时再清理", oldExe)
+	}
+	self, err := os.Executable()
+	if err != nil {
+		log.Printf("[cfpilot] 更新收尾失败：定位新版本失败：%v（请手动启动）", err)
+		return
+	}
+	// 原样透传用户显式给过的启动参数（--port / --console 等）。
+	// helper 的启动命令是 `--update-helper <old> <originalArgs...>`，
+	// passArgs 由调用方从 os.Args 里剥掉 `--update-helper <old>` 后得到。
+	if err := exec.Command(self, passArgs...).Start(); err != nil {
+		log.Printf("[cfpilot] 更新收尾失败：重启主程序失败：%v（请手动启动）", err)
+		return
+	}
+	log.Printf("[cfpilot] 更新收尾完成：主程序已以新版本重启")
+}
+
+func main() {
+	var (
+		portFlag    = flag.Int("port", 0, "监听端口（覆盖配置，仅本次生效）")
+		noBrowser   = flag.Bool("no-browser", false, "启动后不自动打开浏览器")
+		checkOnly   = flag.Bool("check", false, "只做自检，不启动托盘")
+		versionFlag = flag.Bool("version", false, "打印版本号")
+		// --console 只影响日志落点：Windows 下产物是 windowsgui 子系统，
+		// 没有控制台时 stderr 无效，这里改为写文件，便于排查。
+		consoleFlag = flag.Bool("console", false, "把日志写到文件（便于排查）")
+		// --no-tray 不启托盘，前台只跑 HTTP 服务（无桌面会话时使用）
+		noTray = flag.Bool("no-tray", false, "不启托盘，只运行本地服务")
+		// --browser 强制用系统浏览器打开面板（排查窗口问题时的逃生门）。
+		browserFlag = flag.Bool("browser", false, "用系统浏览器打开面板，不使用内嵌窗口")
+		// --update-helper 是「重启并更新应用」的收尾进程（由更新流程 spawn 自身）：
+		// 等旧进程退出 → 删除 .old 备份 → 以正常模式重启主程序 → helper 退出。
+		// 详见 internal/update/apply.go 的注释。
+		updateHelperOld = flag.String("update-helper", "", "内部参数：等旧进程退出后清理备份并重启主程序")
+		// +mesh 变体专用：从 JSON 配置启动组网（最小集真机测试入口）
+		meshConfig = flag.String("mesh-config", "", "+mesh 变体：从 JSON 配置启动组网节点")
+		// +mesh Windows 安装包调用：提权下载 wintun.dll 到指定目录（双重 SHA256 校验）
+		fetchWintun = flag.String("fetch-wintun", "", "+mesh 变体：下载 wintun.dll 到指定目录（安装/提权时用）")
+	)
+	flag.Parse()
+
+	// 下载 wintun.dll（安装包提权调用）。普通版/非 Windows 由 stub 明确报错。
+	if *fetchWintun != "" {
+		path, err := mesh.FetchWintun(*fetchWintun)
+		if err != nil {
+			fatal(fmt.Errorf("下载 wintun.dll 失败：%w", err))
+		}
+		fmt.Printf("wintun.dll 已就绪: %s\n", path)
+		return
+	}
+
+	// +mesh 模式：读取配置 → 启动 Lifecycle → 前台运行（不启托盘/HTTP 服务）
+	// 普通版（无 mesh tag）该文件返回 false，零影响。
+	if *meshConfig != "" {
+		if handled := runMeshMode(*meshConfig); handled {
+			return
+		}
+	}
+
+	// helper 模式必须在任何日志/托盘初始化之前处理：
+	// 它只是个几秒钟的收尾进程，正常模式的所有初始化对它都是浪费，
+	// 而且它会再 spawn 一个真正的主程序 —— 先处理完再走正常流程。
+	if strings.TrimSpace(*updateHelperOld) != "" {
+		// 剥掉 `--update-helper <oldExe>` 及其值，剩下的是原主程序的启动参数，
+		// helper 重启主程序时原样透传（与 SpawnUpdateHelper 的拼接顺序对应）。
+		var passArgs []string
+		for i := 1; i < len(os.Args); i++ {
+			if os.Args[i] == "--update-helper" && i+1 < len(os.Args) {
+				i++ // 跳过参数值（oldExe）
+				continue
+			}
+			passArgs = append(passArgs, os.Args[i])
+		}
+		runUpdateHelper(*updateHelperOld, passArgs)
+		return
+	}
+
+	if *versionFlag {
+		fmt.Printf("CFPilot Desktop %s (%s/%s)\n", Version, runtime.GOOS, runtime.GOARCH)
+		return
+	}
+
+	// 日志文件（始终写，不只在 --console 时写）
+	//
+	// 为什么始终写：界面的「日志」页签要能随时查看历史，
+	// 而之前只有 --console 才写文件 → 平时根本没日志可看。
+	//
+	// 用 logfile.Writer 而不是裸 os.File：它带**滚动上限**，
+	// 扫描进度每秒几十行，不限制体积很快就把磁盘写满了。
+	{
+		dir, err := config.EnsureDir()
+		if err == nil {
+			w, werr := logfile.New(
+				filepath.Join(dir, "cfpilot.log"),
+				logfile.DefaultMaxBytes,
+				logfile.DefaultMaxBackups,
+			)
+			if werr == nil {
+				// --console：同时输出到终端（原来它才是「写文件」的开关，
+				// 现在文件始终写，这个参数只控制是否也打终端）
+				if *consoleFlag {
+					log.SetOutput(io.MultiWriter(w, os.Stderr))
+				} else {
+					log.SetOutput(w)
+				}
+				defer func() { _ = w.Close() }()
+
+				// ⚠️ **把 stderr 也转进日志文件**。
+				//
+				// Go 的 panic / runtime 致命错误（OOM、goroutine 死锁）
+				// 都写到 **fd 2**，托盘模式下 stderr 不可见 →
+				// 用户只看到「服务被强制退出」，日志里什么都没有。
+				//
+				// 这里用管道把 stderr 接过来，抄进日志文件：
+				// 万一有 panic 逃过了各处的 recover 兜底，
+				// 至少日志里能留下现场。
+				redirectStderrToLog(w)
+			} else {
+				log.Printf("[cfpilot] 打开日志文件失败：%v", werr)
+			}
+		}
+	}
+
+	// 配置目录必须可写，否则后面写凭据全失败 —— 启动就检查，早失败早报错
+	if _, err := config.EnsureDir(); err != nil {
+		fatal(err)
+	}
+
+	settings, err := config.LoadSettings()
+	if err != nil {
+		log.Printf("[cfpilot] 读取设置失败，使用默认值：%v", err)
+	}
+	if *portFlag > 0 {
+		if *portFlag < 1 || *portFlag > 65535 {
+			fatal(fmt.Errorf("端口 %d 超出范围（1-65535）", *portFlag))
+		}
+		settings.Port = *portFlag
+	} else if p := config.EnvPortValue(); p > 0 {
+		// 环境变量端口（容器里用）。命令行 --port 优先级更高。
+		settings.Port = p
+	}
+
+	// 环境变量覆盖「允许局域网访问」。
+	//
+	// ⚠️ 这个开关会让面板**监听所有网卡**（0.0.0.0）——
+	// 任何能访问该端口的人都能打开面板，而面板持有 Cloudflare Token 的
+	// 读写权限、能部署与删除 Cloudflare 项目。
+	//
+	// 所以它**只能由用户在启动时显式给出**（环境变量 / 界面里的二次确认），
+	// 不存在「默认开启」这种状态。这里也不能静默生效 ——
+	// 生效时会在启动日志里打出醒目警告。
+	if config.EnvAllowLANValue() && !settings.AllowLAN {
+		settings.AllowLAN = true
+		log.Printf("[cfpilot] 已通过环境变量 %s 开启局域网访问", config.EnvAllowLAN)
+	}
+
+	if *checkOnly {
+		fmt.Printf("配置目录：%s\n", config.SettingsPathForDisplay())
+		fmt.Printf("监听端口：%d\n", settings.Port)
+		if isPortFree(settings.Port) {
+			fmt.Println("端口状态：可用")
+		} else {
+			fmt.Println("端口状态：已被占用")
+		}
+		fmt.Printf("版本：%s (%s/%s)\n", Version, runtime.GOOS, runtime.GOARCH)
+		return
+	}
+
+	// 注入版本号（构建时 ldflags 写入 Version 变量）
+	server.SetVersion(Version)
+
+	srv, err := server.New(settings)
+	if err != nil {
+		fatal(err)
+	}
+	if err := srv.Start(); err != nil {
+		// 端口被占用最常见的原因是「上一个实例还在托盘里跑」：
+		// 用户双击 exe 的本意是把面板调出来，不该看到一个「端口已被占用」的错误框。
+		// 窗口存在就唤醒它并安静退出（那个实例仍在提供服务，不能动它）。
+		// 本变体 / 另一变体 / 旧标题都试一遍 —— 双变体共用端口，标题各不相同。
+		if !*noTray {
+			own, peer, legacy := panelTitles()
+			for _, title := range []string{own, peer, legacy} {
+				if shell.ActivateExisting(title) {
+					log.Printf("[cfpilot] 已有实例在运行，已唤醒它的面板窗口，本次启动退出")
+					return
+				}
+			}
+		}
+		// 真的被别的程序占用时给出可操作的提示，而不是直接崩
+		fatal(fmt.Errorf("%w\n提示：用 --port <端口> 换一个，或先关掉占用该端口的程序", err))
+	}
+
+	url := srv.WelcomeURL()
+	// URL 中的 ?t= 是一次性高权限启动令牌，不能写入持久日志。
+	log.Printf("[cfpilot] 管理界面：%s（启动令牌已通过本地打开流程传递）", srv.WelcomeURLForLog())
+
+	// ---- 面板窗口 ----
+	//
+	// 普通版与 +mesh 版走同一条路径：能用内嵌窗口就用窗口，
+	// 不能用（无图形会话 / 缺 WebView2 运行时 / 用户指定 --browser）就回退浏览器。
+	// 容器与无桌面环境显式用 --no-tray --no-browser，不会走到这里。
+	if !*noBrowser && !*noTray && !*browserFlag &&
+		config.EffectivePanelMode(settings) != config.PanelModeBrowser {
+		dataDir := ""
+		if dir, derr := config.EnsureDir(); derr == nil {
+			dataDir = filepath.Join(dir, "webview")
+		}
+		p, perr := shell.New(shell.Options{
+			Title:        panelWindowTitle,
+			URL:          url,
+			DataDir:      dataDir,
+			OpenExternal: openBrowser,
+			Logf:         log.Printf,
+		})
+		switch {
+		case perr == nil:
+			panel = p
+			log.Printf("[cfpilot] 面板已在应用窗口内打开（%s）", p.Platform())
+		case errors.Is(perr, shell.ErrAlreadyRunning):
+			// 已有实例：刚才已经把它唤到前台，本进程安静退出。
+			log.Printf("[cfpilot] 面板已在另一个窗口里运行，本次启动退出")
+			_ = srv.Stop()
+			return
+		default:
+			log.Printf("[cfpilot] 内嵌窗口不可用，回退系统浏览器：%v", perr)
+		}
+	}
+
+	// ⚠️ 允许局域网访问时的风险警告。
+	//
+	// 这个面板持有 Cloudflare Token 的读写权限、能部署与删除 Cloudflare 项目。
+	// 放开后**任何能访问该端口的人**都能打开它 ——
+	// 一次误配（端口映射到 0.0.0.0、反代没做鉴权、公网 IP 直连）
+	// 就足以把 Cloudflare 账号交出去。
+	//
+	// 所以这里必须把话说清楚，而不是让人自己在文档里翻。
+	if settings.AllowLAN {
+		log.Printf("")
+		log.Printf("[cfpilot] ══════════════════════════════════════════════════════")
+		log.Printf("[cfpilot] ⚠️  已启用局域网访问")
+		log.Printf("[cfpilot] ⚠️  面板持有 Cloudflare Token 的读写权限，")
+		log.Printf("[cfpilot] ⚠️  能部署与删除 Cloudflare 项目。")
+		log.Printf("[cfpilot] ⚠️  请确认该端口只对可信网络开放，")
+		log.Printf("[cfpilot] ⚠️  切勿直接暴露到公网。")
+		if settings.Host != config.LoopbackHost {
+			log.Printf("[cfpilot] ⚠️  当前监听地址：%s（监听地址与访问范围是两回事，", settings.Host)
+			log.Printf("[cfpilot] ⚠️  真正的边界是「谁能访问这个端口」）")
+		}
+		log.Printf("[cfpilot] ══════════════════════════════════════════════════════")
+		log.Printf("")
+	}
+
+	// 启动后自动打开 WebUI。
+	//
+	// ⚠️ 不再受设置项 OpenBrowserOnStart 控制（2026-10-28）：
+	// 那是个默认 false 的开关，用户第一次双击 exe 时浏览器不打开，
+	// 表现为「双击了但什么都没发生」—— 极难自解释。
+	// 现在只有 --no-browser 能关掉它。
+	if !*noBrowser && panel == nil {
+		// 给监听器一点时间就绪，再打开浏览器
+		go func() {
+			time.Sleep(300 * time.Millisecond)
+			if err := openBrowser(url); err != nil {
+				log.Printf("[cfpilot] 打开浏览器失败，请手动访问 %s：%v", url, err)
+			}
+		}()
+	}
+
+	// --no-tray：不启托盘，前台常驻。
+	//
+	// 两个用途：
+	//   1. 无桌面会话的环境（CI / SSH / 纯命令行 Linux）里 systray 起不来，
+	//      这时用本模式只跑 HTTP 服务；
+	//   2. 自动化测试要验证服务行为时，避免托盘线程干扰与阻塞。
+	if *noTray {
+		log.Printf("[cfpilot] 以无托盘模式运行，Ctrl+C 退出")
+		// 无托盘也发系统通知（Linux 服务器上能通过桌面通知/日志确认启动）
+		notify.ShowViaShell(notify.StartupMessage(url, settings.Port, settings.AllowLAN))
+		waitForSignal()
+		_ = srv.Stop()
+		return
+	}
+
+	app := tray.New(srv)
+	app.SetRunning(true)
+	app.SetOpenHandler(func(u string) {
+		// 窗口还活着就置前它；窗口已被关闭（或本就没有）才回退浏览器。
+		if panel != nil && panel.Show("") {
+			return
+		}
+		if err := openBrowser(u); err != nil {
+			log.Printf("[cfpilot] 打开浏览器失败：%v", err)
+		}
+	})
+	app.SetExitHandler(func() {
+		if panel != nil {
+			panel.Close()
+		}
+		_ = srv.Stop()
+		os.Exit(0)
+	})
+
+	// ---- 后台更新检查 ----
+	//
+	// 两个独立的版本：
+	//   应用更新 = 换 exe（外壳 / 界面 / 优选器）
+	//   部署更新 = 换线上内核（数据面 / 控制面）
+	//
+	// 部署更新的「远程最新内核版本」来自 GitHub Release，
+	// 与应用自身版本比较 —— 远程更新时托盘菜单会出现「（有新版 x.y.z）」。
+	// 真正的「线上 vs 最新」对比在界面的一键部署页里显示。
+	checker := tray.NewUpdateChecker(
+		func(ctx context.Context) (*update.CheckResult, error) {
+			return update.Check(ctx, server.Version()), nil
+		},
+		func(ctx context.Context) (*tray.DeployCheckResult, error) {
+			// 优先走内核热更新通道（固定滚动 Release，只拉几 KB 的版本清单）：
+			// 只改内核、不发新包时，只有这条通道知道「有新内核」。
+			// 通道没消息（离线 / 尚未发布）→ 回退旧的包 Release 语义。
+			//
+			// ⚠️ 判据必须是「线上已部署的 build」而不是「本程序内置的锚点」。
+			// 内置锚点只在应用升级时变化，而「更新内核」更新的是线上部署 ——
+			// 拿通道比内置，会让提示在更新完之后**永远消不掉**（用户反复点、
+			// 反复弹同一个提示）。见 kernel.ResolveTarget 的说明。
+			target := kernel.ResolveTarget(ctx, server.Version())
+			if target.Info != nil {
+				return &tray.DeployCheckResult{
+					RemoteVersion: target.Version,
+					RemoteNewer:   target.HasUpdateAgainstDeployed(srv.DeployedKernelBuild()),
+				}, nil
+			}
+			info, err := kernel.FetchRemoteInfo(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if info == nil {
+				return &tray.DeployCheckResult{}, nil
+			}
+			// 通道不可用时只能比版本号（semver），同样比「线上已部署」而不是包版本：
+			// 包版本不随部署变化，会导致更新提示永远消不掉。
+			return &tray.DeployCheckResult{
+				RemoteVersion: info.Version,
+				RemoteNewer:   kernel.CompareSemver(info.Version, srv.DeployedKernelVersion()) > 0,
+			}, nil
+		},
+	)
+	app.SetUpdateChecker(checker)
+
+	// 点菜单项的行为：
+	//   「检查应用更新」→ 立刻查一次 + 打开说明页（有新版时说明页已有提示）
+	//   「检查部署更新」→ 立刻查一次 + 打开一键部署页
+	app.SetCheckAppUpdateHandler(func() {
+		if !appUpdateEnabled() {
+			// +mesh 版是安装包形态，不能自我替换；提示重新下载 +mesh 安装包。
+			notify.ShowViaShell(notify.Message{
+				Title: "CFPilot Mesh 升级",
+				Body:  "请使用最新的 +mesh 安装包重新安装（本版本不支持应用内自动更新）。",
+			})
+			return
+		}
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			st := checker.Check(ctx)
+			logUpdateState(st)
+			openPanelPage(url, "about")
+		}()
+	})
+	app.SetCheckDeployUpdateHandler(func() {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			st := checker.Check(ctx)
+			logUpdateState(st)
+			openPanelPage(url, "deploy")
+		}()
+	})
+
+	// 一键优选 IP：托盘子菜单里每个已保存账号一项，点哪个就用哪个账号跑
+	// （用它自己的 Token / KV 清单 / 面板密码，回填也回到它自己的面板）。
+	//
+	// 进度与结果**全部由托盘呈现**：
+	//   - 运行中实时改父项标题（「一键优选：扫描 45/1500 · 3%」）+ 托盘图标 tooltip；
+	//   - 开始 / 25% / 50% / 75% / 完成 各弹一条文本气泡。
+	//
+	// ⚠️ 气泡没法显示进度条：Windows 的 Shell_NotifyIcon 气泡只有文本字段，
+	// Win32 也没有给「绿色单文件 + 无主窗口」的托盘程序加任务栏进度条的通道。
+	// 完整结论与替代方案见 internal/tray/tray.go 的 SetQuickScanProgress 注释。
+	app.SetQuickScanHandler(func(profileID string) {
+		// 托盘在独立 goroutine 里调这里，所以可以直接同步跑。
+		// 扫描 + 回填可能要几分钟，给足超时。
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+		defer cancel()
+
+		// ⚠️ 按 ID 精确取账号；取不到就报错，**不能回落到活跃账号** ——
+		// 那会把结果回填到另一个账号的面板（串号）。
+		profile, err := srv.QuickScanProfile(profileID)
+		if err != nil || profile == nil {
+			app.FinishQuickScan(server.QuickScanResult{
+				OK:    false,
+				Error: "找不到该账号（可能已在界面里删除），请刷新托盘菜单后重试",
+			})
+			return
+		}
+
+		res := srv.RunQuickScanFor(ctx, profile, app.SetQuickScanProgress)
+		// 无论成功失败都要恢复菜单（标题 / 账号项可点状态）
+		app.FinishQuickScan(res)
+
+		if res.OK {
+			log.Printf("[cfpilot] 一键优选完成（账号 %s）：%s", profileID, res.Message)
+			return
+		}
+		log.Printf("[cfpilot] 一键优选失败（账号 %s）：%s", profileID, res.Error)
+	})
+
+	// 平时自动检查：启动 20 秒后查一次，之后每小时一次。
+	//
+	// 延迟 20 秒是为了不和用户第一次打开界面抢网络。
+	// +mesh 版禁用（安装包不能 rename-swap 替换自身，且两变体共用 tag 会串变体）。
+	if appUpdateEnabled() {
+		checker.StartAutoCheck(context.Background(), 20*time.Second, time.Hour, func(st *tray.UpdateState) {
+			logUpdateState(st)
+			if st.AppHasUpdate {
+				title, body := "CFPilot 有新版本", fmt.Sprintf("发现新版本 %s，可从托盘菜单「检查应用更新」查看。", st.AppLatest)
+				if st.AppPrerelease {
+					title = "CFPilot 有测试版"
+					body = fmt.Sprintf("发现测试版 %s（非稳定版），请确认后再从托盘菜单「检查应用更新」升级。", st.AppLatest)
+				}
+				notify.ShowViaShell(notify.Message{Title: title, Body: body})
+			}
+			if st.DeployHasUpdate {
+				// 内核有新版的气泡 —— 只改内核、不发新包时（内核热更新通道），
+				// 用户不开界面就完全看不到「线上部署有更新」，气泡是唯一主动提醒。
+				notify.ShowViaShell(notify.Message{
+					Title: "CFPilot 内核有更新",
+					Body:  fmt.Sprintf("发现新内核 %s，可从托盘菜单「检查部署更新」更新线上部署。", st.DeployLatest),
+				})
+			}
+		})
+	}
+
+	app.Run()
+
+	// 走到这里有两种可能：
+	//   1. 用户在托盘里点了「退出」→ onExit 已 os.Exit(0)，不会到这
+	//   2. **托盘启动失败**（图标坏 / 建窗口类失败 / 无桌面会话）→ 消息循环立即返回
+	//
+	// 第 2 种情况如果直接往下走，进程会静默退出，用户看到的是
+	// 「双击毫无反应，托盘也没图标」—— 这个坑实测踩过，极难定位。
+	// 所以这里降级为「无托盘模式」：服务继续跑并打开浏览器，至少还能用。
+	if app.Failed() {
+		log.Printf("[cfpilot] 托盘不可用，降级为无托盘模式（服务继续运行）")
+		// 没有托盘就没有「打开面板」入口：窗口留着用户关掉后再也打不开，
+		// 所以这里先关掉窗口，改用浏览器 + 常驻服务这条老路径。
+		if panel != nil {
+			panel.Close()
+			panel = nil
+		}
+		log.Printf("[cfpilot] 管理界面：%s（启动令牌已通过本地打开流程传递）", srv.WelcomeURLForLog())
+		if !*noBrowser {
+			if err := openBrowser(url); err != nil {
+				log.Printf("[cfpilot] 打开浏览器失败，请手动访问 %s：%v", url, err)
+			}
+		}
+		showMessageBox("CFPilot 托盘无法启动",
+			"系统托盘不可用（可能是无桌面会话或图标资源异常）。\n\n"+
+				"服务已在后台运行，界面地址：\n"+url+"\n\n"+
+				"浏览器会自动打开。关掉本提示后程序继续在后台运行，\n"+
+				"需要退出时请用任务管理器结束本进程。")
+		waitForSignal()
+	}
+
+	_ = srv.Stop()
+}
+
+// waitForSignal 阻塞直到收到退出信号。
+func waitForSignal() {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+	<-ch
+}
+
+// openPanelPage 优先在内嵌窗口里切到指定页签，窗口不可用时回退浏览器。
+func openPanelPage(baseURL, page string) {
+	if panel != nil && panel.Show(page) {
+		return
+	}
+	openPage(baseURL, page)
+}
+
+// openPage 打开管理界面的指定页签。
+//
+// 界面读 URL 的 `page` 参数决定初始页签（cred / deploy / scan / about），
+// 所以托盘菜单点「检查部署更新」能直接落到「一键部署」页。
+func openPage(baseURL, page string) {
+	u := baseURL
+	if strings.Contains(u, "?") {
+		u += "&page=" + url.QueryEscape(page)
+	} else {
+		u += "?page=" + url.QueryEscape(page)
+	}
+	if err := openBrowser(u); err != nil {
+		log.Printf("[cfpilot] 打开浏览器失败：%v", err)
+	}
+}
+
+// logUpdateState 把检查结果记到日志。
+func logUpdateState(st *tray.UpdateState) {
+	if st == nil {
+		return
+	}
+	if st.AppHasUpdate {
+		if st.AppPrerelease {
+			log.Printf("[cfpilot] 应用有测试版：%s（当前 %s，非稳定版）", st.AppLatest, server.Version())
+		} else {
+			log.Printf("[cfpilot] 应用有新版本：%s（当前 %s）", st.AppLatest, server.Version())
+		}
+	}
+	if st.DeployHasUpdate {
+		log.Printf("[cfpilot] 线上内核有新版本可用：%s", st.DeployLatest)
+	}
+	if st.Err != "" {
+		log.Printf("[cfpilot] 更新检查部分失败：%s", st.Err)
+	}
+}
+
+// openBrowser 用系统默认浏览器打开 URL。
+func openBrowser(url string) error {
+	switch runtime.GOOS {
+	case "windows":
+		return exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
+	case "darwin":
+		return exec.Command("open", url).Start()
+	default:
+		// Linux：优先 xdg-open，回落其他
+		for _, c := range []string{"xdg-open", "sensible-browser", "x-www-browser", "firefox"} {
+			if _, err := exec.LookPath(c); err == nil {
+				return exec.Command(c, url).Start()
+			}
+		}
+		return fmt.Errorf("未找到可用的浏览器启动命令")
+	}
+}
+
+// isPortFree 检查 127.0.0.1 上的端口是否可绑定。
+func isPortFree(port int) bool {
+	ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if err != nil {
+		return false
+	}
+	_ = ln.Close()
+	return true
+}
+
+// redirectStderrToLog 把进程的 stderr 接到日志文件。
+//
+// # 为什么
+//
+// Go 的 panic 与 runtime 致命错误（OOM、goroutine 死锁）都写到 **fd 2**。
+// 托盘模式下 stderr 没有可见的终端 → 用户只看到「服务被强制退出」，
+// 日志文件里**什么都没有**，事后完全无从查起。
+//
+// 把它接到日志文件后，至少现场会被留下来。
+//
+// # 注意
+//
+//   - 只复制，不改写内容（panic 的格式保持原样，便于对照）
+//   - 每行加 `[stderr]` 前缀，方便和普通日志区分
+//   - 复制协程自身的 panic 也会被吞掉（写日志时 panic）→ 用 recover 兜住
+//   - **只允许一个读者**（见下面注释）
+func redirectStderrToLog(w io.Writer) {
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return
+	}
+	orig := os.Stderr
+	os.Stderr = pw
+
+	// ⚠️⚠️ 这里**只能有一个读者**，而且**不能用 io.Copy**。
+	//
+	// ## 为什么不能用 io.Copy(orig, pr)
+	//
+	// `*os.File` 实现了 `io.WriterTo`（Go 1.22 起），
+	// 所以 `io.Copy(orig, pr)` 会走 `pr.WriteTo(orig)` → Linux 上是 **splice**。
+	//
+	// splice 的实现是：**先拿住目标 fd 的写锁，再循环从源读、往目标写**。
+	// 源里没有数据时，它就**一直持着目标的写锁**等下去。
+	//
+	// `orig` 就是进程的 stderr —— 于是：
+	//   1. 复制协程卡在 splice 上，永远占着 stderr 的写锁；
+	//   2. 后续任何 `log.Printf`（写 stderr）都要抢这把锁 → **整个程序卡死**。
+	//
+	// 症状：服务起来了（HTTP 在别的协程里跑），但主流程停在启动那一步，
+	// 托盘不出现、浏览器不开、**容器里 docker logs 一片空白**。
+	//
+	// ## 什么时候会命中
+	//
+	// 只有 stderr 是**管道**时才会（Windows 的 TTY 与 Linux 终端都不走 splice）：
+	// Docker、CI、systemd —— 也就是「把程序跑在别处」的所有场景。
+	//
+	// ## 现在的做法
+	//
+	// 用 `io.TeeReader` 让**同一个读取循环**把数据同时送到原 stderr 与日志文件：
+	//   - 只有一个读者 ✓（TeeReader 内部只从 pr 读一次）
+	//   - 不经过 io.Copy / WriteTo / splice ✓
+	//   - 写锁只在真正 write 的那一刻持有，不跨越读 ✓
+	go func() {
+		defer func() { _ = recover() }()
+		defer pr.Close()
+		sc := bufio.NewScanner(io.TeeReader(pr, orig))
+		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for sc.Scan() {
+			_, _ = fmt.Fprintf(w, "[stderr] %s\n", sc.Text())
+		}
+	}()
+}
+
+func fatal(err error) {
+	log.Printf("[cfpilot] %v", err)
+	if runtime.GOOS != "windows" {
+		os.Exit(1)
+	}
+	// Windows 下本程序以 -H=windowsgui 编译，没有控制台；
+	// 这里尝试弹一个系统消息框，保证用户看得到错误。
+	showMessageBox("CFPilot 启动失败", err.Error())
+	os.Exit(1)
+}

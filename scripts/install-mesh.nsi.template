@@ -1,0 +1,120 @@
+; CFPilot +mesh Windows 安装器（NSIS MUI2 现代向导界面）。
+; 由 scripts/build-installers.mjs 填入版本号后调用 makensis 编译。
+; 关键：安装时**提权**调用 cfpilot 的 --fetch-wintun 下载 wintun.dll
+;（ADR-0002：DLL 不捆绑，官方下载 + 双重 SHA256 校验）。
+
+Unicode true
+RequestExecutionLevel admin
+
+; 内置简体中文语言文件（不依赖系统 NSIS 是否带 Contrib/Language files，
+; Ubuntu apt 的 nsis 包路径与 Windows 不同，内置后 CI/本机行为一致）。
+!addincludedir "${__FILEDIR__}/nsis-lang"
+!include "MUI2.nsh"
+
+!define APP_NAME "CFPilot Mesh"
+!define APP_VERSION "APP_VERSION_PLACEHOLDER"
+!define EXE_NAME "EXE_NAME_PLACEHOLDER"
+!define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\CFPilotMesh"
+!define MESHD_NAME "MESHD_NAME_PLACEHOLDER"
+
+Name "${APP_NAME} ${APP_VERSION}"
+OutFile "SETUP_OUT_PLACEHOLDER"
+; 默认安装路径（用户可在目录选择页改成任意路径）
+InstallDir "$LOCALAPPDATA\CFPilot-Mesh"
+InstallDirRegKey HKCU "${UNINST_KEY}" "InstallDir"
+ShowInstDetails show
+
+; ---------- MUI 界面设置 ----------
+!define MUI_ABORTWARNING
+!define MUI_WELCOMEPAGE_TITLE "欢迎安装 ${APP_NAME} ${APP_VERSION}"
+!define MUI_WELCOMEPAGE_TEXT "本安装程序将安装 CFPilot 异地组网节点。$\r$\n$\r$\n安装过程中会联网下载并校验 wintun.dll（官方源 + SHA256），请确保网络可用。$\r$\n$\r$\n点击「下一步」继续。"
+!define MUI_DIRECTORYPAGE_TEXT_TOP "选择安装目录。默认在 %LOCALAPPDATA%\CFPilot-Mesh，可点击「浏览」自定义路径。"
+!define MUI_FINISHPAGE_TITLE "安装完成"
+!define MUI_FINISHPAGE_TEXT "${APP_NAME} 已安装。$\r$\n$\r$\n请从开始菜单或桌面快捷方式启动，并用 CFPilot 面板「组网」页生成的配置运行节点。"
+
+; 安装向导页面：欢迎 → 目录选择（自定义路径）→ 安装 → 完成
+!insertmacro MUI_PAGE_WELCOME
+!insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_PAGE_FINISH
+
+; 卸载向导页面
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+
+; 简体中文界面
+!insertmacro MUI_LANGUAGE "SimpChinese"
+
+Section "主程序" Main
+  SetOutPath "$INSTDIR"
+
+  ; ⚠️ 升级前必须先停服务 + 结束主程序：
+  ; 服务进程锁着 cfpilot-meshd.exe，覆盖会失败或「写进去了但仍在跑旧镜像」。
+  ; 这是 2026-11-19 实测到的升级缺陷（用户装了新包，报的还是旧版本错误）。
+  DetailPrint "正在停止旧版组网服务…"
+  ExecWait 'net stop CFPilotMesh'
+  ExecWait 'taskkill /F /IM "${EXE_NAME}" /T'
+  ; 普通版 / 旧版本号的程序与 Mesh 版共用端口，若仍在托盘运行，新 exe 只会唤醒旧窗口。
+  ; 因此安装时统一结束所有 CFPilot 进程（不含系统服务，服务由 net stop 单独处理）。
+  ExecWait 'taskkill /F /IM "cfpilot.exe" /T'
+  ExecWait 'taskkill /F /IM "cfpilot-0.50.0-windows-amd64.exe" /T'
+  Sleep 800
+
+  File "EXE_SOURCE_PLACEHOLDER"
+  File "MESHD_SOURCE_PLACEHOLDER"
+
+  ; 先准备 wintun.dll，服务启动时可能立即恢复上次的组网。
+  DetailPrint "正在下载并校验 wintun.dll（官方源 + SHA256）…"
+  ClearErrors
+  ExecWait '"$INSTDIR\${EXE_NAME}" --fetch-wintun "$INSTDIR"' $0
+  IfErrors dllfail
+  IntCmp $0 0 dllok
+  dllfail:
+    MessageBox MB_ICONSTOP "wintun.dll 下载/校验失败，安装中止。请检查网络后重试。"
+    Abort
+  dllok:
+
+  ; 注册提权守护进程为 Windows 服务（LocalSystem 权限，面板/托盘通过本地 API 控制）
+  ; --install 会先删除旧服务再按当前路径重建，保证升级后跑的是新二进制。
+  ExecWait '"$INSTDIR\${MESHD_NAME}" --install'
+  ExecWait 'net start CFPilotMesh'
+
+  ; 开始菜单 + 桌面快捷方式（用用户选的 $INSTDIR，支持自定义路径）
+  CreateDirectory "$SMPROGRAMS\${APP_NAME}"
+  CreateShortcut "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk" "$INSTDIR\${EXE_NAME}"
+  CreateShortcut "$DESKTOP\${APP_NAME}.lnk" "$INSTDIR\${EXE_NAME}"
+
+  ; 卸载信息
+  WriteRegStr HKCU "${UNINST_KEY}" "DisplayName" "${APP_NAME} ${APP_VERSION}"
+  WriteRegStr HKCU "${UNINST_KEY}" "UninstallString" '"$INSTDIR\uninstall.exe"'
+  WriteRegStr HKCU "${UNINST_KEY}" "InstallDir" "$INSTDIR"
+  WriteUninstaller "$INSTDIR\uninstall.exe"
+SectionEnd
+
+Section "Uninstall"
+  ; 进程占用防护：主程序运行时 Windows 会锁定 exe 与目录，导致卸载残留。
+  ; 始终询问是否强制结束进程——taskkill 对「未运行」的进程无副作用（静默返回），
+  ; 所以不必精确检测。选「否」则跳过强杀（若真在运行，删除会失败，用户已知晓）。
+  MessageBox MB_YESNO|MB_ICONQUESTION \
+    "卸载前是否强制结束可能正在运行的 ${APP_NAME} 进程？$\r$\n$\r$\n选「是」：结束后再卸载（推荐，避免文件残留）。$\r$\n选「否」：如果该程序正在运行，请退出后再卸载。" \
+    IDNO skip_kill
+  ExecWait 'taskkill /F /IM "${EXE_NAME}" /T'
+  Sleep 800
+  skip_kill:
+  ; 停止并卸载提权守护服务
+  ExecWait 'net stop CFPilotMesh'
+  ExecWait '"$INSTDIR\${MESHD_NAME}" --uninstall'
+  ; 删除 CFPilot 虚拟网卡入站放行规则（规则由提权服务在启动时幂等创建）
+  nsExec::ExecToStack /TIMEOUT=10000 `"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -Command "Remove-NetFirewallRule -DisplayName 'CFPilot Mesh Interface Inbound' -ErrorAction SilentlyContinue"`
+  Pop $0
+  Pop $1
+  Delete "$INSTDIR\${EXE_NAME}"
+  Delete "$INSTDIR\${MESHD_NAME}"
+  Delete "$INSTDIR\wintun.dll"
+  Delete "$INSTDIR\uninstall.exe"
+  RMDir "$INSTDIR"
+  Delete "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk"
+  RMDir "$SMPROGRAMS\${APP_NAME}"
+  Delete "$DESKTOP\${APP_NAME}.lnk"
+  DeleteRegKey HKCU "${UNINST_KEY}"
+SectionEnd

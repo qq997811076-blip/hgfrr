@@ -1,0 +1,931 @@
+// Package server 实现 CFPilot 桌面版的本地 HTTP 服务。
+//
+// ## 设计要点
+//
+// 桌面版不再自带浏览器内核：服务监听 127.0.0.1，用户用系统浏览器访问。
+// 界面层（index.html / renderer.js）与 Electron 版**完全同一份源码**，
+// 差别只在通信层：Electron 走 ipcRenderer.invoke，这里走 fetch('/api/...')。
+//
+// ## 安全模型
+//
+// 这个服务能读写 Cloudflare Token，是本地的高价值目标，因此：
+//
+//  1. **只监听回环地址**（127.0.0.1），不监听 0.0.0.0 —— 局域网不可达。
+//  2. **启动令牌 + 独立会话**：进程启动时生成随机 token，拼在欢迎 URL 里。
+//     每个浏览器用它换取独立的 HttpOnly Cookie 会话；服务端并行维护多个会话，
+//     一个浏览器建立会话不会使其它浏览器下线。这样别的网页没法直接调用本服务的 API（它拿不到 token）。
+//  3. **Origin 校验**：凡是带 Origin 头的请求，必须是本站 Origin。
+//     防止恶意网页用跨站请求打本地端口。
+//  4. **Host 校验**：只接受 localhost / 127.0.0.1 的 Host 头，
+//     防 DNS Rebinding（把 evil.com 解析到 127.0.0.1 来绕过同源策略）。
+package server
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"embed"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"log"
+	"net"
+	"net/http"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/config"
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/safe"
+	"github.com/xmwengxing/cfpilot/packages/desktop/internal/store"
+)
+
+//go:embed all:assets
+var embeddedFS embed.FS
+
+// SessionCookie 是 API 鉴权用的 HttpOnly Cookie 名。
+const SessionCookie = "cfpilot_session"
+
+// BootCookie 是直接打开本地首页时下发的短期引导 Cookie 名。
+const BootCookie = "cfpilot_boot"
+const bootCookieTTL = 10 * time.Minute
+
+// allowScheduledTasks 本平台是否提供「定时优选任务」。
+//
+// ## 为什么安卓上不做
+//
+// 安卓系统随时可能冻结/回收后台进程（Doze / App Standby），
+// 「到点自动跑一轮」在手机上**不可靠** —— 任务可能延后很久甚至不跑。
+//
+// 定时优选交给**常驻的容器形态**做（NAS / 小主机），两边分工明确：
+//   - 手机 / 桌面：现在跑一次
+//   - 容器：按周期自动跑
+//
+// 桌面上照常提供 ✓
+const allowScheduledTasks = runtime.GOOS != "android"
+
+// Server 是本地服务实例。
+type Server struct {
+	mu       sync.RWMutex
+	settings config.DesktopSettings
+	// sessions 保存各浏览器的独立会话及服务端到期时间。
+	sessions map[string]time.Time
+	// bootToken 是进程级欢迎链接凭据，不写入持久日志，可供多个浏览器建立独立会话。
+	bootToken string
+	listener  net.Listener
+	httpSrv   *http.Server
+	startedAt time.Time
+	// store 是凭据库（与 Electron 版共用同一份 secrets.json）
+	store *store.Store
+	// events 是 SSE 事件总线（推送日志 / 部署状态 / 扫描结果）
+	events *eventBus
+	// deploy 是部署任务状态（同一时刻只允许一个部署）
+	deploy deployState
+	// scan 是优选任务状态（同一时刻只允许一个扫描）
+	scan scanState
+	// relay 是反代体检任务状态（同一时刻只允许一个）
+	relay relayState
+	// edge 是盲中继部署任务状态（与代理部署独立，互不阻塞）
+	edge edgeState
+	// update 是更新下载状态
+	update updateState
+	// cfBase 覆盖 Cloudflare API 根地址（测试用；生产恒为空 → 走官方地址）
+	cfBase string
+	// usage 是用量查询的缓存与本地调用风控（首次使用时创建）
+	usage     *usageState
+	usageOnce sync.Once
+	// sourceSched 是外部 IP 数据源定时同步（Phase 3）。Start 启动、Stop 停止；
+	// 与「立即同步」按钮共用同一把进程内互斥，避免叠加跑。
+	sourceSched *sourceScheduler
+	// sched 是定时优选任务调度器。Start 启动、Stop 停止；
+	// 与手动优选共用 s.scan 那把互斥锁，同一时刻只跑一个扫描。
+	sched *scheduleScheduler
+}
+
+// New 创建一个服务实例（不启动监听）。
+func New(settings config.DesktopSettings) (*Server, error) {
+	// 启动令牌：优先用环境变量给定的固定值（容器编排 / 反代需要它），
+	// 否则每次启动随机生成 —— 随机的是安全默认值。
+	boot := config.EnvBootTokenValue()
+	if boot == "" {
+		var err error
+		boot, err = randomHex(16)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &Server{
+		settings:    settings,
+		bootToken:   boot,
+		sessions:    make(map[string]time.Time),
+		startedAt:   time.Now(),
+		store:       store.New(""),
+		events:      newEventBus(),
+		sourceSched: &sourceScheduler{},
+		sched:       &scheduleScheduler{},
+	}, nil
+}
+
+// SetStore 注入凭据库（测试用；生产环境用默认目录）。
+func (s *Server) SetStore(st *store.Store) {
+	s.store = st
+}
+
+// SetCFAPIBase 注入 Cloudflare API 根地址（测试用）。
+//
+// 生产恒为空 —— 空串会让 cfapi 走官方地址（cfapi.DefaultAPIBase）。
+// 测试要指向 httptest 服务器，才能验证
+// 「请求里的 kvNamespaceId 是否真被用上」「外部 Token 是否被落盘」
+// 这类**接口契约**（它们都是踩过坑才写对的规则）。
+func (s *Server) SetCFAPIBase(base string) {
+	s.cfBase = base
+}
+
+// BootToken 返回本进程内的启动令牌（供托盘「打开界面」拼接 URL）。
+func (s *Server) BootToken() string {
+	return s.bootTokenValue()
+}
+
+func (s *Server) bootTokenValue() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.bootToken
+}
+
+// WelcomeURL 返回带启动令牌的欢迎地址。
+func (s *Server) WelcomeURL() string {
+	return fmt.Sprintf("http://%s:%d/?t=%s", browseHost(s.settings.Host), s.port(), s.bootTokenValue())
+}
+
+// WelcomeURLForLog 返回不含启动令牌的地址。
+// 启动令牌是一次性高权限凭据，不能落入持久日志或错误报告。
+func (s *Server) WelcomeURLForLog() string {
+	return fmt.Sprintf("http://%s:%d/", browseHost(s.settings.Host), s.port())
+}
+
+// ServiceURL 返回独立服务管理页的地址。
+func (s *Server) ServiceURL() string {
+	return fmt.Sprintf("http://%s:%d/service", browseHost(s.settings.Host), s.port())
+}
+
+// browseHost 把监听地址转成浏览器可访问的地址。
+//
+// `0.0.0.0` / `::` 是「监听所有网卡」的表示，不能直接放进 URL ——
+// 浏览器访问 `http://0.0.0.0:19726` 在部分系统上是未定义行为。
+func browseHost(host string) string {
+	if host == "" || host == config.AnyHost || host == "::" {
+		return config.LoopbackHost
+	}
+	return host
+}
+
+func (s *Server) port() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.settings.Port
+}
+
+// Settings 返回当前设置副本。
+func (s *Server) Settings() config.DesktopSettings {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.settings
+}
+
+// Start 开始监听。端口被占用时返回可读的错误。
+func (s *Server) Start() error {
+	addr := net.JoinHostPort(s.settings.Host, strconv.Itoa(s.settings.Port))
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		if isAddrInUse(err) {
+			return fmt.Errorf("端口 %d 已被占用，请在托盘菜单里换一个端口", s.settings.Port)
+		}
+		return fmt.Errorf("无法监听 %s：%w", addr, err)
+	}
+	// ⚠️ 服务实例必须先落到局部变量再交给 goroutine。
+	//
+	// 早前这里直接 `go func() { s.httpSrv.Serve(ln) }()`：
+	// goroutine 读的是**字段** s.httpSrv，而 Stop() 会把它置为 nil。
+	// 于是「启动后立刻停止」时，goroutine 可能读到 nil → 空指针 panic，
+	// 直接把整个进程带走（托盘、服务、日志一起消失）。
+	// CI 上表现为 internal/server 测试随机崩溃（2026-11-01 v0.13.6 发布时命中）。
+	srv := &http.Server{
+		Handler:           s.routes(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	s.mu.Lock()
+	s.listener = ln
+	s.httpSrv = srv
+	s.mu.Unlock()
+	go func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("[cfpilot] 服务异常退出：%v", err)
+		}
+	}()
+	log.Printf("[cfpilot] 已启动：http://%s", addr)
+	// 外部数据源定时同步跟随服务生命周期；start 内部防重复启动（换端口会再调 Start）
+	s.startSourceScheduler()
+	// 定时优选任务同样跟随服务生命周期（安卓上不做，见 allowScheduledTasks）
+	if allowScheduledTasks {
+		s.startScheduleScheduler()
+	}
+	return nil
+}
+
+// Stop 关闭监听。
+//
+// ## 为什么用 Shutdown 而不是 Close
+//
+// Close 会**立刻掐断所有连接**，包括正在处理的那个请求本身 ——
+// 用户点「修改端口」，服务端处理完关监听时把这条连接的响应也砍了，
+// 浏览器只会看到「The response ended prematurely」，以为操作失败。
+// Shutdown 会等在途请求写完再关。
+//
+// ## 超时不能设太长
+//
+// 换端口时「本请求」正是要等的那个在途请求，Shutdown 会一直等到它结束。
+// 超时设 5 秒就会让停服务卡 5 秒（测试里更是每次收尾都多等 5 秒）。
+// 真正的换端口流程已经改成「先 flush 响应再后台执行」，
+// 所以这里 800ms 足够覆盖正常收尾，超时就强关。
+func (s *Server) Stop() error {
+	// 先停定时同步，避免服务关闭后还有 goroutine 在写本地池
+	s.stopSourceScheduler()
+	// 再停定时优选调度器（它可能正在跑一轮扫描）
+	s.stopScheduleScheduler()
+	s.mu.Lock()
+	srv := s.httpSrv
+	s.httpSrv = nil
+	s.listener = nil
+	s.mu.Unlock()
+	if srv == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		// 超时还没关干净就强关，避免托盘里点了「停止」却还占着端口
+		_ = srv.Close()
+		return nil
+	}
+	return nil
+}
+
+// UpdatePort 换端口：先关旧监听，再在新端口上起服务。
+//
+// 失败时回滚到原端口，避免用户改错一个数字就把服务搞没了。
+func (s *Server) UpdatePort(port int) error {
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("端口 %d 超出范围（1-65535）", port)
+	}
+	s.mu.Lock()
+	old := s.settings.Port
+	s.mu.Unlock()
+	if port == old {
+		return nil
+	}
+
+	// 先确认新端口能绑上，再动旧监听 ——
+	// 否则端口被占用时要先停后起，中间有一段时间界面直接失联。
+	if err := probePortFree(port); err != nil {
+		return fmt.Errorf("端口 %d 不可用：%w", port, err)
+	}
+
+	if err := s.Stop(); err != nil {
+		return fmt.Errorf("关闭原监听失败：%w", err)
+	}
+
+	s.mu.Lock()
+	s.settings.Port = port
+	s.mu.Unlock()
+
+	if err := s.Start(); err != nil {
+		// 回滚
+		s.mu.Lock()
+		s.settings.Port = old
+		s.mu.Unlock()
+		if rbErr := s.Start(); rbErr != nil {
+			return fmt.Errorf("换端口失败（%w），且回滚到 %d 也失败（%v）", err, old, rbErr)
+		}
+		return fmt.Errorf("换端口失败：%w（已回滚到 %d）", err, old)
+	}
+
+	if err := config.SaveSettings(s.Settings()); err != nil {
+		return fmt.Errorf("端口已切换，但保存设置失败：%w", err)
+	}
+	return nil
+}
+
+// probePortFree 试绑端口，确认可用后立即释放。
+func probePortFree(port int) error {
+	ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if err != nil {
+		if isAddrInUse(err) {
+			return fmt.Errorf("已被其他程序占用")
+		}
+		return err
+	}
+	return ln.Close()
+}
+
+// ---------- 路由 ----------
+
+func (s *Server) routes() http.Handler {
+	mux := http.NewServeMux()
+
+	// 静态资源（内嵌的界面文件）
+	sub, err := fs.Sub(embeddedFS, "assets")
+	if err != nil {
+		panic(err)
+	}
+	fileServer := http.FileServer(http.FS(sub))
+
+	// 首页要注入「本平台有哪些能力」——
+	//
+	// ⚠️ 为什么不用接口告诉界面：那样要先等一次请求回来，
+	//    这期间「定时优选任务」页签会先闪一下再消失。
+	//    注入到 HTML 里则**首屏就有**，同步可用。
+	//
+	// 注入的是一行脚本：安卓上带 scheduledTasks:false，
+	// 界面据此把整个定时任务模块藏起来。
+	capsScript := "<script>window.__cfpilotCaps=" +
+		fmt.Sprintf("{%q:%v}", "scheduledTasks", allowScheduledTasks) +
+		";</script>"
+	indexHTML := injectCapabilities(mustReadIndexHTML(), capsScript)
+	// ⚠️ 必须禁缓存。
+	//
+	// 界面跑在**系统浏览器**里，而监听端口是固定的（换版本后通常还是同一个端口）
+	// → 同源。早前这里没设 Cache-Control，浏览器会把 index.html / renderer.js /
+	// adapter.js 缓存下来；换了 exe 之后就可能出现「新的 HTML + 旧的 JS」这种混合
+	// 状态：旧 adapter 没有新方法 → 初始化在 bindRelay 处抛错 → 后面的
+	// `refreshProfiles()` 不再执行 → 「凭据页的账户列表莫名其妙空了」，
+	// 而磁盘上的凭据其实完好无损。
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		// 首页单独走：返回注入了能力标志的版本。
+		if p := r.URL.Path; p == "/" || p == "/index.html" {
+			// 直接输入本地地址的浏览器没有 ?t= 欢迎参数。下发短期引导 Cookie，
+			// 让 Chrome/Firefox 等浏览器也能建立自己的独立会话；API 仍只认 session Cookie。
+			http.SetCookie(w, &http.Cookie{
+				Name: BootCookie, Value: s.bootTokenValue(), Path: "/", MaxAge: int(bootCookieTTL.Seconds()),
+				HttpOnly: true, SameSite: http.SameSiteLaxMode,
+			})
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write(indexHTML)
+			return
+		}
+		fileServer.ServeHTTP(w, r)
+	}))
+
+	// 会话换取：首次访问带 ?t=<bootToken> 换 Cookie
+	mux.HandleFunc("/__session", s.handleSession)
+
+	// 服务管理 API（托盘里的功能也用这些接口，做到「界面与托盘同一套逻辑」）
+	mux.HandleFunc("/api/service/status", s.guard(s.handleServiceStatus))
+	// 日志浏览（界面「日志」页签用）
+	s.registerLogRoutes(mux)
+	mux.HandleFunc("/api/service/port", s.guard(s.handleServicePort))
+	mux.HandleFunc("/api/service/stop", s.guard(s.handleServiceStop))
+
+	// 账户与凭据 API
+	s.registerCredRoutes(mux)
+
+	// 账号用量与额度（只读；需要 Account Analytics Read 权限）
+	mux.HandleFunc("/api/usage", s.guard(s.handleUsage))
+
+	// SSE 事件推送（日志 / 部署状态 / 扫描结果）
+	s.registerEventRoutes(mux)
+
+	// 部署 / KV / 账号检测 API
+	s.registerDeployRoutes(mux)
+
+	// 优选 / 环境检测 API
+	s.registerScanRoutes(mux)
+
+	// 盲中继 / 云监测台部署 API（基础功能，独立资源，不碰代理内核）
+	s.registerEdgeRoutes(mux)
+
+	// 构建变体查询（普通版 / +mesh 版）：界面据此显示或隐藏组网入口
+	mux.HandleFunc("/api/mesh/enabled", s.guard(s.handleMeshEnabled))
+
+	// +mesh 控制 API（start/stop/status/peers）：面板与托盘通过它控制提权守护进程 meshd
+	s.registerMeshControlRoutes(mux)
+
+	// 定时优选任务 API（任务清单 + 本地 IP 池）
+	// 安卓上没有这个功能（见 allowScheduledTasks），路由也不注册。
+	if allowScheduledTasks {
+		s.registerScheduleRoutes(mux)
+	}
+
+	// 反代优选（出站链路体检）API
+	s.registerRelayRoutes(mux)
+
+	// 实验性功能开关（默认全部关闭）
+	s.registerExperimentalRoutes(mux)
+
+	// 检查更新 API
+	s.registerUpdateRoutes(mux)
+
+	// 链式代理（自建落地节点）API
+	s.registerChainRoutes(mux)
+
+	// 外部 IP 数据源管理页（Phase 5，唯一 UI 入口；面板零改动）
+	s.registerSourcesRoutes(mux)
+
+	return s.withCommonHeaders(s.logApiFailures(mux))
+}
+
+// apiRecorder 记录接口响应的状态码与响应体。
+//
+// 用于把「接口为什么失败」写进日志 —— 只记状态码没用，
+// 用户要看到的是「写入凭据失败：Access is denied」这种带原因的信息。
+type apiRecorder struct {
+	http.ResponseWriter
+	status int
+	body   bytes.Buffer
+}
+
+func (a *apiRecorder) WriteHeader(code int) {
+	if a.status == 0 {
+		a.status = code
+		a.ResponseWriter.WriteHeader(code)
+	}
+}
+
+func (a *apiRecorder) Write(b []byte) (int, error) {
+	if a.status == 0 {
+		a.status = http.StatusOK
+	}
+	a.body.Write(b)
+	return a.ResponseWriter.Write(b)
+}
+
+// logApiFailures 把「接口返回了错误」写进日志。
+//
+// ## 为什么需要这一层
+//
+// 用户反馈的典型症状是「点了按钮没反应，日志里什么都没有」。
+// 根因是**两层都不出声**：
+//
+//   - 服务端：接口出错只回一个带 error 的 JSON，**不写日志**；
+//   - 界面：按钮的处理函数没接住异常，Promise 拒绝被静默吞掉。
+//
+// 结果就是任何失败都表现为「完全没反应」—— 用户既看不到提示，
+// 也查不到原因，只能来问「是不是坏了」。
+//
+// 这里补上服务端这一层：任何 /api/ 请求返回 4xx / 5xx 都记一条日志，
+// 带上有 error 字段的具体原因。
+//
+// ⚠️ /api/events（SSE）必须排除：那是长连接，
+//
+//	响应体没有边界，缓冲下来会一直涨。
+func (s *Server) logApiFailures(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/api/events" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		rec := &apiRecorder{ResponseWriter: w}
+		next.ServeHTTP(rec, r)
+		if rec.status < 400 {
+			return
+		}
+		reason := ""
+		if obj := parseErrorField(rec.body.Bytes()); obj != "" {
+			reason = "：" + obj
+		}
+		s.logLevel(fmt.Sprintf("接口 %s %s 返回 %d%s", r.Method, r.URL.Path, rec.status, reason), "err")
+	})
+}
+
+// parseErrorField 从接口响应体里取出 error 字段（没有就返回空串）。
+func parseErrorField(raw []byte) string {
+	var obj struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(obj.Error)
+}
+
+// mustReadIndexHTML 读内嵌的首页。
+//
+// 首页是构建中间物，没构建时读不到 —— 那就让界面那边自己报错，
+// 不能因为读不到首页就 panic（那会让整个服务起不来）。
+func mustReadIndexHTML() []byte {
+	raw, err := embeddedFS.ReadFile("assets/index.html")
+	if err != nil {
+		log.Printf("[cfpilot] 读不到内嵌界面（先跑 node scripts/build-desktop.mjs）：%v", err)
+		return nil
+	}
+	return raw
+}
+
+// injectCapabilities 把能力标志脚本插到 </head> 之前。
+//
+// 插不进去（页面结构变了）就原样返回 —— 界面会退回到「靠接口判断」那条路，
+// 也就是最多闪一下，不会出错。
+func injectCapabilities(html []byte, script string) []byte {
+	if len(html) == 0 || script == "" {
+		return html
+	}
+	tag := []byte("</head>")
+	i := bytes.Index(html, tag)
+	if i < 0 {
+		return html
+	}
+	out := make([]byte, 0, len(html)+len(script))
+	out = append(out, html[:i]...)
+	out = append(out, script...)
+	out = append(out, html[i:]...)
+	return out
+}
+
+// withCommonHeaders 统一加安全响应头与 Host 校验。
+//
+// ## Host 校验的两种模式
+//
+// 校验 Host 头的目的是**防 DNS Rebinding**：
+// 恶意网页把自己的域名解析到 127.0.0.1，再让浏览器请求本服务。
+// 浏览器发请求时 Host 头会是 `evil.com`，我们据此拒绝。
+//
+//   - **仅本机模式**（默认）：Host 必须是回环地址
+//     （`127.0.0.1` / `localhost` / `[::1]` / 本机网卡 IP）。
+//   - **局域网模式**（用户显式开启）：额外放行私有网段的 IP 与
+//     本机主机名 —— 否则同事用 `http://192.168.1.10:19726`
+//     访问时 Host 是 `192.168.1.10`，会被判成非法而打不开。
+//
+// ⚠️ 局域网模式下**仍然拒绝任意域名**（`evil.com` 一律 403），
+// 所以 DNS Rebinding 依然防得住 —— 攻击者无法让 Host 头变成内网 IP。
+func (s *Server) withCommonHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		allowLAN := s.Settings().AllowLAN
+
+		// Host 校验：防 DNS Rebinding
+		if !hostAllowed(r.Host, allowLAN) {
+			http.Error(w, "非法 Host", http.StatusForbidden)
+			return
+		}
+		// 同源校验：带 Origin 时必须是同 Host
+		if origin := r.Header.Get("Origin"); origin != "" && !s.originAllowed(origin, r.Host) {
+			http.Error(w, "非法 Origin", http.StatusForbidden)
+			return
+		}
+
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		// 界面不需要被任何外部页面嵌入
+		w.Header().Set("X-Frame-Options", "DENY")
+		// 本地服务不缓存：避免浏览器拿旧界面
+		w.Header().Set("Cache-Control", "no-store")
+
+		// ⚠️ **panic 兜底**：Go 里 handler panic 会让整个进程退出
+		// （net/http 的 recover 只保护连接，不保护进程）。
+		// 一次请求里的 nil 解引用就会把「托盘 + 服务 + 正在跑的扫描」全部带走，
+		// 而托盘模式下 panic 信息写在 stderr（用户看不见）→ 表现为「服务莫名消失」。
+		//
+		// 这里接住 → 记日志（含堆栈）→ 返回 500，连接与进程都保住。
+		defer func() {
+			if r := safe.Recover("处理 HTTP 请求 " + r.Method + " " + r.URL.Path); r != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{
+					"error": "服务内部错误，详情已记入日志",
+				})
+			}
+		}()
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// hostAllowed 判断 Host 头是否可接受。
+//
+// allowLAN 为 true 时，额外放行私有网段地址与主机名（局域网访问场景）。
+func hostAllowed(hostport string, allowLAN bool) bool {
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host = hostport
+	}
+	host = strings.Trim(host, "[]")
+
+	// 回环 / localhost 永远放行
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// 非 IP 的 Host（如主机名）。仅本机模式下一律拒绝，
+		// 局域网模式下放行「看起来像内网主机名」的简单名称。
+		if !allowLAN {
+			return false
+		}
+		return isSimpleHostname(host)
+	}
+	if ip.IsLoopback() {
+		return true
+	}
+	if !allowLAN {
+		return false
+	}
+	// 局域网模式：只放行私有网段（10/8、172.16/12、192.168/16、fc00::/7、fe80::/10）
+	return ip.IsPrivate() || ip.IsLinkLocalUnicast()
+}
+
+// isSimpleHostname 判断是否是简单主机名（不含点，或含点但不是公网域名）。
+//
+// 用于局域网模式下允许 `http://my-pc:19726` 这种访问。
+// 明确排除带公网后缀的名称，避免被 DNS Rebinding 利用。
+func isSimpleHostname(host string) bool {
+	if host == "" || len(host) > 253 {
+		return false
+	}
+	// 不含点 → 是本地主机名（如 DESKTOP-ABC），放行
+	if !strings.Contains(host, ".") {
+		return true
+	}
+	// 含点的一律拒绝：`evil.com` 可能被解析到 127.0.0.1
+	return false
+}
+
+// guard 校验会话 Cookie，未通过直接 401。
+func (s *Server) guard(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.hasValidSession(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{
+				"error": "未授权：请从托盘菜单打开界面，或用带 t= 参数的欢迎链接访问",
+			})
+			return
+		}
+		limitRequestBody(h)(w, r)
+	}
+}
+
+// maxRequestBody 是单个 API 请求体的上限（1 MB）。
+//
+// ## 为什么要有这个闸
+//
+// 界面「自定义候选」输入框在**每敲一个键**时就把整个文本发过来
+// （刷新「已识别 N 个」提示）。清单一大就是几万行 ——
+// 单次请求 = 几 MB 的请求体 + 解析出的几万个字符串 + 同样大的响应，
+// 几个并发请求就能把进程撑爆，表现为「页面卡死、服务也没了」。
+//
+// 上限按「maxCustomCandidates 个候选装得下」取：
+// 5000 × 约 30 字节 ≈ 150 KB，1 MB 留足了余量。
+const maxRequestBody = 1 << 20
+
+// limitRequestBody 给请求体加上限。
+//
+// ⚠️ 不用 http.MaxBytesReader 就完事：那样超限时 body 被截断，
+// handler 里的 json.Decode 会报「请求体不是合法 JSON」——
+// 那个提示会让人以为是数据格式问题，而不是「太大了」。
+// 这里自己读一遍，超了直接给 413 和一句说人话的提示。
+func limitRequestBody(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Body == nil {
+			h(w, r)
+			return
+		}
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBody+1))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "读取请求体失败：" + err.Error(),
+			})
+			return
+		}
+		if len(body) > maxRequestBody {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{
+				"error": fmt.Sprintf("请求体过大（上限 %d MB）", maxRequestBody/1024/1024),
+			})
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.ContentLength = int64(len(body))
+		h(w, r)
+	}
+}
+
+func (s *Server) hasValidSession(r *http.Request) bool {
+	c, err := r.Cookie(SessionCookie)
+	if err != nil {
+		return false
+	}
+	s.mu.RLock()
+	expiresAt, ok := s.sessions[c.Value]
+	s.mu.RUnlock()
+	return ok && c.Value != "" && time.Now().Before(expiresAt)
+}
+
+func (s *Server) originAllowed(origin, host string) bool {
+	// Origin 形如 http://127.0.0.1:19726
+	const p = "http://"
+	if !strings.HasPrefix(origin, p) {
+		return false
+	}
+	return strings.EqualFold(strings.TrimPrefix(origin, p), host)
+}
+
+// ---------- handlers ----------
+
+func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
+	t := r.URL.Query().Get("t")
+	if t == "" {
+		if c, err := r.Cookie(BootCookie); err == nil {
+			t = c.Value
+		}
+	}
+	wantBoot := s.bootTokenValue()
+	if t == "" || subtle.ConstantTimeCompare([]byte(t), []byte(wantBoot)) != 1 {
+		http.Error(w, "启动令牌无效", http.StatusForbidden)
+		return
+	}
+	token, err := randomHex(24)
+	if err != nil {
+		http.Error(w, "内部错误", http.StatusInternalServerError)
+		return
+	}
+	s.mu.Lock()
+	// 每个浏览器独立建会话，不能覆盖其它浏览器的 Cookie。
+	now := time.Now()
+	if s.sessions == nil {
+		s.sessions = make(map[string]time.Time)
+	}
+	for key, expiry := range s.sessions {
+		if !now.Before(expiry) {
+			delete(s.sessions, key)
+		}
+	}
+	// 容量满时拒绝新会话，不驱逐正在使用的浏览器。
+	if len(s.sessions) >= 64 {
+		s.mu.Unlock()
+		http.Error(w, "会话数量已达上限，请稍后重试", http.StatusTooManyRequests)
+		return
+	}
+	s.sessions[token] = now.Add(12 * time.Hour)
+	s.mu.Unlock()
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     SessionCookie,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		// ⚠️ 用 Lax 而不是 Strict。
+		//
+		// Strict 的语义是「任何跨站来源的请求都不带 Cookie」，
+		// 包括**从地址栏直接粘贴 URL 打开**这种场景在某些浏览器上
+		// 也会被判为「无来源」而不携带 —— 表现为会话明明建立了，
+		// 后续 API 仍然全线 401。
+		//
+		// Lax 仍然阻止跨站 POST（本服务所有写操作都是 POST），
+		// 安全性等价，兼容性更好。
+		SameSite: http.SameSiteLaxMode,
+		// 本地 http 服务，不能设 Secure（否则浏览器不会回传）
+		MaxAge: 12 * 60 * 60,
+	})
+	// 明确告诉浏览器/代理不要缓存这次会话建立
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "expiresIn": 12 * 60 * 60})
+}
+
+func (s *Server) handleServiceStatus(w http.ResponseWriter, r *http.Request) {
+	st := s.Settings()
+	// 数据目录（设置、凭据、日志都在这里）。
+	//
+	// ⚠️ 各平台路径不一样（桌面版是用户目录，安卓版是应用私有目录），
+	//    界面要显示**真实路径** —— 写死一个在别的平台上就是错的。
+	dataDir, _ := config.Dir()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"running":       true,
+		"host":          st.Host,
+		"port":          st.Port,
+		"url":           fmt.Sprintf("http://%s:%d/", st.Host, st.Port),
+		"uptimeSeconds": int(time.Since(s.startedAt).Seconds()),
+		"keepInTray":    st.KeepRunningInTray,
+		"settingsFile":  config.SettingsPathForDisplay(),
+		"dataDir":       dataDir,
+		// 界面据此决定要不要显示「定时优选任务」模块。
+		"capabilities": map[string]bool{
+			"scheduledTasks": allowScheduledTasks,
+		},
+		"pid": osGetpid(),
+		// 程序版本（界面「运行状态」要显示**真实版本**，不能只写「运行中」）。
+		"version": Version(),
+		// 构建变体：两个产物共用同一个版本号，界面靠它区分普通版与 +mesh 版。
+		"variant": variantName(),
+		// 内嵌界面指纹：同版本号可能重编多次，这里给面板一个可自证的构建标记，
+		// 避免「装了新包但界面没变」时无法判断到底跑的是哪一份 renderer.js。
+		"uiBuild": embeddedUIBuild(),
+	})
+}
+
+func (s *Server) handleServicePort(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "仅支持 POST"})
+		return
+	}
+	var body struct {
+		Port int `json:"port"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体不是合法 JSON"})
+		return
+	}
+	if body.Port < 1 || body.Port > 65535 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("端口 %d 超出范围（1-65535）", body.Port)})
+		return
+	}
+
+	// 先做「不关监听就能做」的全部校验，失败直接回错误，服务不受影响。
+	if body.Port == s.port() {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "port": body.Port, "note": "端口未变化"})
+		return
+	}
+	if err := probePortFree(body.Port); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": fmt.Sprintf("端口 %d 不可用：%v", body.Port, err),
+		})
+		return
+	}
+
+	// 关键：关旧监听会掐断「正在处理本请求」的这条连接。
+	//
+	// 实测两种都会失败：
+	//   - Close()         立刻断开 → 客户端 "response ended prematurely"
+	//   - Shutdown(ctx)   会等本请求结束，而本请求正等 Shutdown 返回 → 死等到超时
+	//
+	// 所以必须**先把响应写出去并冲刷**，再在后台换端口。
+	w.Header().Set("Connection", "close")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":   true,
+		"port": body.Port,
+		"url":  fmt.Sprintf("http://127.0.0.1:%d/", body.Port),
+		"note": "端口即将切换到新地址，请用新地址重新打开界面",
+	})
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
+	go func() {
+		// 给响应一点时间真正离开内核缓冲区
+		time.Sleep(250 * time.Millisecond)
+		if err := s.UpdatePort(body.Port); err != nil {
+			log.Printf("[cfpilot] 换端口失败：%v", err)
+		}
+	}()
+}
+
+func (s *Server) handleServiceStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "仅支持 POST"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "note": "服务即将关闭"})
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		if err := s.Stop(); err != nil {
+			log.Printf("[cfpilot] 停止失败：%v", err)
+		}
+	}()
+}
+
+// ---------- 小工具 ----------
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func randomHex(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func isLoopbackHost(hostport string) bool {
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host = hostport
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func isAddrInUse(err error) bool {
+	// 不直接 import syscall 的常量（Windows/Linux 错误码不同），
+	// 用错误文本判断已足够，且不引入平台分支
+	msg := err.Error()
+	return strings.Contains(msg, "Only one usage of each socket address") ||
+		strings.Contains(msg, "address already in use")
+}

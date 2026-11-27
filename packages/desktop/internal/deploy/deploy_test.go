@@ -1,0 +1,1322 @@
+package deploy
+
+// 部署流程的测试。
+//
+// ## 测试重点
+//
+// 这里不测「能不能连通 Cloudflare」（那是 live_test 的事），
+// 而是测**那些踩过坑才写对的规则**：
+//
+//   - KV 归属校验必须在写入任何键之前
+//   - 8000119 要先同名重试 3 次，再换名
+//   - 换名后域名迁移顺序必须是「旧解绑 → 新绑定 → 删旧项目」
+//   - 域名迁移失败时**不能**删旧项目（旧项目还挂着用户唯一入口）
+//   - 先部署数据面，再部署控制面
+//   - 数据面换名后要重配控制面 DATA_HOST
+//   - 写 KV 用大写 CONFIG，不碰小写 config
+//   - 清单里 build 读不到就写空串，不写 "unknown"
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// fakeCF 是一个可编程的假 Cloudflare API。
+type fakeCF struct {
+	mu sync.Mutex
+
+	// 已部署的项目名 → 部署次数
+	deployCalls map[string]int
+	// 每次部署请求的项目名（按顺序）
+	deployOrder []string
+	// 创建过的项目名
+	created []string
+	// 删除过的项目名
+	deleted []string
+	// 域名操作顺序（用于验证「旧解绑 → 新绑 → 删旧」）
+	domainOps []string
+	// patchCalls 记录 PATCH 配置请求：项目名 → 次数
+	//
+	// ⚠️ `PATCH /pages/projects/{name}` 会**自动触发一次部署**，
+	// 所以 PATCH 次数直接等于「隐式发布事件数」。
+	// 环境变量与 KV 绑定必须**合并成一次 PATCH**，
+	// 否则一次部署动作的发布次数会翻倍（风控画像累积更快）。
+	patchCalls map[string]int
+	// patchBodies 记录每次 PATCH 的请求体（用于校验一次 PATCH 同时带 env 与 KV）
+	patchBodies []map[string]any
+	// KV 写入记录：key → value
+	kvWrites map[string]string
+	// 已存在的 KV 值
+	kvSeed map[string]string
+
+	// deployFailPlan: 项目名 → 前 N 次返回 8000119
+	deployFailPlan map[string]int
+	// addDomainFail 为 true 时绑定域名失败
+	addDomainFail bool
+	// existingProject 返回 404 表示不存在
+	existingProject map[string]bool
+	// subdomainOf 项目名 → 子域名
+	subdomainOf map[string]string
+	// manifestInKV 是预置的清单
+	manifestInKV string
+	// envVars 记录控制面最后一次配置的 DATA_HOST
+	dataHost string
+	// subdomainSwitches 记录每个 Worker 的 workers.dev 开关（enabled / previews_enabled）
+	subdomainSwitches map[string]map[string]bool
+	// workerDomains 是账号下 Worker 的自定义域名绑定
+	workerDomains []struct {
+		service  string
+		hostname string
+	}
+}
+
+func newFakeCF() *fakeCF {
+	return &fakeCF{
+		deployCalls:       map[string]int{},
+		patchCalls:        map[string]int{},
+		kvWrites:          map[string]string{},
+		kvSeed:            map[string]string{},
+		deployFailPlan:    map[string]int{},
+		existingProject:   map[string]bool{},
+		subdomainOf:       map[string]string{},
+		subdomainSwitches: map[string]map[string]bool{},
+	}
+}
+
+func (f *fakeCF) handler(t *testing.T) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+
+		path := r.URL.Path
+		ok := func(result any) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "result": result})
+		}
+		fail := func(code int, msg string) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(code)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": false,
+				"errors":  []map[string]any{{"code": code, "message": msg}},
+			})
+		}
+
+		// ---- KV ----
+		// 列键名：归属判定靠键名集合（见 inspectKvOwnership）。
+		// 假服务器按「已写入的键 + 预置的键」回应，和真实 API 的字典序无关 ——
+		// 判定只做集合比较。
+		if strings.Contains(path, "/storage/kv/namespaces/") && strings.HasSuffix(path, "/keys") {
+			seen := map[string]bool{}
+			list := make([]map[string]string, 0, len(f.kvSeed)+len(f.kvWrites))
+			for key := range f.kvSeed {
+				if !seen[key] {
+					seen[key] = true
+					list = append(list, map[string]string{"name": key})
+				}
+			}
+			for key := range f.kvWrites {
+				if !seen[key] {
+					seen[key] = true
+					list = append(list, map[string]string{"name": key})
+				}
+			}
+			ok(list)
+			return
+		}
+		if strings.Contains(path, "/storage/kv/namespaces/") && strings.Contains(path, "/values/") {
+			parts := strings.Split(path, "/values/")
+			key := parts[len(parts)-1]
+			if r.Method == http.MethodGet {
+				if v, has := f.kvSeed[key]; has {
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(v))
+					return
+				}
+				if v, has := f.kvWrites[key]; has {
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(v))
+					return
+				}
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			if r.Method == http.MethodPut {
+				buf := make([]byte, r.ContentLength)
+				_, _ = r.Body.Read(buf)
+				if len(buf) == 0 {
+					var sb strings.Builder
+					b := make([]byte, 4096)
+					for {
+						n, err := r.Body.Read(b)
+						if n > 0 {
+							sb.Write(b[:n])
+						}
+						if err != nil {
+							break
+						}
+					}
+					f.kvWrites[key] = sb.String()
+				} else {
+					f.kvWrites[key] = string(buf)
+				}
+				ok(nil)
+				return
+			}
+		}
+
+		// ---- Pages 项目 ----
+		if strings.Contains(path, "/pages/projects") {
+			// 部署
+			if strings.HasSuffix(path, "/deployments") && r.Method == http.MethodPost {
+				seg := strings.Split(path, "/pages/projects/")
+				proj := strings.Split(seg[len(seg)-1], "/")[0]
+				f.deployOrder = append(f.deployOrder, proj)
+				f.deployCalls[proj]++
+
+				if n, has := f.deployFailPlan[proj]; has && f.deployCalls[proj] <= n {
+					fail(http.StatusBadRequest, "You have been blocked（8000119）")
+					return
+				}
+				ok(map[string]any{"id": "dep-" + proj, "environment": "production"})
+				return
+			}
+
+			// 列部署（轮询状态）
+			if strings.HasSuffix(path, "/deployments") && r.Method == http.MethodGet {
+				ok([]map[string]any{
+					{"id": "dep1", "latest_stage": map[string]any{"name": "deploy", "status": "success"}},
+				})
+				return
+			}
+
+			// 域名子接口
+			if strings.Contains(path, "/domains") {
+				seg := strings.Split(path, "/pages/projects/")
+				rest := seg[len(seg)-1]
+				if r.Method == http.MethodGet {
+					ok([]map[string]any{
+						{"name": "cf.example.com", "status": "active"},
+					})
+					return
+				}
+				if r.Method == http.MethodDelete {
+					proj := strings.Split(rest, "/")[0]
+					domain := rest[strings.LastIndex(rest, "/")+1:]
+					f.domainOps = append(f.domainOps, "unbind:"+proj+":"+domain)
+					ok(nil)
+					return
+				}
+				if r.Method == http.MethodPost {
+					proj := strings.Split(rest, "/")[0]
+					var body map[string]string
+					_ = json.NewDecoder(r.Body).Decode(&body)
+					if f.addDomainFail {
+						f.domainOps = append(f.domainOps, "bindfail:"+proj)
+						fail(http.StatusBadRequest, "You have already added this custom domain")
+						return
+					}
+					f.domainOps = append(f.domainOps, "bind:"+proj+":"+body["name"])
+					ok(map[string]any{"name": body["name"]})
+					return
+				}
+			}
+
+			// 项目详情 / PATCH / DELETE
+			seg := strings.Split(path, "/pages/projects/")
+			if len(seg) == 2 && r.Method == http.MethodGet {
+				proj := seg[1]
+				sub := f.subdomainOf[proj]
+				if sub == "" {
+					sub = proj + ".pages.dev"
+				}
+				ok(map[string]any{
+					"id":        "pid-" + proj,
+					"name":      proj,
+					"subdomain": sub,
+					"domains":   []string{},
+					"deployment_configs": map[string]any{
+						"production": map[string]any{
+							"env_vars": map[string]any{
+								"DATA_HOST": map[string]any{"value": f.dataHost, "type": "plain_text"},
+							},
+						},
+					},
+				})
+				return
+			}
+			if len(seg) == 2 && r.Method == http.MethodDelete {
+				f.deleted = append(f.deleted, seg[1])
+				f.domainOps = append(f.domainOps, "delete:"+seg[1])
+				ok(nil)
+				return
+			}
+			// PATCH（配置变量 / KV 绑定）
+			if len(seg) == 2 && r.Method == http.MethodPatch {
+				var body map[string]any
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				f.patchCalls[seg[1]]++
+				f.patchBodies = append(f.patchBodies, body)
+				if dc, has := body["deployment_configs"].(map[string]any); has {
+					if prod, has2 := dc["production"].(map[string]any); has2 {
+						if env, has3 := prod["env_vars"].(map[string]any); has3 {
+							if dh, has4 := env["DATA_HOST"].(map[string]any); has4 {
+								f.dataHost = fmt.Sprint(dh["value"])
+							}
+						}
+					}
+				}
+				ok(nil)
+				return
+			}
+			// 创建项目
+			if strings.HasSuffix(path, "/pages/projects") && r.Method == http.MethodPost {
+				var body map[string]any
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				name := fmt.Sprint(body["name"])
+				f.created = append(f.created, name)
+				ok(map[string]any{
+					"id":        "pid-" + name,
+					"name":      name,
+					"subdomain": name + ".pages.dev",
+				})
+				return
+			}
+			// 列项目
+			if r.Method == http.MethodGet {
+				ok([]any{})
+				return
+			}
+		}
+
+		// ---- Workers 数据面 ----
+		//
+		// 记录 workers.dev 的生产/预览开关与自定义域名绑定，
+		// 用来验证「绑了自定义域名就必须关掉 workers.dev 链接」。
+		if strings.Contains(path, "/workers/") {
+			// 开关：POST .../workers/scripts/{name}/subdomain
+			if strings.HasSuffix(path, "/subdomain") && r.Method == http.MethodPost {
+				var body map[string]bool
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				name := strings.Split(strings.TrimSuffix(path, "/subdomain"), "/")[len(strings.Split(strings.TrimSuffix(path, "/subdomain"), "/"))-1]
+				f.subdomainSwitches[name] = body
+				ok(map[string]any{"enabled": body["enabled"], "previews_enabled": body["previews_enabled"]})
+				return
+			}
+			// 账号的 workers.dev 子域
+			if strings.HasSuffix(path, "/workers/subdomain") && r.Method == http.MethodGet {
+				ok(map[string]any{"subdomain": "acctsub"})
+				return
+			}
+			// 账号下的自定义域名绑定
+			if strings.HasSuffix(path, "/workers/domains") && r.Method == http.MethodGet {
+				out := make([]map[string]any, 0, len(f.workerDomains))
+				for _, d := range f.workerDomains {
+					out = append(out, map[string]any{
+						"id": d.service, "hostname": d.hostname, "service": d.service, "enabled": true,
+					})
+				}
+				ok(out)
+				return
+			}
+			// 上传脚本
+			if strings.Contains(path, "/workers/scripts/") && (r.Method == http.MethodPut || r.Method == http.MethodPost) {
+				ok(map[string]any{"id": "wid", "etag": "e"})
+				return
+			}
+			if strings.Contains(path, "/workers/scripts/") && r.Method == http.MethodGet {
+				ok(map[string]any{"id": "wid", "etag": "e"})
+				return
+			}
+			// 其它 Workers 端点
+			if r.Method == http.MethodGet {
+				ok([]any{})
+				return
+			}
+		}
+
+		t.Errorf("未处理的路由：%s %s", r.Method, path)
+		w.WriteHeader(http.StatusNotFound)
+	}
+}
+
+// newTestDeployer 用假 API 构造部署器。
+func newTestDeployer(t *testing.T, f *fakeCF, mutate func(*Options)) (*Deployer, *httptest.Server) {
+	t.Helper()
+	srv := httptest.NewServer(f.handler(t))
+	t.Cleanup(srv.Close)
+
+	opt := DefaultOptions()
+	opt.Token = "test-token"
+	opt.AccountID = "acc1"
+	opt.KVNamespaceID = "kv1"
+	opt.ControlScript = []byte("// control")
+	opt.DataScript = []byte("// data")
+	opt.APIBase = srv.URL
+	if mutate != nil {
+		mutate(&opt)
+	}
+
+	d := New(opt)
+	return d, srv
+}
+
+// ---------- 测试 ----------
+
+// 首次部署：两个项目都建、都配、都部署。
+func TestFirstDeploy(t *testing.T) {
+	f := newFakeCF()
+	d, _ := newTestDeployer(t, f, nil)
+
+	res, err := d.Run(context.Background())
+	if err != nil {
+		t.Fatalf("部署失败：%v", err)
+	}
+
+	if res.Control.Name == "" || res.Data.Name == "" {
+		t.Error("应生成两个项目名")
+	}
+	if len(f.created) != 2 {
+		t.Errorf("应创建 2 个项目，实际 %d（%v）", len(f.created), f.created)
+	}
+	if len(f.deployOrder) != 2 {
+		t.Errorf("应触发 2 次部署，实际 %d（%v）", len(f.deployOrder), f.deployOrder)
+	}
+	// 凭据都要生成
+	if res.UUID == "" || res.WSPath == "" || res.PanelPassword == "" || res.PanelPath == "" {
+		t.Error("首次部署应生成全部凭据")
+	}
+	if !strings.HasPrefix(res.WSPath, "/") {
+		t.Errorf("WS 路径应带前导斜杠，实际 %q", res.WSPath)
+	}
+}
+
+// 部署顺序：必须**先数据面，再控制面**（控制面的 DATA_HOST 要用数据面域名）。
+func TestDeployOrderDataBeforeControl(t *testing.T) {
+	f := newFakeCF()
+	d, _ := newTestDeployer(t, f, func(o *Options) {
+		o.ControlProject = "mycontrol"
+		o.DataProject = "mydata"
+	})
+
+	if _, err := d.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(f.deployOrder) < 2 {
+		t.Fatalf("应至少 2 次部署，实际 %v", f.deployOrder)
+	}
+	if f.deployOrder[0] != "mydata" {
+		t.Errorf("第一次部署应为数据面，实际 %q（顺序：%v）", f.deployOrder[0], f.deployOrder)
+	}
+	if f.deployOrder[1] != "mycontrol" {
+		t.Errorf("第二次部署应为控制面，实际 %q（顺序：%v）", f.deployOrder[1], f.deployOrder)
+	}
+}
+
+// ⚠️ **每个项目只能 PATCH 一次**。
+//
+// `PATCH /pages/projects/{name}` 会**自动触发一次部署**。
+// 环境变量与 KV 绑定如果分两次 PATCH，就是两次隐式发布；
+// 一次部署动作的发布次数会从「1 隐式 + 1 显式 = 2」涨到「2 隐式 + 1 显式 = 3」，
+// 命中 8000119 换名重试时更会成倍放大 —— 账号级风控画像累积得更快。
+//
+// 所以两个字段必须**合并进同一个 PATCH**。
+func TestConfigurePagesSinglePatch(t *testing.T) {
+	f := newFakeCF()
+	d, _ := newTestDeployer(t, f, func(o *Options) {
+		o.ControlProject = "mycontrol"
+		o.DataProject = "mydata"
+	})
+
+	if _, err := d.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, name := range []string{"mycontrol", "mydata"} {
+		if n := f.patchCalls[name]; n != 1 {
+			t.Errorf("项目 %s 的 PATCH 应恰好 1 次，实际 %d 次（每次 PATCH 都会触发一次隐式部署）", name, n)
+		}
+	}
+
+	// 一次 PATCH 必须**同时**带 env_vars 与 kv_namespaces
+	if len(f.patchBodies) == 0 {
+		t.Fatal("应有 PATCH 请求")
+	}
+	for i, body := range f.patchBodies {
+		dc, ok := body["deployment_configs"].(map[string]any)
+		if !ok {
+			t.Fatalf("第 %d 次 PATCH 缺少 deployment_configs", i)
+		}
+		prod, ok := dc["production"].(map[string]any)
+		if !ok {
+			t.Fatalf("第 %d 次 PATCH 缺少 production", i)
+		}
+		if _, has := prod["env_vars"]; !has {
+			t.Errorf("第 %d 次 PATCH 缺少 env_vars", i)
+		}
+		kvs, ok := prod["kv_namespaces"].(map[string]any)
+		if !ok {
+			t.Fatalf("第 %d 次 PATCH 缺少 kv_namespaces", i)
+		}
+		for _, bind := range []string{"KV", "K"} {
+			if _, has := kvs[bind]; !has {
+				t.Errorf("第 %d 次 PATCH 的 kv_namespaces 缺少绑定 %q", i, bind)
+			}
+		}
+	}
+}
+
+// 写 KV 必须用大写 CONFIG，绝不能写小写 config。
+func TestWritesUppercaseConfigKey(t *testing.T) {
+	f := newFakeCF()
+	d, _ := newTestDeployer(t, f, nil)
+
+	if _, err := d.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, has := f.kvWrites["CONFIG"]; !has {
+		t.Error("必须写入大写 CONFIG 键")
+	}
+	if _, has := f.kvWrites["config"]; has {
+		t.Error("绝不能写入小写 config 键（那是旧版第三方实现的，会覆盖共栖项目配置）")
+	}
+
+	// CONFIG 里要有 UUID 与 WS 路径
+	var cfg map[string]any
+	if err := json.Unmarshal([]byte(f.kvWrites["CONFIG"]), &cfg); err != nil {
+		t.Fatalf("CONFIG 不是合法 JSON：%v", err)
+	}
+	for _, k := range []string{"uuid", "wsPath", "trojanPassword"} {
+		if _, has := cfg[k]; !has {
+			t.Errorf("CONFIG 缺少 %s", k)
+		}
+	}
+}
+
+// 清单里 build 必须是真实版本号，不是 "unknown"。
+func TestManifestBuildNotUnknown(t *testing.T) {
+	f := newFakeCF()
+	d, _ := newTestDeployer(t, f, func(o *Options) {
+		o.LocalBuild = "" // 故意留空（读不到版本号）
+	})
+
+	if _, err := d.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	raw := f.kvWrites["CFP_DEPLOY_MANIFEST"]
+	if raw == "" {
+		t.Fatal("应写入部署清单")
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["build"] == "unknown" {
+		t.Error("读不到版本号时应写空串，绝不能写 \"unknown\"")
+	}
+	if m["build"] != "" {
+		t.Errorf("build 应为空串，实际 %v", m["build"])
+	}
+}
+
+// 清单里要记「本次实际部署的内核版本」（semver）。
+//
+// ⚠️ 它与 build 指纹是**两回事**，两个字段都要写：
+//   - build        构建指纹（`<hash>-<hash>`），精确但比不出新旧
+//   - kernelVersion semver（如 "0.7.6"），能判断「谁更新」
+func TestManifestRecordsKernelVersion(t *testing.T) {
+	f := newFakeCF()
+	d, _ := newTestDeployer(t, f, func(o *Options) {
+		o.LocalBuild = "abc1234-deadbeef"
+		o.LocalKernelVersion = "0.7.6"
+	})
+
+	if _, err := d.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	raw := f.kvWrites["CFP_DEPLOY_MANIFEST"]
+	if raw == "" {
+		t.Fatal("应写入部署清单")
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["kernelVersion"] != "0.7.6" {
+		t.Errorf("清单里的 kernelVersion 应是 0.7.6，实际 %v", m["kernelVersion"])
+	}
+	// build 指纹必须保留（两个字段语义不同）
+	if m["build"] != "abc1234-deadbeef" {
+		t.Errorf("清单里的 build 应保留，实际 %v", m["build"])
+	}
+}
+
+// 读不到内核版本时写空串（绝不写 "unknown"）。
+func TestManifestKernelVersionNotUnknown(t *testing.T) {
+	f := newFakeCF()
+	d, _ := newTestDeployer(t, f, func(o *Options) {
+		o.LocalKernelVersion = "" // 故意留空
+	})
+
+	if _, err := d.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	raw := f.kvWrites["CFP_DEPLOY_MANIFEST"]
+	var m map[string]any
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["kernelVersion"] == "unknown" {
+		t.Error("读不到内核版本时应写空串，绝不能写 \"unknown\"")
+	}
+	if m["kernelVersion"] != "" {
+		t.Errorf("kernelVersion 应为空串，实际 %v", m["kernelVersion"])
+	}
+}
+
+// 旧清单没有 kernelVersion 字段 → 读出来是空串（视为「版本未知」）。
+func TestReadLegacyManifestWithoutKernelVersion(t *testing.T) {
+	f := newFakeCF()
+	f.kvSeed["CFP_DEPLOY_MANIFEST"] = `{
+		"v": 1,
+		"controlProject": "mycontrol",
+		"dataProject": "mydata",
+		"build": "old-build",
+		"at": "2026-10-20T00:00:00.000Z",
+		"credentials": {}
+	}`
+
+	d, _ := newTestDeployer(t, f, func(o *Options) {
+		o.ControlProject = "mycontrol"
+		o.DataProject = "mydata"
+	})
+
+	m, err := d.readManifest(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m == nil {
+		t.Fatal("应读到清单")
+	}
+	if m.KernelVersion != "" {
+		t.Errorf("旧清单的 kernelVersion 应为空串（版本未知），实际 %q", m.KernelVersion)
+	}
+	// build 指纹照旧能读到
+	if m.Build != "old-build" {
+		t.Errorf("build 应为 old-build，实际 %q", m.Build)
+	}
+}
+
+// KV 归属校验：清单属于别的实例时要拒绝部署。
+//
+// ⚠️ 必须是 **fresh 模式**才能触发 occupied：
+//
+// 更新模式（auto / update）会**复用清单里的项目名**（对照 CLI 的
+// deployPagesSplit：「同源项目名：有清单就按清单来」），
+// 因此同一个实例的原地更新判为 owned，不会被误拒。
+// occupied 只在「本次要用的项目名 ≠ 清单里的项目名」时出现 ——
+// 也就是全新部署复用了一个已存在的 KV。
+func TestOwnershipConflictRejected(t *testing.T) {
+	f := newFakeCF()
+	f.kvSeed["CFP_DEPLOY_MANIFEST"] = `{
+		"v": 1,
+		"controlProject": "someone-elses-project",
+		"dataProject": "other-data",
+		"credentials": {}
+	}`
+
+	d, _ := newTestDeployer(t, f, func(o *Options) {
+		o.Mode = "fresh"
+		o.ControlProject = "mycontrol"
+		o.DataProject = "mydata"
+	})
+
+	_, err := d.Run(context.Background())
+	if err == nil {
+		t.Fatal("归属冲突必须中止部署")
+	}
+	// 文案与 Electron 版对齐：说明「已被另一个实例占用」
+	if !strings.Contains(err.Error(), "已被另一个 CFPilot 实例占用") {
+		t.Errorf("错误信息应说明被另一实例占用，实际：%v", err)
+	}
+	// 关键：不能创建任何项目
+	if len(f.created) != 0 {
+		t.Errorf("归属冲突时不该创建项目，实际创建了 %v", f.created)
+	}
+	if len(f.kvWrites) != 0 {
+		t.Errorf("归属冲突时不该写任何 KV，实际写了 %v", keysOf(f.kvWrites))
+	}
+}
+
+// Force 可以跳过 occupied（另一实例占用）。
+func TestOwnershipForceSkips(t *testing.T) {
+	f := newFakeCF()
+	f.kvSeed["CFP_DEPLOY_MANIFEST"] = `{"v":1,"controlProject":"other","dataProject":"otherdata","credentials":{}}`
+
+	d, _ := newTestDeployer(t, f, func(o *Options) {
+		o.Mode = "fresh"
+		o.ControlProject = "mycontrol"
+		o.DataProject = "mydata"
+		o.Force = true
+	})
+
+	if _, err := d.Run(context.Background()); err != nil {
+		t.Fatalf("Force 时应允许部署：%v", err)
+	}
+}
+
+// KV 里有旧版第三方实现的小写 config 键 → 硬阻断。
+//
+// CFPilot 是纯自研数据面，不与旧版第三方实现共用 KV。
+func TestOwnershipForeignBlocked(t *testing.T) {
+	f := newFakeCF()
+	f.kvSeed["config"] = `{"uuid":"third-party-uuid"}`
+
+	d, _ := newTestDeployer(t, f, func(o *Options) {
+		o.ControlProject = "mycontrol"
+		o.DataProject = "mydata"
+	})
+
+	_, err := d.Run(context.Background())
+	if err == nil {
+		t.Fatal("含旧版第三方实现的 config 键时必须阻断")
+	}
+	if !strings.Contains(err.Error(), "第三方") {
+		t.Errorf("错误信息应提到第三方实现，实际：%v", err)
+	}
+	if !strings.Contains(err.Error(), "独立的 KV") {
+		t.Errorf("错误信息应指导新建独立 KV，实际：%v", err)
+	}
+	// 不能创建任何项目、不能写任何 KV
+	if len(f.created) != 0 {
+		t.Errorf("阻断时不该创建项目，实际 %v", f.created)
+	}
+	if len(f.kvWrites) != 0 {
+		t.Errorf("阻断时不该写 KV，实际 %v", keysOf(f.kvWrites))
+	}
+}
+
+// foreign 是硬约束：连 Force 也不放行。
+func TestOwnershipForeignIgnoresForce(t *testing.T) {
+	f := newFakeCF()
+	f.kvSeed["config"] = `{"uuid":"third-party-uuid"}`
+
+	d, _ := newTestDeployer(t, f, func(o *Options) {
+		o.ControlProject = "mycontrol"
+		o.DataProject = "mydata"
+		o.Force = true // 即使强制也不行
+	})
+
+	_, err := d.Run(context.Background())
+	if err == nil {
+		t.Fatal("foreign 判定下 Force 也不能绕过")
+	}
+	if !strings.Contains(err.Error(), "第三方") {
+		t.Errorf("错误信息应提到第三方实现，实际：%v", err)
+	}
+	if len(f.created) != 0 {
+		t.Errorf("不该创建项目，实际 %v", f.created)
+	}
+}
+
+// KV 里有大写 CONFIG 但无清单 → stale，默认阻断。
+func TestOwnershipStaleBlocked(t *testing.T) {
+	f := newFakeCF()
+	f.kvSeed["CONFIG"] = `{"uuid":"residual-uuid"}`
+
+	d, _ := newTestDeployer(t, f, func(o *Options) {
+		o.ControlProject = "mycontrol"
+		o.DataProject = "mydata"
+	})
+
+	_, err := d.Run(context.Background())
+	if err == nil {
+		t.Fatal("含残留 CONFIG 但无清单时必须阻断")
+	}
+	if !strings.Contains(err.Error(), "残留配置") {
+		t.Errorf("错误信息应说明是残留配置，实际：%v", err)
+	}
+	if len(f.created) != 0 {
+		t.Errorf("阻断时不该创建项目，实际 %v", f.created)
+	}
+}
+
+// stale 可以用 Force 接管（与 Electron 版一致）。
+func TestOwnershipStaleAllowsForce(t *testing.T) {
+	f := newFakeCF()
+	f.kvSeed["CONFIG"] = `{"uuid":"residual-uuid"}`
+
+	d, _ := newTestDeployer(t, f, func(o *Options) {
+		o.ControlProject = "mycontrol"
+		o.DataProject = "mydata"
+		o.Force = true
+		o.WaitTimeout = 2 * time.Second
+		o.WaitInterval = 10 * time.Millisecond
+	})
+
+	if _, err := d.Run(context.Background()); err != nil {
+		t.Fatalf("Force 时应允许接管残留配置：%v", err)
+	}
+}
+
+// 空 KV → empty，正常部署。
+func TestOwnershipEmptyPasses(t *testing.T) {
+	f := newFakeCF()
+
+	d, _ := newTestDeployer(t, f, func(o *Options) {
+		o.ControlProject = "mycontrol"
+		o.DataProject = "mydata"
+		o.WaitTimeout = 2 * time.Second
+		o.WaitInterval = 10 * time.Millisecond
+	})
+
+	verdict, detail := d.inspectKvOwnership(context.Background(), nil, "mycontrol")
+	if verdict != OwnEmpty {
+		t.Errorf("空 KV 应判定 empty，实际 %s（%s）", verdict, detail)
+	}
+}
+
+// 回归测试（B2）：清单里 controlProject=X、用户输入为空（→ 随机名）时，
+// fresh 模式必须判为 **occupied** 而不是 owned。
+//
+// ## 这个 bug 的实际后果
+//
+// 账户 A 已在 KV1 部署了现役实例（清单里 controlProject=X），
+// GUI 又选「全新部署」且 KV 下拉框仍是 KV1：
+// 归属校验因「用户输入为空 ⇒ 认领」被放行 → 用**全新**的
+// UUID / WS 路径 / 面板密码覆盖 KV1 的 CFP_DEPLOY_MANIFEST 与 CONFIG
+// → 老实例的客户端节点全部失效，一个 KV 挂着两套 Pages 项目。
+//
+// ## 与 CLI 的对齐
+//
+// CLI 的 deployPagesSplit 先把控制面项目名补成随机名，**再**做归属校验，
+// 比对用的是「即将实际使用的项目名」，因此这里必须是 occupied。
+func TestOwnershipFreshRandomNameIsOccupied(t *testing.T) {
+	f := newFakeCF()
+	f.kvSeed["CFP_DEPLOY_MANIFEST"] = `{
+		"v": 1,
+		"kvNamespaceId": "kv1",
+		"controlProject": "existing-control",
+		"dataProject": "existing-data",
+		"controlSubdomain": "existing-control.pages.dev",
+		"dataSubdomain": "existing-data.pages.dev",
+		"build": "old-build",
+		"at": "2026-10-20T00:00:00.000Z",
+		"credentials": {"uuid":"OLD-UUID","wsPath":"/old-ws","panelPath":"/old-panel","panelPassword":"OLD-PW","trojanPassword":"OLD-TP"}
+	}`
+
+	// 关键：用户**没有**填项目名（GUI 的项目名框是可选的，默认空）
+	d, _ := newTestDeployer(t, f, func(o *Options) {
+		o.Mode = "fresh"
+		o.ControlProject = "" // 留空 → 走随机名兜底
+		o.DataProject = ""
+		o.WaitTimeout = 2 * time.Second
+		o.WaitInterval = 10 * time.Millisecond
+	})
+
+	_, err := d.Run(context.Background())
+	if err == nil {
+		t.Fatal("全新部署复用已存在的 KV 时必须判为 occupied，不能当成 owned 放行")
+	}
+	if !strings.Contains(err.Error(), "已被另一个 CFPilot 实例占用") {
+		t.Errorf("错误信息应说明被另一实例占用，实际：%v", err)
+	}
+
+	// ⚠️ 关键：绝不能覆盖现役实例的清单与配置
+	if _, has := f.kvWrites["CFP_DEPLOY_MANIFEST"]; has {
+		t.Error("归属冲突时绝不能写回部署清单（会把现役实例的身份改掉）")
+	}
+	if _, has := f.kvWrites["CONFIG"]; has {
+		t.Error("归属冲突时绝不能写 CONFIG（会把现役实例的 UUID / WS 路径改掉）")
+	}
+	if len(f.created) != 0 {
+		t.Errorf("归属冲突时不该创建项目，实际创建了 %v", f.created)
+	}
+}
+
+// 反向保证：更新已有实例（auto 模式）**不能**被误判成 occupied。
+//
+// 更新模式会复用清单里的项目名（对照 CLI），
+// 因此归属校验必须判为 owned，部署才能正常进行。
+func TestOwnershipAutoModeReusesManifestProject(t *testing.T) {
+	f := newFakeCF()
+	f.kvSeed["CFP_DEPLOY_MANIFEST"] = `{
+		"v": 1,
+		"controlProject": "existing-control",
+		"dataProject": "existing-data",
+		"build": "old-build",
+		"at": "2026-10-20T00:00:00.000Z",
+		"credentials": {"uuid":"KEEP-UUID","wsPath":"/keep-ws","panelPath":"/keep-panel","panelPassword":"KEEP-PW","trojanPassword":"KEEP-TP"}
+	}`
+
+	// 用户没填项目名（可选框留空）→ 必须复用清单里的，而不是随机名
+	d, _ := newTestDeployer(t, f, func(o *Options) {
+		o.Mode = "auto"
+		o.ControlProject = ""
+		o.DataProject = ""
+		o.LocalBuild = "new-build"
+		o.WaitTimeout = 2 * time.Second
+		o.WaitInterval = 10 * time.Millisecond
+	})
+
+	res, err := d.Run(context.Background())
+	if err != nil {
+		t.Fatalf("更新已有实例不该被拒：%v", err)
+	}
+	if res.Control.Name != "existing-control" {
+		t.Errorf("更新时应复用清单里的控制面项目名，实际 %q", res.Control.Name)
+	}
+	if res.Data.Name != "existing-data" {
+		t.Errorf("更新时应复用清单里的数据面项目名，实际 %q", res.Data.Name)
+	}
+	// 凭据也必须沿用（客户端订阅地址不变）
+	if res.UUID != "KEEP-UUID" {
+		t.Errorf("应沿用清单里的 UUID，实际 %q", res.UUID)
+	}
+}
+
+// 回归测试（B7）：已有 CONFIG 里的字段在部署后**仍然存在**。
+//
+// 之前 writeEffectiveConfig 是整体覆盖，用户在面板里配过的
+// poolManual / poolOfficial / proxyIp / relayPool … 会被一次部署全部抹掉。
+//
+// 对照 CLI 的 writeEffectiveConfig：`{ ...existing, uuid, ... }`。
+func TestConfigMergeKeepsExistingFields(t *testing.T) {
+	f := newFakeCF()
+	// 本实例的清单（归属校验要判 owned 才能走到写配置这一步）
+	f.kvSeed["CFP_DEPLOY_MANIFEST"] = `{
+		"v": 1,
+		"kvNamespaceId": "kv1",
+		"controlProject": "mycontrol",
+		"dataProject": "mydata",
+		"build": "old-build",
+		"at": "2026-10-20T00:00:00.000Z",
+		"credentials": {"uuid":"OLD-UUID","trojanPassword":"OLD-TP","wsPath":"/old-ws","panelPath":"/old-panel","panelPassword":"OLD-PW"}
+	}`
+	// 面板里配过的内容（用户自己在面板保存的）
+	f.kvSeed["CONFIG"] = `{
+		"uuid": "OLD-UUID",
+		"trojanPassword": "OLD-TP",
+		"wsPath": "/old-ws",
+		"poolManual": "1.2.3.4",
+		"poolOfficial": ["5.6.7.8", "9.10.11.12"],
+		"proxyIp": "proxy.example.com",
+		"socks5": "socks.example.com:1080",
+		"relayPool": "https://relay.example.com",
+		"subDomain": "my.example.com",
+		"resolvePreferred": false,
+		"someUserField": {"nested": true}
+	}`
+
+	d, _ := newTestDeployer(t, f, func(o *Options) {
+		o.ControlProject = "mycontrol"
+		o.DataProject = "mydata"
+		o.WaitTimeout = 2 * time.Second
+		o.WaitInterval = 10 * time.Millisecond
+	})
+
+	res, err := d.Run(context.Background())
+	if err != nil {
+		t.Fatalf("部署失败：%v", err)
+	}
+
+	raw := f.kvWrites["CONFIG"]
+	if raw == "" {
+		t.Fatal("必须写入 CONFIG")
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatalf("CONFIG 不是合法 JSON：%v", err)
+	}
+
+	// 用户配过的字段必须还在
+	for _, k := range []string{
+		"poolManual", "poolOfficial", "proxyIp", "socks5",
+		"relayPool", "subDomain", "resolvePreferred", "someUserField",
+	} {
+		if _, has := cfg[k]; !has {
+			t.Errorf("CONFIG 里的 %s 被抹掉了（整体覆盖回归）", k)
+		}
+	}
+	if cfg["poolManual"] != "1.2.3.4" {
+		t.Errorf("poolManual 的值应保持不变，实际 %v", cfg["poolManual"])
+	}
+
+	// 凭据类字段必须被本次部署的值覆盖
+	if cfg["uuid"] != res.UUID {
+		t.Errorf("uuid 应为本次部署的 %q，实际 %v", res.UUID, cfg["uuid"])
+	}
+	if cfg["wsPath"] != res.WSPath {
+		t.Errorf("wsPath 应为本次部署的 %q，实际 %v", res.WSPath, cfg["wsPath"])
+	}
+}
+
+// enableTrojan / enableXhttp 必须与 CLI 一致
+// （CLI 的 deploy/command.ts 固定传 enableTrojan: true / enableXhttp: true）。
+//
+// 之前 Go 侧是零值 false —— Trojan 被强制关闭，
+// GUI 部署出来的实例与 CLI 部署出来的行为不同。
+//
+// XHTTP 自 2026-10-28 起也默认 true（用户要求「默认开启，面板控制」）。
+func TestConfigTrojanMatchesCLI(t *testing.T) {
+	f := newFakeCF()
+	d, _ := newTestDeployer(t, f, nil)
+
+	if _, err := d.Run(context.Background()); err != nil {
+		t.Fatalf("部署失败：%v", err)
+	}
+
+	var cfg map[string]any
+	if err := json.Unmarshal([]byte(f.kvWrites["CONFIG"]), &cfg); err != nil {
+		t.Fatalf("CONFIG 不是合法 JSON：%v", err)
+	}
+	if cfg["enableTrojan"] != true {
+		t.Errorf("enableTrojan 应为 true（与 CLI 一致），实际 %v", cfg["enableTrojan"])
+	}
+	if cfg["enableXhttp"] != true {
+		t.Errorf("enableXhttp 应为 true（与 CLI 一致，面板可关），实际 %v", cfg["enableXhttp"])
+	}
+}
+
+// 8000119：**一次失败就停** —— 不重试、不换名重建。
+//
+// ⚠️ 这是账号级封禁的直接原因：旧实现是「同名重试 3 次 → 换随机名再来」，
+// 一次部署最坏打出 9 次部署请求 + 6 个新项目。
+// 而 Cloudflare 的风控画像按发布事件累积 —— 写的还是同一份被标记的代码，
+// 等于把画像坐实。用户已反馈连续部署导致账号被封。
+func TestDeployStopsOnFirstFailure(t *testing.T) {
+	f := newFakeCF()
+	// 原名永远失败
+	f.deployFailPlan["mydata"] = 999
+
+	d, _ := newTestDeployer(t, f, func(o *Options) {
+		o.DataProject = "mydata"
+		o.ControlProject = "mycontrol"
+		o.WaitTimeout = 2 * time.Second
+		o.WaitInterval = 10 * time.Millisecond
+	})
+
+	if _, err := d.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// ⚠️ 只该尝试 1 次
+	if f.deployCalls["mydata"] != 1 {
+		t.Errorf("失败后应立即停止，实际尝试 %d 次", f.deployCalls["mydata"])
+	}
+	// ⚠️ 不该出现换名项目
+	for name := range f.deployCalls {
+		if strings.HasPrefix(name, "mydata-") {
+			t.Errorf("失败后不该换名重建，却出现了 %q", name)
+		}
+	}
+	// ⚠️ 控制面也不该继续部署（数据面失败即整个部署中止）
+	if f.deployCalls["mycontrol"] != 0 {
+		t.Errorf("数据面失败后不应继续部署控制面，实际 %d 次", f.deployCalls["mycontrol"])
+	}
+}
+
+// 部署成功时项目名保持不变，也不会有换名项目。
+func TestDeploySucceedsOnPreferredName(t *testing.T) {
+	f := newFakeCF()
+
+	d, _ := newTestDeployer(t, f, func(o *Options) {
+		o.DataProject = "mydata"
+		o.ControlProject = "mycontrol"
+		o.WaitTimeout = 2 * time.Second
+		o.WaitInterval = 10 * time.Millisecond
+	})
+
+	res, err := d.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if f.deployCalls["mydata"] != 1 {
+		t.Errorf("应只尝试 1 次，实际 %d 次", f.deployCalls["mydata"])
+	}
+	// 不该产生换名项目
+	for name := range f.deployCalls {
+		if strings.HasPrefix(name, "mydata-") {
+			t.Errorf("部署成功时不该换名，却出现了 %q", name)
+		}
+	}
+	if res.Data.Name != "mydata" {
+		t.Errorf("数据面名应保持 mydata，实际 %q", res.Data.Name)
+	}
+}
+
+// 更新部署沿用清单里的项目名 —— 用户的自定义域名因此**不用动**。
+//
+// ⚠️ 旧实现里项目名可能变（8000119 换名重建），于是需要「解绑旧域名 →
+//
+//	绑新域名 → 删旧项目」这套迁移。换名机制取消后，更新部署是**原地**的，
+//	域名跟着项目走，什么都不用迁 —— 也就少了一堆可能失败的操作。
+func TestDeployKeepsProjectNameAndDomain(t *testing.T) {
+	f := newFakeCF()
+	f.kvSeed["CFP_DEPLOY_MANIFEST"] = `{
+		"v": 1,
+		"kvNamespaceId": "kv1",
+		"controlProject": "mycontrol",
+		"dataProject": "olddata",
+		"controlSubdomain": "mycontrol.pages.dev",
+		"dataSubdomain": "olddata.pages.dev",
+		"dataCustomDomain": "cf.example.com",
+		"build": "old-build",
+		"at": "2026-10-20T00:00:00.000Z",
+		"credentials": {"uuid":"u","wsPath":"/ws","panelPath":"p","panelPassword":"pw","trojanPassword":"tp"}
+	}`
+
+	d, _ := newTestDeployer(t, f, func(o *Options) {
+		o.ControlProject = "mycontrol"
+		o.DataProject = "olddata"
+		o.LocalBuild = "new-build"
+		o.WaitTimeout = 2 * time.Second
+		o.WaitInterval = 10 * time.Millisecond
+	})
+
+	res, err := d.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 项目名沿用清单里的
+	if res.Data.Name != "olddata" {
+		t.Errorf("更新部署应沿用清单里的项目名 olddata，实际 %q", res.Data.Name)
+	}
+	// ⚠️ 域名不该被动（项目没换名，域名就跟着走）
+	for _, op := range f.domainOps {
+		if strings.HasPrefix(op, "unbind:") || strings.HasPrefix(op, "delete:") {
+			t.Errorf("项目名没变时不该动域名/删项目，实际操作：%v", f.domainOps)
+			break
+		}
+	}
+	// 旧项目也不能被删
+	for _, op := range f.domainOps {
+		if op == "delete:olddata" {
+			t.Errorf("旧项目不该被删除，实际操作：%v", f.domainOps)
+			break
+		}
+	}
+}
+
+func TestSkipSameVersion(t *testing.T) {
+	f := newFakeCF()
+	f.kvSeed["CFP_DEPLOY_MANIFEST"] = `{
+		"v": 1,
+		"controlProject": "mycontrol",
+		"dataProject": "mydata",
+		"controlSubdomain": "mycontrol.pages.dev",
+		"dataSubdomain": "mydata.pages.dev",
+		"build": "same-build",
+		"at": "2026-10-20T00:00:00.000Z",
+		"credentials": {"uuid":"u","wsPath":"/ws","panelPath":"p","panelPassword":"pw","trojanPassword":"tp"}
+	}`
+
+	d, _ := newTestDeployer(t, f, func(o *Options) {
+		o.ControlProject = "mycontrol"
+		o.DataProject = "mydata"
+		o.LocalBuild = "same-build"
+	})
+
+	res, err := d.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !res.Skipped {
+		t.Error("同版本应跳过部署")
+	}
+	if len(f.deployOrder) != 0 {
+		t.Errorf("同版本不该触发部署，实际 %v", f.deployOrder)
+	}
+	// 凭据要沿用清单里的
+	if res.UUID != "u" {
+		t.Errorf("应沿用清单里的 UUID，实际 %q", res.UUID)
+	}
+	if res.WSPath != "/ws" {
+		t.Errorf("应沿用清单里的 WS 路径，实际 %q", res.WSPath)
+	}
+}
+
+// 更新模式：沿用清单里的凭据（客户端订阅地址不变）。
+func TestUpdateKeepsCredentials(t *testing.T) {
+	f := newFakeCF()
+	f.kvSeed["CFP_DEPLOY_MANIFEST"] = `{
+		"v": 1,
+		"controlProject": "mycontrol",
+		"dataProject": "mydata",
+		"controlSubdomain": "mycontrol.pages.dev",
+		"dataSubdomain": "mydata.pages.dev",
+		"build": "old-build",
+		"at": "2026-10-20T00:00:00.000Z",
+		"credentials": {"uuid":"KEEP-UUID","wsPath":"/keep-ws","panelPath":"keep-panel","panelPassword":"KEEP-PW","trojanPassword":"KEEP-TP"}
+	}`
+
+	d, _ := newTestDeployer(t, f, func(o *Options) {
+		o.ControlProject = "mycontrol"
+		o.DataProject = "mydata"
+		o.LocalBuild = "new-build"
+		o.WaitTimeout = 2 * time.Second
+		o.WaitInterval = 10 * time.Millisecond
+	})
+
+	res, err := d.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if res.UUID != "KEEP-UUID" {
+		t.Errorf("应沿用 UUID，实际 %q", res.UUID)
+	}
+	if res.WSPath != "/keep-ws" {
+		t.Errorf("应沿用 WS 路径，实际 %q", res.WSPath)
+	}
+	if res.PanelPassword != "KEEP-PW" {
+		t.Errorf("应沿用小写面板密码，实际 %q", res.PanelPassword)
+	}
+
+	// 写回 KV 的 CONFIG 也必须是沿用值
+	var cfg map[string]any
+	_ = json.Unmarshal([]byte(f.kvWrites["CONFIG"]), &cfg)
+	if cfg["uuid"] != "KEEP-UUID" {
+		t.Errorf("CONFIG 里的 uuid 应为沿用值，实际 %v", cfg["uuid"])
+	}
+}
+
+// 参数校验。
+func TestValidate(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*Options)
+		want   string
+	}{
+		{"缺 Token", func(o *Options) { o.Token = "" }, "Token"},
+		{"缺账号", func(o *Options) { o.AccountID = "" }, "账号"},
+		{"缺 KV", func(o *Options) { o.KVNamespaceID = "" }, "KV"},
+		{"缺控制面产物", func(o *Options) { o.ControlScript = nil }, "控制面"},
+		{"缺数据面产物", func(o *Options) { o.DataScript = nil }, "数据面"},
+	}
+	for _, tc := range cases {
+		f := newFakeCF()
+		d, _ := newTestDeployer(t, f, tc.mutate)
+		_, err := d.Run(context.Background())
+		if err == nil {
+			t.Errorf("%s：应报错", tc.name)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s：错误信息应含 %q，实际 %v", tc.name, tc.want, err)
+		}
+	}
+}
+
+// 空脚本不该发起部署。
+func TestEmptyScriptSkipsDeploy(t *testing.T) {
+	f := newFakeCF()
+	d, _ := newTestDeployer(t, f, func(o *Options) {
+		o.DataScript = nil
+		o.WaitTimeout = time.Second
+	})
+	// 直接调内部方法验证
+	d2 := d
+	d2.opt.DataScript = nil
+	res := d2.deployOnce(context.Background(), deployAttemptParams{
+		preferredName: "x",
+		code:          nil,
+		label:         "数据面",
+	})
+	if res != nil {
+		t.Error("空脚本应返回 nil")
+	}
+	if len(f.deployOrder) != 0 {
+		t.Error("空脚本不该发起部署")
+	}
+}
+
+// ---------- 辅助 ----------
+
+func keysOf(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+func keysOfInt(m map[string]int) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, fmt.Sprintf("%s(%d)", k, m[k]))
+	}
+	return out
+}
+
+var _ = errors.New
+
+// TestMigrateLegacyResourceDefaults 守护「旧默认 → 新默认」的迁移语义。
+//
+// 对照 CLI 的 deploy-legacy-migration.test.ts：迁移只认**恰好等于旧默认值**
+// 的项，键不存在 / 用户改过 / 非法值都不动 —— 否则会把用户刻意的设置改掉。
+func TestMigrateLegacyResourceDefaults(t *testing.T) {
+	cfg, applied := migrateLegacyResourceDefaults(map[string]any{
+		"uuid":           "keep-me",
+		"dataBudgetMB":   float64(0),
+		"relayRedialMax": float64(4),
+	})
+	if got := cfg["dataBudgetMB"]; got != float64(512) {
+		t.Errorf("dataBudgetMB 应升级为 512，实际 %v", got)
+	}
+	if got := cfg["relayRedialMax"]; got != float64(2) {
+		t.Errorf("relayRedialMax 应升级为 2，实际 %v", got)
+	}
+	if cfg["uuid"] != "keep-me" {
+		t.Errorf("其余字段必须原样保留，实际 %v", cfg["uuid"])
+	}
+	if len(applied) != 2 {
+		t.Errorf("应记录 2 项升级，实际 %v", applied)
+	}
+
+	// 键不存在：不写进 KV（写进去会把内核新默认钉死）
+	cfg, applied = migrateLegacyResourceDefaults(map[string]any{"uuid": "x"})
+	if _, ok := cfg["dataBudgetMB"]; ok {
+		t.Error("缺省键不应被写入")
+	}
+	if len(applied) != 0 {
+		t.Errorf("缺省键不应产生升级记录，实际 %v", applied)
+	}
+
+	// 用户改过的值必须尊重
+	cfg, applied = migrateLegacyResourceDefaults(map[string]any{
+		"dataBudgetMB":   float64(1024),
+		"relayRedialMax": float64(3),
+	})
+	if cfg["dataBudgetMB"] != float64(1024) || cfg["relayRedialMax"] != float64(3) {
+		t.Errorf("用户设置被覆盖：%v", cfg)
+	}
+	if len(applied) != 0 {
+		t.Errorf("不应产生升级记录，实际 %v", applied)
+	}
+
+	// KV 里存成字符串数字时同样识别
+	cfg, _ = migrateLegacyResourceDefaults(map[string]any{
+		"dataBudgetMB":   "0",
+		"relayRedialMax": "4",
+	})
+	if cfg["dataBudgetMB"] != float64(512) || cfg["relayRedialMax"] != float64(2) {
+		t.Errorf("字符串数字未迁移：%v", cfg)
+	}
+}
