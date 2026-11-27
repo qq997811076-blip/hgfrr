@@ -1612,7 +1612,7 @@
         <span class="app-version" id="appVersion" title="本程序版本"></span>
       </div>
       <div class="brand">
-        
+        <h1>Edgetunnel 部署</h1>
         <p class="sub">Cloudflare部署 · 本地优选 · 异地组网</p>
       </div>
       <div class="spacer"></div>
@@ -1753,7 +1753,6 @@
               · Developer Platform / Pages / <b>Edit</b> —— 建/删 Pages 项目、上传内核、绑 KV、配环境变量<br>
               <b>可选</b><br>
               · Account & Billing / Account API Tokens / <b>Read</b> —— 仅用于显示 Token 有效期<br>
-              · Analytics & Logs / Account Analytics / <b>Read</b> —— 仅用于「用量/额度」面板（查已用量）<br>
 
               </div>
             </div>
@@ -1767,9 +1766,6 @@
 
             这里只展示**本地可确证**的运行信息（服务状态、环境干扰、本机部署记录）。
 
-            账号级用量另放在凭据页的「用量/额度」弹窗：
-            平台侧计量要走 GraphQL 分析接口（需要 Account Analytics Read 权限），
-            与本页的本地信息不是一回事，所以不混在一起。
           -->
           <div class="card">
             <h2><span class="dot"></span>📈 运行状态</h2>
@@ -1916,7 +1912,7 @@
               <div class="fold-body">
                 <div class="field">
                   <label>EdgeTunnel 项目名</label>
-                  
+                  <input type="text" id="dataProject" placeholder="留空 = 随机字母" />
                   <p class="tip">EdgeTunnel Worker / Pages 项目的名称</p>
                 </div>
 
