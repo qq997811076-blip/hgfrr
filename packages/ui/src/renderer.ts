@@ -586,24 +586,7 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
   }
 
   /**
-   * 切换账户后清空上一账户的所有上下文，避免误操作。
-   *
-   * ## ⚠️ 必须连「部署页」一起清（2026-10-28 修的真实串号）
-   *
-   * 之前只清了凭据页的框（Token / 面板密码），**部署页的 5 个输入框没清**：
-   *
-   *   controlProject / dataProject / panelPath / wsPath / deployPanelPassword
-   *
-   * 而后端 `handleDeployRun` 会把它们**无条件写进部署**
-   * （`deploy_routes.go`：`opt.ControlProject = req.ControlProject` …），
-   * 且这些值**优先于清单**（非空就不随机生成）。
-   *
-   * 触发路径：账户 A 下在部署页填过项目名 / 面板路径 / WS 路径 / 面板密码
-   * → 切到账户 B → **不回头看部署页**直接点「开始部署」
-   * → A 的面板密码变成 B 实例的面板密码，A 的 WS 路径写进 B 的 KV CONFIG。
-   *
-   * Cloudflare 的 KV 是账号作用域，**挡不住这种串号** ——
-   * 因为写进去的是**当前账户自己的 KV**，内容却是上一个账户的凭据。
+   * 切换账户后清空上一账户的上下文，避免项目名或管理密码跨账号残留。
    */
   function resetAccountContext(): void {
     accountContextGen++
@@ -617,7 +600,7 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
     $('panelPassword').value = ''
     clearCredAlert()
 
-    // 部署页的 5 个框：跨账户残留会造成凭据泄漏，必须一起清
+    // 清空部署页仍保留的项目名和管理密码。
     clearDeployFormFields()
   }
 
