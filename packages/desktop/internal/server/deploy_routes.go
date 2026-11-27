@@ -224,6 +224,11 @@ func (s *Server) handleDeployRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// EdgeTunnel 是本 APK 当前部署目标：仅替换云端部署核心，原 UI 与本地 Go 服务保持不变。
+	// EdgeTunnel 使用单个官方 Worker、ADMIN 环境变量和 KV 绑定，不再上传 CFPilot 双 Worker 内核。
+	s.startEdgeTunnelDeploy(w, req, profile)
+	return
+
 	// KV 解析：**全新部署会新建一个**，其余情况沿用请求 / 账户里选的（见 resolveDeployKv）
 	kvCtx, cancelKv := context.WithTimeout(context.Background(), 25*time.Second)
 	kvID, freshKvTitle, kvErr := s.resolveDeployKv(kvCtx, s.newCFClient(profile.CfToken), profile, req.Mode, req.KVNamespaceID)
@@ -1319,3 +1324,100 @@ func shortRandom(n int) string {
 
 // errNoArtifacts 表示找不到内核产物。
 var errNoArtifacts = errors.New("找不到内核产物")
+
+
+// startEdgeTunnelDeploy 通过 Cloudflare API 部署 EdgeTunnel 官方单 Worker 核心。
+func (s *Server) startEdgeTunnelDeploy(w http.ResponseWriter, req deployRequest, profile *store.Profile) {
+	client := s.newCFClient(profile.CfToken)
+	kvID := resolveKVNamespaceID(req.KVNamespaceID, profile.KVNamespaceID)
+	kvTitle := ""
+	if kvID == "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		title := "edgetunnel-kv-" + shortRandom(8)
+		ns, err := client.CreateKVNamespace(ctx, profile.AccountID, title)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "创建 EdgeTunnel KV 命名空间失败：" + err.Error()})
+			return
+		}
+		kvID, kvTitle = ns.ID, ns.Title
+		if _, err := s.store.SaveActive(store.Patch{KVNamespaceID: &kvID}); err != nil {
+			s.logLevel("EdgeTunnel KV 已创建，但保存本地选择失败："+err.Error(), "warn")
+		}
+	}
+	workerName := strings.TrimSpace(req.DataProject)
+	if workerName == "" {
+		workerName = strings.TrimSpace(req.ControlProject)
+	}
+	adminPassword := strings.TrimSpace(req.PanelPassword)
+	if adminPassword == "" {
+		adminPassword = strings.TrimSpace(profile.DeployPanelPassword)
+	}
+
+	s.deploy.mu.Lock()
+	if s.deploy.running {
+		s.deploy.mu.Unlock()
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "已有部署正在进行，请等待完成"})
+		return
+	}
+	s.deploy.running = true
+	s.deploy.mu.Unlock()
+
+	go func() {
+		defer func() {
+			s.deploy.mu.Lock()
+			s.deploy.running = false
+			s.deploy.mu.Unlock()
+		}()
+		defer func() {
+			if recovered := safe.Recover("EdgeTunnel 部署任务"); recovered != nil {
+				s.logLevel("EdgeTunnel 部署发生内部错误，详情已记入日志", "err")
+				s.events.publish("deploy-status", map[string]any{"ok": false, "error": "EdgeTunnel 部署发生内部错误，详情已记入日志"})
+			}
+		}()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cancel()
+		result, err := deploy.DeployEdgeTunnel(ctx, client, profile.AccountID, workerName, adminPassword, kvID, func(message string) {
+			s.logf(message)
+		})
+		payload := map[string]any{"ok": err == nil}
+		if err != nil {
+			payload["error"] = err.Error()
+			s.logLevel("EdgeTunnel 部署失败："+err.Error(), "err")
+		} else {
+			host := strings.TrimPrefix(strings.TrimPrefix(result.URL, "https://"), "http://")
+			slot := deploy.Slot{Name: result.Name, Subdomain: host}
+			deployed := &deploy.Result{
+				Control: slot, Data: slot, Warnings: result.Warnings,
+				PanelPath: "/admin", PanelPassword: result.Admin,
+				DataPlaneMode: "workers",
+			}
+			payload["result"] = deployed
+			s.saveSnapshot(&DeploySnapshot{
+				KVNamespaceID: kvID, KVTitle: kvTitle,
+				ControlProject: result.Name, ControlSubdomain: host,
+				DataProject: result.Name, DataSubdomain: host,
+				At: time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+				AccountID: profile.AccountID, AccountName: profile.AccountName,
+				DataPlaneMode: "workers",
+			})
+			for _, warning := range result.Warnings {
+				s.logLevel("⚠ "+warning, "warn")
+			}
+			s.logLevel("EdgeTunnel 部署完成："+result.URL, "ok")
+			s.logLevel("后台地址："+result.URL+"/admin", "ok")
+			s.logLevel("后台密码："+result.Admin, "ok")
+			s.events.publish("deploy-status", payload)
+			return
+		}
+		s.events.publish("deploy-status", payload)
+	}()
+
+	response := map[string]any{"started": true, "note": "EdgeTunnel 部署已开始，进度会通过 SSE 实时推送"}
+	if kvTitle != "" {
+		response["kvNamespaceId"] = kvID
+		response["kvTitle"] = kvTitle
+	}
+	writeJSON(w, http.StatusOK, response)
+}
