@@ -530,6 +530,28 @@ func (s *Server) handleDeployCheck(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client := s.newCFClient(profile.CfToken)
+	edgeRaw, edgeState, edgeErr := client.GetKVValueState(r.Context(), profile.AccountID, kvID, edgeTunnelManifestKey)
+	if edgeErr != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"state":"unknown","hasDeploy":false,"reason":"edge-manifest-read-error","note":edgeErr.Error()})
+		return
+	}
+	if edgeState != cfapi.KVFound || strings.TrimSpace(edgeRaw) == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"state":"none","hasDeploy":false,"reason":"no-edgetunnel"})
+		return
+	}
+	var edgeInfo edgeTunnelManifest
+	if err := json.Unmarshal([]byte(edgeRaw), &edgeInfo); err != nil || edgeInfo.Project == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"state":"none","hasDeploy":false,"reason":"invalid-edgetunnel-manifest"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"state":"latest","hasDeploy":true,"build":"EdgeTunnel","localBuild":"EdgeTunnel",
+		"at":edgeInfo.UpdatedAt,"controlProject":"EdgeTunnel","dataProject":edgeInfo.Project,
+		"controlSubdomain":"","dataSubdomain":edgeInfo.URL,"dataPlaneMode":edgeInfo.Mode,
+		"kernelVersion":"EdgeTunnel","localKernelVersion":"EdgeTunnel","remoteKernelVersion":"",
+		"kernelUpdatable":false,"kernelRemoteError":"",
+	})
+	return
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
 
