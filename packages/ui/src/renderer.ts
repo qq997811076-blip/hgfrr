@@ -1607,7 +1607,7 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
             customDomainPrefix: (document.getElementById('deployDomainPrefix') as HTMLInputElement | null)?.value.trim() || '',
             // 本次部署要设的面板密码（留空 = 随机 / 沿用清单）
             panelPassword: deployPw,
-          },
+          } as any,
           kvId
         )
         // 全新部署时后端会新建 KV：把下拉框切过去，否则界面还显示旧实例的 KV
