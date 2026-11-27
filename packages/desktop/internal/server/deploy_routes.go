@@ -1185,14 +1185,28 @@ func (s *Server) handleKvList(w http.ResponseWriter, r *http.Request) {
 			}
 
 			hasManifest := false
+			hasEdgeTunnel := false
 			cfpilotTouched := false
 			for _, key := range keys {
-				if key == deploy.ManifestKey {
-					hasManifest = true
+				if key == deploy.ManifestKey { hasManifest = true }
+				if key == edgeTunnelManifestKey { hasEdgeTunnel = true }
+				if deploy.IsCfPilotKVKey(key) { cfpilotTouched = true }
+			}
+
+			// EdgeTunnel 实例以专用标记识别，不再把 CFPilot 清单当作本项目实例。
+			if hasEdgeTunnel {
+				if raw, ok := client.GetKVValue(ctx, accountID, ns.ID, edgeTunnelManifestKey); ok && strings.TrimSpace(raw) != "" {
+					var m edgeTunnelManifest
+					if json.Unmarshal([]byte(raw), &m) == nil && m.Project != "" {
+						opt.Ownership = "instance"
+						opt.DataProject = m.Project
+						opt.DataSubdomain = m.URL
+						opt.At = m.UpdatedAt
+						return
+					}
 				}
-				if deploy.IsCfPilotKVKey(key) {
-					cfpilotTouched = true
-				}
+				opt.Ownership = "foreign"
+				return
 			}
 
 			// 2) 有清单 → instance（或清单损坏 → cfpilot 残留）
