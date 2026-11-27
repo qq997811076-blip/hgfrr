@@ -646,6 +646,28 @@ func (c *Client) CreatePagesProject(ctx context.Context, accountID, name, produc
 	return &out, nil
 }
 
+// CreatePagesProjectConfigured 创建 Pages 项目时一次性写入 production 环境变量与 KV 绑定，避免创建后 PATCH 触发额外部署。
+func (c *Client) CreatePagesProjectConfigured(ctx context.Context, accountID, name, productionBranch string, vars map[string]PageVar, bindings map[string]string) (*PagesProject, error) {
+	if productionBranch == "" { productionBranch = "main" }
+	type kvBinding struct { NamespaceID string `json:"namespace_id"` }
+	type productionConfig struct {
+		EnvVars map[string]PageVar `json:"env_vars,omitempty"`
+		KVNamespaces map[string]kvBinding `json:"kv_namespaces,omitempty"`
+	}
+	body := map[string]any{
+		"name":name,
+		"production_branch":productionBranch,
+		"deployment_configs":map[string]any{"production":productionConfig{EnvVars:vars,KVNamespaces:func() map[string]kvBinding {
+			out:=map[string]kvBinding{}
+			for k,v:=range bindings { out[k]=kvBinding{NamespaceID:v} }
+			return out
+		}()}},
+	}
+	var out PagesProject
+	if err:=c.doJSON(ctx,http.MethodPost,fmt.Sprintf("/accounts/%s/pages/projects",accountID),body,&out);err!=nil{return nil,err}
+	return &out,nil
+}
+
 // DeletePagesProject 删除 Pages 项目。
 func (c *Client) DeletePagesProject(ctx context.Context, accountID, name string) error {
 	return c.doJSON(ctx, http.MethodDelete,
