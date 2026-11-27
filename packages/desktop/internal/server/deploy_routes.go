@@ -1230,6 +1230,7 @@ func (s *Server) handleKvList(w http.ResponseWriter, r *http.Request) {
 			opt := &options[i]
 			if binding, ok := edgeBindings[ns.ID]; ok {
 				opt.Ownership = "instance"
+				opt.ControlProject = "EdgeTunnel"
 				opt.DataProject = binding.Project
 				opt.DataSubdomain = binding.URL
 				return
@@ -1258,6 +1259,7 @@ func (s *Server) handleKvList(w http.ResponseWriter, r *http.Request) {
 					var m edgeTunnelManifest
 					if json.Unmarshal([]byte(raw), &m) == nil && m.Project != "" {
 						opt.Ownership = "instance"
+						opt.ControlProject = "EdgeTunnel"
 						opt.DataProject = m.Project
 						opt.DataSubdomain = m.URL
 						opt.At = m.UpdatedAt
