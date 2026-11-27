@@ -1627,22 +1627,28 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
         }
         const prodUrl = (r.panelUrl ?? '').trim()
         const customUrl = (r.panelCustomUrl ?? '').trim()
-        // 两种入口都展示：缺哪一种就在那一行写明，而不是只留一个「—」。
+        const customDomainStatus = (r.customDomainStatus ?? '').trim()
+        // 自定义域名来自 Cloudflare 实时绑定查询；查询失败不能误报为未绑定。
         set('credPanelUrl', prodUrl || '未记录生产链接')
-        set('credPanelCustomUrl', customUrl || '未绑定自定义域名')
+        set(
+          'credPanelCustomUrl',
+          customDomainStatus === 'error'
+            ? '检测失败（请检查 Token 权限或稍后重试）'
+            : customUrl || '未绑定自定义域名',
+        )
         set('credPanelPw', r.panelPassword ?? '')
-        set('credUuid', r.uuid ?? '')
-        set('credWsPath', r.wsPath ?? '')
         const urlHint = document.getElementById('credUrlHint')
         if (urlHint) {
           urlHint.textContent =
-            !prodUrl && !customUrl
-              ? '未读取到可用的面板地址，请先在「部署」页完成一次部署。'
-              : !customUrl
-                ? '控制面项目未绑定自定义域名；可在 Cloudflare 控制台给控制面项目绑定后再查看。'
-                : !prodUrl
-                  ? '未记录 Cloudflare 生产链接，请使用自定义域名访问面板。'
-                  : '两个地址都能打开面板；自定义域名需在 Cloudflare 控制台绑定后才会显示。'
+            customDomainStatus === 'error'
+              ? 'Cloudflare 自定义域名查询失败，当前无法确认绑定状态；面板密码仍可正常使用。'
+              : !prodUrl && !customUrl
+                ? '未读取到可用的面板地址，请先在「部署」页完成一次部署。'
+                : !customUrl
+                  ? 'Cloudflare 当前未检测到该项目的自定义域名绑定。'
+                  : !prodUrl
+                    ? '未记录 Cloudflare 生产链接，请使用自定义域名访问面板。'
+                    : '已从 Cloudflare 读取当前项目的自定义域名绑定。'
         }
         modal.hidden = false
 
@@ -1652,10 +1658,9 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
         // 再点一次「复制全部」属于多余步骤。
         const text = [
           '面板地址（生产链接）：' + (prodUrl || '未记录'),
-          '面板地址（自定义域名）：' + (customUrl || '未绑定'),
+          '面板地址（自定义域名）：' +
+            (customDomainStatus === 'error' ? '检测失败' : customUrl || '未绑定'),
           '面板密码：' + (r.panelPassword ?? ''),
-          'UUID：' + (r.uuid ?? ''),
-          'WS 路径：' + (r.wsPath ?? ''),
         ].join('\n')
         try {
           await navigator.clipboard.writeText(text)
@@ -1689,8 +1694,6 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
         '面板地址（生产链接）：' + g('credPanelUrl'),
         '面板地址（自定义域名）：' + g('credPanelCustomUrl'),
         '面板密码：' + g('credPanelPw'),
-        'UUID：' + g('credUuid'),
-        'WS 路径：' + g('credWsPath'),
       ].join('\n')
       try {
         await navigator.clipboard.writeText(text)
