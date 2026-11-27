@@ -87,7 +87,7 @@ type Options struct {
 	KeepCredentials bool
 	// SkipSameVersion 本地版本与线上一致时跳过部署（默认 true）
 	SkipSameVersion bool
-	// Force 忽略归属校验（危险，仅用户显式确认时用）
+	// Force 为旧版部署请求兼容字段；当前部署不再执行 KV 项目归属校验。
 	Force bool
 
 	// ---- 可选覆盖（留空则自动生成或沿用清单）----
@@ -381,19 +381,9 @@ func (d *Deployer) Run(ctx context.Context) (*Result, error) {
 	d.result.Control.Name = controlName
 	d.result.Data.Name = dataName
 
-	// ---------------- 0c. 归属校验（写入任何键之前） ----------------
-	//
-	// ⚠️ 必须在「创建项目 / 写 KV / 部署」之前。
-	// 越界写入会直接改坏别人的线上项目（订阅指向错误 UUID、
-	// 面板路径与密码被覆盖、会话可跨实例复用），事后极难清理。
-	//
-	// 校验用的是**解析后的** controlName（对照 CLI）：
-	//   - 更新模式 → 来自清单 → 同一个实例的原地更新判为 owned，不被误拒
-	//   - 全新模式 → 随机名 → 与清单里的名字必不相等 → 判为 occupied
-	//     （必须换 KV，或用户显式勾选「强制」接管）
-	if err := d.assertKvOwnership(ctx, manifest, controlName); err != nil {
-		return nil, err
-	}
+	// ---------------- 0c. KV 项目归属检测已移除 ----------------
+	// 同一个 KV Namespace 允许绑定到多个 Pages 项目；部署流程不再
+	// 因为清单、已有键或其他项目的使用记录而阻止继续部署。
 
 	// 首次部署：缺项的凭据生成随机值
 	if eff.panelPath == "" {
