@@ -112,6 +112,50 @@ func loadEdgeTunnelWorker(ctx context.Context) ([]byte, error) {
 
 func edgeTunnelMinInt(a, b int) int { if a < b { return a }; return b }
 
+// resolveProxyCustomDomain 根据域名列表中的 Zone 和可选前缀生成完整主机名。
+// 前缀只允许一个 DNS 标签，避免把用户输入误当成完整域名或注入额外层级。
+func resolveProxyCustomDomain(ctx context.Context, client *cfapi.Client, accountID, zoneID, prefix string) (string, string, error) {
+	zoneID = strings.TrimSpace(zoneID)
+	prefix = strings.ToLower(strings.TrimSpace(prefix))
+	if zoneID == "" {
+		if prefix != "" {
+			return "", "", fmt.Errorf("填写了自定义域前缀，请先在「域名列表」选择一个域名")
+		}
+		return "", "", nil
+	}
+	if prefix != "" {
+		if len(prefix) > 63 || strings.HasPrefix(prefix, "-") || strings.HasSuffix(prefix, "-") {
+			return "", "", fmt.Errorf("自定义域前缀必须是 1–63 位的单个 DNS 标签，且不能以连字符开头或结尾")
+		}
+		for _, ch := range prefix {
+			if !((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-') {
+				return "", "", fmt.Errorf("自定义域前缀只能包含英文字母、数字和连字符，不能包含点号")
+			}
+		}
+	}
+	zones, err := client.ListZones(ctx)
+	if err != nil {
+		return "", "", fmt.Errorf("读取 Cloudflare 域名列表失败：%w", err)
+	}
+	for _, zone := range zones {
+		if zone.ID != zoneID {
+			continue
+		}
+		hostname := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(zone.Name)), ".")
+		if hostname == "" {
+			return "", "", fmt.Errorf("所选 Cloudflare Zone 没有有效域名")
+		}
+		if prefix != "" {
+			hostname = prefix + "." + hostname
+		}
+		if len(hostname) > 253 {
+			return "", "", fmt.Errorf("拼接后的自定义域名过长")
+		}
+		return hostname, zone.ID, nil
+	}
+	return "", "", fmt.Errorf("所选域名已不在当前 Cloudflare 账号的域名列表中，请重新选择")
+}
+
 func (s *Server) handleEdgeTunnelDeploy(w http.ResponseWriter, req deployRequest, profile *store.Profile) {
 	mode := strings.ToLower(strings.TrimSpace(req.DataPlaneMode))
 	if mode != "workers" { mode = "pages" }
@@ -119,6 +163,14 @@ func (s *Server) handleEdgeTunnelDeploy(w http.ResponseWriter, req deployRequest
 	defer cancel()
 
 	client := s.newCFClient(profile.CfToken)
+	customDomain, customZoneID, domainErr := resolveProxyCustomDomain(ctx, client, profile.AccountID, req.CustomDomainZoneID, req.CustomDomainPrefix)
+	if domainErr != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": domainErr.Error()})
+		return
+	}
+	if customDomain != "" {
+		s.logLevel("已选择自定义域名："+customDomain+"，部署完成后将自动绑定", "info")
+	}
 	kvID := strings.TrimSpace(req.KVNamespaceID)
 	kvTitle := ""
 	if strings.EqualFold(req.Mode, "fresh") {
@@ -171,15 +223,47 @@ func (s *Server) handleEdgeTunnelDeploy(w http.ResponseWriter, req deployRequest
 		if err := client.UploadWorkerScript(ctx,profile.AccountID,project,script,bindings,"2025-11-04"); err != nil {
 			writeJSON(w,http.StatusBadGateway,map[string]any{"error":"上传 EdgeTunnel Worker 失败："+err.Error()}); return
 		}
+		if customDomain != "" {
+			domains, listErr := client.ListWorkerDomains(ctx, profile.AccountID)
+			if listErr != nil {
+				writeJSON(w, http.StatusBadGateway, map[string]any{"error": "读取 Worker 域名绑定失败：" + listErr.Error()})
+				return
+			}
+			alreadyBound := false
+			for _, item := range domains {
+				if strings.EqualFold(item.Hostname, customDomain) {
+					if item.Service != project {
+						writeJSON(w, http.StatusConflict, map[string]any{"error": "自定义域名已绑定到其他 Worker：" + item.Service})
+						return
+					}
+					alreadyBound = true
+					break
+				}
+			}
+			if !alreadyBound {
+				if _, bindErr := client.AttachWorkerDomain(ctx, profile.AccountID, customDomain, project, customZoneID); bindErr != nil {
+					writeJSON(w, http.StatusBadGateway, map[string]any{"error": "Worker 已上传，但自动绑定自定义域名失败：" + bindErr.Error()})
+					return
+				}
+			}
+			// 自定义域名作为正式入口时关闭 workers.dev / preview，避免双入口造成路由混淆。
+			if err := client.PutScriptSubdomain(ctx, profile.AccountID, project, false, false); err != nil {
+				s.logLevel("自定义域名已提交绑定，但关闭 workers.dev 入口失败："+err.Error(), "warn")
+			}
+			publicURL = "https://" + customDomain
+			s.logLevel("Worker 自定义域名已绑定："+publicURL, "ok")
+		}
 		sub,_ := client.GetWorkersSubdomain(ctx,profile.AccountID)
 		if err := client.PutScriptSubdomain(ctx,profile.AccountID,project,true,false); err != nil {
 			s.logLevel("开启 workers.dev 访问入口失败："+err.Error(),"warn")
 		}
-		if strings.TrimSpace(sub) == "" {
-			s.logLevel("Worker 已上传，但该账号尚未设置 workers.dev 子域；请到 Cloudflare 控制台启用 workers.dev，或绑定自定义域名。","warn")
-			publicURL = ""
-		} else {
-			publicURL = "https://"+project+"."+strings.TrimSpace(sub)+".workers.dev"
+		if customDomain == "" {
+			if strings.TrimSpace(sub) == "" {
+				s.logLevel("Worker 已上传，但该账号尚未设置 workers.dev 子域；请到 Cloudflare 控制台启用 workers.dev，或绑定自定义域名。","warn")
+				publicURL = ""
+			} else {
+				publicURL = "https://"+project+"."+strings.TrimSpace(sub)+".workers.dev"
+			}
 		}
 	} else {
 		existing, err := client.GetPagesProject(ctx,profile.AccountID,project)
@@ -210,7 +294,30 @@ func (s *Server) handleEdgeTunnelDeploy(w http.ResponseWriter, req deployRequest
 				writeJSON(w,http.StatusBadGateway,map[string]any{"error":"更新 Pages 的 ADMIN / KV 失败："+err.Error()}); return
 			}
 		}
-		publicURL = "https://"+project+".pages.dev"
+		if customDomain != "" {
+			domains, listErr := client.ListPagesDomains(ctx, profile.AccountID, project)
+			if listErr != nil {
+				writeJSON(w, http.StatusBadGateway, map[string]any{"error": "读取 Pages 自定义域名失败：" + listErr.Error()})
+				return
+			}
+			alreadyBound := false
+			for _, item := range domains {
+				if strings.EqualFold(item.Name, customDomain) {
+					alreadyBound = true
+					break
+				}
+			}
+			if !alreadyBound {
+				if err := client.AddPagesDomain(ctx, profile.AccountID, project, customDomain); err != nil {
+					writeJSON(w, http.StatusBadGateway, map[string]any{"error": "Pages 项目已部署，但自动绑定自定义域名失败：" + err.Error()})
+					return
+				}
+			}
+			publicURL = "https://" + customDomain
+			s.logLevel("Pages 自定义域名已提交绑定："+publicURL, "ok")
+		} else {
+			publicURL = "https://"+project+".pages.dev"
+		}
 	}
 
 	manifest := edgeTunnelManifest{Project:project,Mode:mode,URL:publicURL,KVNamespaceID:kvID,AdminSet:true,UpdatedAt:time.Now().UTC().Format(time.RFC3339)}
