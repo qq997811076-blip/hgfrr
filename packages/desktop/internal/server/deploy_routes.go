@@ -224,6 +224,10 @@ func (s *Server) handleDeployRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 当前 Android 版统一部署 CM EdgeTunnel，不再调用 CFPilot 双项目部署器。
+	s.startEdgeTunnelDeploy(w, req, profile)
+	return
+
 	// KV 解析：**全新部署会新建一个**，其余情况沿用请求 / 账户里选的（见 resolveDeployKv）
 	kvCtx, cancelKv := context.WithTimeout(context.Background(), 25*time.Second)
 	kvID, freshKvTitle, kvErr := s.resolveDeployKv(kvCtx, s.newCFClient(profile.CfToken), profile, req.Mode, req.KVNamespaceID)
