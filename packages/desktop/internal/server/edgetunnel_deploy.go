@@ -68,7 +68,13 @@ func detectEdgeTunnelBindings(ctx context.Context, client *cfapi.Client, account
 	}
 	// Pages：同样通过 KV / ADMIN 绑定识别，不依赖本工具写入的私有标记。
 	if projects, err := client.ListPagesProjects(ctx, accountID); err == nil {
-		for _, project := range projects {
+		for _, listed := range projects {
+			project := listed
+			if project.DeploymentConfigs.Production.KVNamespaces == nil || project.DeploymentConfigs.Production.EnvVars == nil {
+				if detail, err := client.GetPagesProject(ctx, accountID, project.Name); err == nil && detail != nil {
+					project = *detail
+				}
+			}
 			production := project.DeploymentConfigs.Production
 			kv := production.KVNamespaces["KV"]
 			_, hasAdmin := production.EnvVars["ADMIN"]
