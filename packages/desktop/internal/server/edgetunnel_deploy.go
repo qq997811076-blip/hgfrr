@@ -123,19 +123,23 @@ func (s *Server) handleEdgeTunnelDeploy(w http.ResponseWriter, req deployRequest
 	}
 	if kvID == "" { writeJSON(w,http.StatusBadRequest,map[string]any{"error":"请先选择 KV 命名空间，或选择全新部署"}); return }
 
+	boundInstances := detectEdgeTunnelBindings(ctx, client, profile.AccountID)
+	boundInstance, isBoundInstance := boundInstances[kvID]
 	keys, err := client.ListKVKeys(ctx, profile.AccountID, kvID)
 	if err != nil { writeJSON(w,http.StatusBadRequest,map[string]any{"error":"检查 KV 归属失败："+err.Error()}); return }
 	rawManifest, state, readErr := client.GetKVValueState(ctx, profile.AccountID, kvID, edgeTunnelManifestKey)
 	if readErr != nil { writeJSON(w,http.StatusBadRequest,map[string]any{"error":"读取 EdgeTunnel 部署记录失败："+readErr.Error()}); return }
 	var old edgeTunnelManifest
 	hasManifest := state == cfapi.KVFound && json.Unmarshal([]byte(rawManifest), &old) == nil && old.Project != ""
-	if !hasManifest && len(keys) > 0 {
-		writeJSON(w,http.StatusConflict,map[string]any{"error":"所选 KV 已有其他项目的数据，未检测到 EdgeTunnel 部署记录。为避免覆盖，请选择空 KV 或全新部署。"})
+	if !hasManifest && !isBoundInstance && len(keys) > 0 {
+		writeJSON(w,http.StatusConflict,map[string]any{"error":"所选 KV 已有其他项目的数据，未检测到 EdgeTunnel 绑定。为避免覆盖，请选择 EdgeTunnel 实例或空 KV。"})
 		return
 	}
 
+	if isBoundInstance && !strings.EqualFold(req.Mode,"fresh") { mode = boundInstance.Mode }
 	project := strings.TrimSpace(req.DataProject)
-	if hasManifest && !strings.EqualFold(req.Mode,"fresh") { project = old.Project }
+	if hasManifest && !strings.EqualFold(req.Mode,"fresh") { project = old.Project
+	} else if isBoundInstance && !strings.EqualFold(req.Mode,"fresh") { project = boundInstance.Project }
 	if project == "" { project = "edgetunnel-" + shortRandom(6) }
 	admin := strings.TrimSpace(req.PanelPassword)
 	if admin == "" && hasManifest && !strings.EqualFold(req.Mode,"fresh") {
