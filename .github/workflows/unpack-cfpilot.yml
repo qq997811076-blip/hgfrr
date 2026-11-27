@@ -1,0 +1,38 @@
+name: Unpack C由Pilot source
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/unpack-cfpilot.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Extract complete source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="CFPilot-9aedcbf3d1779191ac0ea6a370819834f4009b46.zip"
+          test -f "$archive"
+          temp_dir="$(mktemp -d)"
+          unzip -q "$archive" -d "$temp_dir"
+          source_dir="$temp_dir/CFPilot-9aedcbf3d1779191ac0ea6a370819834f4009b46"
+          test -d "$source_dir"
+          cp -a "$source_dir"/. .
+          rm -f .github/workflows/unpack-cfpilot.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Import and extract C由Pilot v0.60.0-beta.2 source"
+          git push origin HEAD:main
