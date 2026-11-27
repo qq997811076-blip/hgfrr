@@ -175,22 +175,31 @@ func (s *Server) handleEdgeTunnelDeploy(w http.ResponseWriter, req deployRequest
 	} else {
 		existing, err := client.GetPagesProject(ctx,profile.AccountID,project)
 		if err != nil { writeJSON(w,http.StatusBadGateway,map[string]any{"error":"查询 Pages 项目失败："+err.Error()}); return }
+		envVars := map[string]cfapi.PageVar{"ADMIN":{Value:admin,Type:"plain_text"}}
+		kvBindings := map[string]string{"KV":kvID}
 		if existing == nil {
-			if _,err := client.CreatePagesProject(ctx,profile.AccountID,project,"main"); err != nil {
-				writeJSON(w,http.StatusBadGateway,map[string]any{"error":"创建 Pages 项目失败："+err.Error()}); return
+			if _,err := client.CreatePagesProjectConfigured(ctx,profile.AccountID,project,"main",envVars,kvBindings); err != nil {
+				writeJSON(w,http.StatusBadGateway,map[string]any{"error":"创建并配置 Pages 项目失败："+err.Error()}); return
 			}
-		}
-		// Pages 项目配置与 Worker 文件使用同一份 EdgeTunnel 源码。
-		if err := client.ConfigurePages(ctx,profile.AccountID,project,
-			map[string]cfapi.PageVar{"ADMIN":{Value:admin,Type:"plain_text"}},
-			map[string]string{"KV":kvID}); err != nil {
-			writeJSON(w,http.StatusBadGateway,map[string]any{"error":"配置 Pages 的 ADMIN / KV 失败："+err.Error()}); return
-		}
-		if _,err := client.DeployPagesWorker(ctx,cfapi.PagesDeployOptions{
-			AccountID:profile.AccountID,Project:project,Script:script,
-			CommitMessage:"Deploy CM EdgeTunnel",Branch:"main",
-		}); err != nil {
-			writeJSON(w,http.StatusBadGateway,map[string]any{"error":"上传 EdgeTunnel Pages 部署文件失败："+err.Error()}); return
+			if _,err := client.DeployPagesWorker(ctx,cfapi.PagesDeployOptions{
+				AccountID:profile.AccountID,Project:project,Script:script,
+				CommitMessage:"Deploy CM EdgeTunnel",Branch:"main",
+			}); err != nil {
+				writeJSON(w,http.StatusBadGateway,map[string]any{"error":"上传 EdgeTunnel Pages 部署文件失败："+err.Error()}); return
+			}
+		} else {
+			// 已存在的 Pages 项目必须先确认它确实绑定了当前 EdgeTunnel KV，禁止误覆盖其他项目。
+			isThisInstance := (hasManifest && old.Project == project && old.Mode == "pages") ||
+				(isBoundInstance && boundInstance.Mode == "pages" && boundInstance.Project == project)
+			if !isThisInstance {
+				writeJSON(w,http.StatusConflict,map[string]any{"error":"同名 Pages 项目已存在，但未确认属于当前 EdgeTunnel 实例；为避免覆盖其他项目，已停止部署。"})
+				return
+			}
+			// PATCH 会触发一次部署；现有 Pages 项目已运行同一份固定版本的 _worker.js，
+			// 因此只更新 ADMIN / KV 配置，不再重复提交第二次 Worker 部署。
+			if err := client.ConfigurePages(ctx,profile.AccountID,project,envVars,kvBindings); err != nil {
+				writeJSON(w,http.StatusBadGateway,map[string]any{"error":"更新 Pages 的 ADMIN / KV 失败："+err.Error()}); return
+			}
 		}
 		publicURL = "https://"+project+".pages.dev"
 	}
