@@ -887,80 +887,9 @@ func (s *Server) handleDeployCredentials(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	cancelBind()
-	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
-	defer cancel()
-
-	raw, ok := client.GetKVValue(ctx, profile.AccountID, kvID, deploy.ManifestKey)
-	if !ok || strings.TrimSpace(raw) == "" {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":    false,
-			"error": "这个 KV 里没有部署记录，请先完成一次部署",
-		})
-		return
-	}
-	var m deploy.Manifest
-	if err := json.Unmarshal([]byte(raw), &m); err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "部署清单格式损坏"})
-		return
-	}
-
-	// 面板完整地址 = 控制面域名 + 面板路径
-	// ⚠️ 面板路径必须保证带前导斜杠（兼容清单里可能存在的旧格式裸串）
-	panelPath := m.Credentials.PanelPath
-	if panelPath != "" && !strings.HasPrefix(panelPath, "/") {
-		panelPath = "/" + panelPath
-	}
-	panelURL := ""
-	if m.ControlSubdomain != "" && panelPath != "" {
-		host := m.ControlSubdomain
-		if !strings.HasPrefix(host, "http") {
-			host = "https://" + host
-		}
-		panelURL = host + panelPath
-	}
-
-	// 控制面自定义域名：清单里不存这个字段（只有数据面的 dataCustomDomain），
-	// 所以以平台上控制面 Pages 项目的**真实绑定**为准。
-	//
-	// 用户在 Cloudflare 控制台手动绑定的域名也能显示；查不到（未绑定 / 网络失败）
-	// 时返回空串，由界面给出「未绑定」提示，而不是把这一行藏起来。
-	// 单独用 5 秒子超时：不能让一趟平台查询拖慢「查看凭据」这个本机操作。
-	panelCustomDomain := ""
-	if project := strings.TrimSpace(m.ControlProject); project != "" {
-		domainCtx, cancelDomain := context.WithTimeout(ctx, 5*time.Second)
-		if p, e := client.GetPagesProject(domainCtx, profile.AccountID, project); e == nil && p != nil {
-			for _, d := range p.Domains {
-				host := strings.TrimSpace(d)
-				if host == "" || strings.HasSuffix(strings.ToLower(host), ".pages.dev") {
-					continue
-				}
-				panelCustomDomain = host
-				break
-			}
-		}
-		cancelDomain()
-	}
-	panelCustomURL := ""
-	if panelCustomDomain != "" && panelPath != "" {
-		host := panelCustomDomain
-		if !strings.HasPrefix(host, "http") {
-			host = "https://" + host
-		}
-		panelCustomURL = host + panelPath
-	}
-
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":                true,
-		"panelUrl":          panelURL,
-		"panelCustomDomain": panelCustomDomain,
-		"panelCustomUrl":    panelCustomURL,
-		"panelPath":         panelPath,
-		"panelPassword":     m.Credentials.PanelPassword,
-		"uuid":              m.Credentials.UUID,
-		"wsPath":            m.Credentials.WSPath,
-		"dataSubdomain":     m.DataSubdomain,
-		"build":             m.Build,
-		"at":                m.At,
+		"ok": false,
+		"error": "当前 KV 未检测到 EdgeTunnel 实例，或 ADMIN 变量无法读取。请确认实例已部署，并将 ADMIN 设置为普通文本变量。",
 	})
 }
 
