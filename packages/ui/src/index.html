@@ -367,15 +367,6 @@
     .log-line.warn { color: var(--warn); }
     .log-line.err { color: var(--err); }
 
-    /* 链式代理的部署输出：等宽 + 可滚动，长日志不撑破卡片 */
-    .chain-out {
-      margin: 10px 0 0; padding: 10px 12px; max-height: 260px; overflow: auto;
-      background: var(--bg-input); border: 1px solid var(--border); border-radius: 8px;
-      font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px;
-      line-height: 1.55; white-space: pre-wrap; word-break: break-all;
-      color: var(--text-secondary);
-    }
-
     /* 矮窗口时把标题条压小一点，避免占掉内容 */
     @media (max-height: 600px) {
       .log-head { padding: 4px 16px; min-height: 26px; }
@@ -1812,10 +1803,6 @@
               <b>可选</b><br>
               · Account & Billing / Account API Tokens / <b>Read</b> —— 仅用于显示 Token 有效期<br>
               · Analytics & Logs / Account Analytics / <b>Read</b> —— 仅用于「用量/额度」面板（查已用量）<br>
-              · DNS & Zone / Account DNS Settings / <b>Edit</b>（+ DNS View / <b>Read</b>）—— 仅绑定自定义域名时需要<br>
-			  <b>Workers 部署增加一项必需</b><br>
-			  · Developer Platform / Workers / Admin —— 建/删 Workers 项目、上传内核、绑 KV、配环境变量<br>
-			  <br>
 
               </div>
             </div>
@@ -1941,19 +1928,6 @@
                 <label class="chk" title="将 EdgeTunnel 的 _worker.js 自动打包为 Pages 部署文件并发布到 *.pages.dev。"><input type="radio" name="dataPlane" value="pages" checked /> Pages 部署（默认）</label>
                 <label class="chk" title="将同一份 EdgeTunnel _worker.js 直接上传为 Cloudflare Worker，并绑定 KV 与 ADMIN。"><input type="radio" name="dataPlane" value="workers" /> Workers 部署</label>
               </div>
-              <div id="dataHostField" hidden style="display:none;margin-top:10px">
-                <label>节点域名（Workers 模式）</label>
-                <input type="text" id="dataHost" placeholder="如 w1.example.com" />
-                <p class="tip" id="dataHostHint">
-                  域名会写进控制面的 <code>DATA_HOST</code>变量（订阅里的节点地址），
-                  此处填写值只用于控制面的 <code>DATA_HOST</code>。如需自动绑定自定义域名，
-                  请在下方「域名列表」中选择域名，并按需填写「自定义域前缀」；部署时会自动完成绑定。<br>
-                  点「检查部署状态」会按平台上的**真实绑定**自动刷新。
-                </p>
-                <p class="tip">
-                  留空则节点用 <code>*.workers.dev</code> —— 多数网络直连不可访问，节点无法连接。
-                </p>
-              </div>
               <p class="tip">
                 ⚠ <b>更新部署时如果切换模式，新模式数据面部署后会自动删除旧模式数据面
                 （Pages 或 Worker），原自定义域名随之失效，需重新绑定。</b>
@@ -1987,42 +1961,14 @@
             </div>
 
             <details class="fold">
-              <summary>高级选项（项目名 / 路径 / 强制覆盖）— 一般无需调整</summary>
+              <summary>高级选项（项目名 / 强制覆盖）— 一般无需调整</summary>
               <div class="fold-body">
-                <div class="row">
-                  <div class="field">
-                    <label>控制面项目名（EdgeTunnel 不使用）</label>
-                    <input type="text" id="controlProject" placeholder="留空 = 随机或按清单" />
-                    <p class="tip">承载面板、订阅与探针，客户端不连接该项目</p>
-                  </div>
-                  <div class="field">
-                    <label>EdgeTunnel 项目名</label>
-                    <input type="text" id="dataProject" placeholder="留空 = 随机或按清单" />
-                    <p class="tip">EdgeTunnel Worker / Pages 项目的名称</p>
-                  </div>
+                <div class="field">
+                  <label>EdgeTunnel 项目名</label>
+                  <input type="text" id="dataProject" placeholder="Random" />
+                  <p class="tip">EdgeTunnel Worker / Pages 项目的名称</p>
                 </div>
 
-                <div class="row">
-                  <div class="field">
-                    <label>面板路径（EdgeTunnel 不使用）</label>
-                    <input type="text" id="panelPath" placeholder="如 /p-a1b2c3d4" />
-                    <p class="tip">面板访问路径，留空则随机生成或沿用已有值</p>
-                  </div>
-                  <div class="field">
-                    <label>WS 路径（EdgeTunnel 不使用）</label>
-                    <input type="text" id="wsPath" placeholder="如 /k7m2x9q4w8" />
-                    <p class="tip">代理的 WebSocket 路径，留空则随机生成或沿用已有值</p>
-                  </div>
-                </div>
-
-                <label class="switch-box">
-                  <span class="sw-info">
-                    <span class="sw-title">更新时重新生成 UUID / WS 路径 / 面板凭据</span>
-                    <span class="sw-desc">启用后客户端的订阅地址需要同步修改</span>
-                  </span>
-                  <input type="checkbox" id="optNewCred" />
-                  <span class="switch"></span>
-                </label>
                 <label class="switch-box">
                   <span class="sw-info">
                     <span class="sw-title">强制重新部署</span>
@@ -2042,49 +1988,6 @@
             </p>
           </div>
 
-          <!--
-            链式代理（自建落地节点）
-
-            为什么叫「链式」：链路是 客户端 → Worker（前置）→ 你的 VPS（落地）→ 目标站。
-            Worker 那段负责抗封锁与就近接入，VPS 那段决定目标站看到的出口 IP。
-
-            为什么需要：Cloudflare 的出口是机房 IP，流媒体与部分站点对这类 IP 的
-            风控是结构性的 —— 不是配置错了，是 IP 类型不对。换一个自己的出口，
-            比任何「解锁检测」都有效。
-          -->
-          <div class="card">
-            <h2><span class="dot"></span>🔗 链式代理（自建落地节点）</h2>
-            <p class="desc">
-              在<b>私有 VPS</b> 装一个带口令的 SOCKS5 落地节点，
-              流量走 <b>客户端 → Worker → VPS → 目标站</b>。
-              目标站看到 VPS 出口，非 Cloudflare 机房 IP。
-            </p>
-
-            <div class="row">
-              <div class="field">
-                <label>VPS 地址（user@主机）</label>
-                <input type="text" id="chainHost" placeholder="root@203.0.113.10" />
-              </div>
-              <div class="field" style="flex:0 0 160px">
-                <label>SOCKS5 端口</label>
-                <input type="text" id="chainPort" value="1080" />
-              </div>
-            </div>
-
-            <div class="btn-row" style="margin-top:4px">
-              <button class="btn btn-primary" id="btnChainDeploy">一键部署到 VPS</button>
-              <button class="btn btn-ghost" id="btnChainCopy">复制命令（手动执行）</button>
-            </div>
-
-            <pre id="chainOut" class="chain-out" hidden></pre>
-
-            <p class="tip" style="margin-top:10px">
-              · 需要本机有 <code>ssh</code> 客户端且已配好密钥。<br>
-              · <b>无密钥</b>：点「复制命令」在终端里执行 —— 终端 ssh 提示输入密码。<br>
-              · 脚本会装 sing-box、生成随机口令、起 systemd 服务，仅支持 Debian/Ubuntu/CentOS 系。<br>
-              · 运行后输出 <code>socks5://用户:口令@IP:端口</code>，粘到面板「出站与高级」→ SOCKS5。
-            </p>
-          </div>
           </div><!-- /proxyPanel -->
         </section>
 
