@@ -49,13 +49,13 @@ func loadEdgeTunnelWorker(ctx context.Context) ([]byte, error) {
 	if res.StatusCode != http.StatusOK { return nil, fmt.Errorf("下载 EdgeTunnel _worker.js 失败：HTTP %d", res.StatusCode) }
 	raw, err := io.ReadAll(io.LimitReader(res.Body, 8<<20))
 	if err != nil { return nil, err }
-	if len(raw) < 10000 || !strings.Contains(string(raw[:minInt(len(raw), 200000)]), "export default") {
+	if len(raw) < 10000 || !strings.Contains(string(raw[:edgeTunnelMinInt(len(raw), 200000)]), "export default") {
 		return nil, errors.New("下载到的 EdgeTunnel Worker 文件不完整或格式不正确")
 	}
 	return raw, nil
 }
 
-func minInt(a, b int) int { if a < b { return a }; return b }
+func edgeTunnelMinInt(a, b int) int { if a < b { return a }; return b }
 
 func (s *Server) handleEdgeTunnelDeploy(w http.ResponseWriter, req deployRequest, profile *store.Profile) {
 	mode := strings.ToLower(strings.TrimSpace(req.DataPlaneMode))
