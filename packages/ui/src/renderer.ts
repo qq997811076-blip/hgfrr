@@ -981,7 +981,7 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
    *
    * ## 为什么必须醒目
    *
-   * 用户一个 Cloudflare 账号下可能存在**多个** CFPilot 实例（多个 KV）。
+   * 用户一个 Cloudflare 账号下可能存在**多个** EdgeTunnel 实例（多个 KV）。
    * 一旦选错 KV，后续「部署 / 优选 / 回填 / 订阅」会全部作用到**别的实例**上，
    * 而且不会有任何报错 —— 只会在很久以后表现为「面板数据不对」「回填没生效」。
    * 所以「没检测到实例」和「检测到多个实例」这两种情况必须一眼看见。
@@ -1010,10 +1010,10 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
   }
 
   /**
-   * 检测账号，并按「该账号下 CFPilot 实例的个数」自动决定 KV 选择。
+   * 检测账号，并按「该账号下 EdgeTunnel 实例的个数」自动决定 KV 选择。
    *
    * 规则（用户 2026-10-29 要求）：
-   *   - **0 个实例** → 醒目提示「未检查到CFPilot 实例，请到「部署」页全新部署」
+   *   - **0 个实例** → 醒目提示「未检查到 EdgeTunnel 实例，请到「部署」页全新部署」
    *   - **1 个实例** → 自动选中并保存（唯一实例不用问，少一步操作）
    *   - **≥2 个实例** → 醒目提示「请在下方选择 KV」（绝不替用户猜）
    */
@@ -1068,7 +1068,7 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
         if (myGen !== accountContextGen) return
       }
 
-      // 读 KV 列表，并判断有没有已部署的 CFPilot 实例
+      // 读 KV 列表，并判断有没有已部署的 EdgeTunnel 实例
       await loadKvOptions(myGen)
       if (myGen !== accountContextGen) return
       await autoPickKvByInstances()
@@ -1093,9 +1093,9 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
     const instances = kvOptions.filter((o) => o.ownership === 'instance')
 
     if (instances.length === 0) {
-      kvGuidance = '这个账号下还没有部署过 CFPilot，去「部署」页部署一次即可。'
+      kvGuidance = '这个账号下还没有部署过 EdgeTunnel，去「部署」页部署一次即可。'
       updateKvHint()
-      showCredAlert('danger', '未检查到CFPilot 实例，请到「部署」页全新部署。')
+      showCredAlert('danger', '未检查到 EdgeTunnel 实例，请到「部署」页全新部署。')
       log('该账号下没有已部署实例，请到「部署」页全新部署', 'warn')
       return
     }
@@ -1109,22 +1109,22 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
       } catch {
         /* 保存失败不阻断：下拉框当前值仍会用于本次部署 */
       }
-      kvGuidance = '已自动选中该账号下唯一的 CFPilot 实例。'
+      kvGuidance = '已自动选中该账号下唯一的 EdgeTunnel 实例。'
       updateKvHint()
       showCredAlert(
         'ok',
-        '已自动选中唯一的 CFPilot 实例 <code>' + escapeHtml(only.title) + '</code>，KV 已保存。'
+        '已自动选中唯一的 EdgeTunnel 实例 <code>' + escapeHtml(only.title) + '</code>，KV 已保存。'
       )
       log('检测到 1 个实例，已自动选中并保存 KV：' + only.title, 'ok')
       return
     }
 
     // ≥2 个：绝不替用户选 —— 选错会让所有功能作用到错的实例上
-    kvGuidance = '检测到 ' + instances.length + ' 个 CFPilot 实例，请从下方选择本次使用的 KV。'
+    kvGuidance = '检测到 ' + instances.length + ' 个 EdgeTunnel 实例，请从下方选择本次使用的 KV。'
     updateKvHint()
     showCredAlert(
       'danger',
-      '检测到 <b>' + instances.length + '</b> 个 CFPilot 实例，请在下方选择 KV：<br>' +
+      '检测到 <b>' + instances.length + '</b> 个 EdgeTunnel 实例，请在下方选择 KV：<br>' +
         instances.map((i) => '<code>' + escapeHtml(i.title) + '</code>').join('、') +
         '<br>选错 KV 会让后续部署 / 优选 / 回填全部作用到别的实例上。'
     )
@@ -8701,7 +8701,7 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
     // 启动时「当前使用」已有选中账户 → 自动检测实例并按个数自动选 KV
     //
     // 用户要求（2026-10-29）：点「检测账号」或者在「当前使用」里选中账户时，
-    // 都要自动探测有没有 CFPilot 实例，唯一实例直接选中并保存。
+    // 都要自动探测有没有 EdgeTunnel 实例，唯一实例直接选中并保存。
     // 这一条不能 await —— 它要打 Cloudflare API，慢的时候会拖住界面首屏。
     void (async () => {
       try {
