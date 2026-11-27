@@ -1960,6 +1960,20 @@
               </p>
             </div>
 
+            <div class="row" id="deployCustomDomainFields">
+              <div class="field">
+                <label for="deployDomainZone">域名列表</label>
+                <select id="deployDomainZone">
+                  <option value="">正在读取域名列表…</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="deployDomainPrefix">自定义域前缀（选填）</label>
+                <input type="text" id="deployDomainPrefix" placeholder="例如 11；留空则直接使用所选域名" />
+                <p class="tip" id="deployDomainPreview">选择域名后，部署时自动绑定自定义域名。</p>
+              </div>
+            </div>
+
             <div class="field">
               <label>EdgeTunnel 管理密码 ADMIN（可选）</label>
               <input
