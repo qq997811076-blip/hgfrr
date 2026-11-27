@@ -1163,6 +1163,7 @@ func (s *Server) handleKvList(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "列出 KV 失败：" + err.Error()})
 		return
 	}
+	edgeBindings := detectEdgeTunnelBindings(ctx, client, accountID)
 
 	type kvOption struct {
 		ID               string `json:"id"`
@@ -1202,6 +1203,12 @@ func (s *Server) handleKvList(w http.ResponseWriter, r *http.Request) {
 
 			ns := nsList[i]
 			opt := &options[i]
+			if binding, ok := edgeBindings[ns.ID]; ok {
+				opt.Ownership = "instance"
+				opt.DataProject = binding.Project
+				opt.DataSubdomain = binding.URL
+				return
+			}
 
 			// 1) 先列键名：归属靠**键名集合**判定，不能只看 config / CONFIG。
 			//    别的项目可能用 `c` / `wk` / `rm` 这类键名，只探两个键会把
