@@ -2060,8 +2060,8 @@
                   悬浮气泡容易被漏看。
               -->
               <div class="radios">
-                <label class="chk" title="深度集成 Git (GitHub/GitLab)，自动构建便利，开放流量，适合静态网站和无自有域名部署；*.pages.dev 域名直连可访问，无需配置自定义域名！"><input type="radio" name="dataPlane" value="pages" checked /> Pages 模式（默认）</label>
-                <label class="chk" title="极致的动态与边缘控制，适合 API、代理、鉴权、重定向、SSR 渲染以及结合 D1、R2、KV 等全栈后端部署；*.workers.dev 域名直连无法访问，请登录 cloudflare 控制台配置自定义域名！"><input type="radio" name="dataPlane" value="workers" /> Workers 模式</label>
+                <label class="chk" title="使用 EdgeTunnel 官方 _worker.js，自动打包为 Pages Advanced Mode Worker Bundle 并部署到 Pages，访问地址为 *.pages.dev。"><input type="radio" name="dataPlane" value="pages" checked /> EdgeTunnel Pages 部署</label>
+                <label class="chk" title="使用同一份 EdgeTunnel 官方 _worker.js，直接上传为 Cloudflare Worker，自动开启 workers.dev。"><input type="radio" name="dataPlane" value="workers" /> EdgeTunnel Workers 部署</label>
               </div>
               <div id="dataHostField" style="display:none;margin-top:10px">
                 <label>节点域名（Workers 模式）</label>

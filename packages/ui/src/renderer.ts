@@ -1310,9 +1310,9 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
    * 这里不再往页面上写第二份 —— 两处文案必然漂移。
    */
   function syncDataPlaneUI(): void {
-    const mode = readDataPlane()
+    // EdgeTunnel Workers / Pages 均由部署流程自动生成访问域名，不需要旧 CFPilot 的 DATA_HOST 输入。
     const field = document.getElementById('dataHostField')
-    if (field) field.style.display = mode === 'workers' ? 'block' : 'none'
+    if (field) field.style.display = 'none'
   }
 
   /**

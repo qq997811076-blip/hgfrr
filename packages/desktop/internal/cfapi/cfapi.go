@@ -735,6 +735,9 @@ type PagesDeployOptions struct {
 	CommitMessage string
 	// Branch 是分支名（默认 main）
 	Branch string
+	// Bindings 是 Pages Advanced Mode Worker 的 KV / 环境变量绑定。
+	// 键为运行时变量名，值为 Cloudflare Worker binding 描述。
+	Bindings map[string]any
 }
 
 // DeployPagesWorker 上传 _worker.js 完成一次部署。
@@ -769,9 +772,13 @@ func (c *Client) DeployPagesWorker(ctx context.Context, opts PagesDeployOptions)
 	// ================================================================
 
 	// ---- 内层：构建 _worker.bundle ----
+	bindings := opts.Bindings
+	if bindings == nil {
+		bindings = map[string]any{}
+	}
 	innerMeta := map[string]any{
 		"main_module": "_worker.js",
-		"bindings":    map[string]any{},
+		"bindings":    bindings,
 	}
 	innerMetaRaw, err := json.Marshal(innerMeta)
 	if err != nil {

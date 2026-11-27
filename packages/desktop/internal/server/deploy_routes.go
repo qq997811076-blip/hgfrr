@@ -224,8 +224,7 @@ func (s *Server) handleDeployRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// EdgeTunnel 是本 APK 当前部署目标：仅替换云端部署核心，原 UI 与本地 Go 服务保持不变。
-	// EdgeTunnel 使用单个官方 Worker、ADMIN 环境变量和 KV 绑定，不再上传 CFPilot 双 Worker 内核。
+	// Workers / Pages 二选一，共用同一份 EdgeTunnel 官方 _worker.js 核心。
 	s.startEdgeTunnelDeploy(w, req, profile)
 	return
 
@@ -1378,9 +1377,18 @@ func (s *Server) startEdgeTunnelDeploy(w http.ResponseWriter, req deployRequest,
 
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 		defer cancel()
-		result, err := deploy.DeployEdgeTunnel(ctx, client, profile.AccountID, workerName, adminPassword, kvID, func(message string) {
-			s.logf(message)
-		})
+		target := strings.ToLower(strings.TrimSpace(req.DataPlaneMode))
+		if target != "workers" {
+			target = "pages"
+		}
+		deployLog := func(message string) { s.logf(message) }
+		var result *deploy.EdgeTunnelResult
+		var err error
+		if target == "pages" {
+			result, err = deploy.DeployEdgeTunnelPages(ctx, client, profile.AccountID, workerName, adminPassword, kvID, deployLog)
+		} else {
+			result, err = deploy.DeployEdgeTunnel(ctx, client, profile.AccountID, workerName, adminPassword, kvID, deployLog)
+		}
 		payload := map[string]any{"ok": err == nil}
 		if err != nil {
 			payload["error"] = err.Error()
@@ -1391,7 +1399,7 @@ func (s *Server) startEdgeTunnelDeploy(w http.ResponseWriter, req deployRequest,
 			deployed := &deploy.Result{
 				Control: slot, Data: slot, Warnings: result.Warnings,
 				PanelPath: "/admin", PanelPassword: result.Admin,
-				DataPlaneMode: "workers",
+				DataPlaneMode: target,
 			}
 			payload["result"] = deployed
 			s.saveSnapshot(&DeploySnapshot{
@@ -1400,12 +1408,12 @@ func (s *Server) startEdgeTunnelDeploy(w http.ResponseWriter, req deployRequest,
 				DataProject: result.Name, DataSubdomain: host,
 				At: time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
 				AccountID: profile.AccountID, AccountName: profile.AccountName,
-				DataPlaneMode: "workers",
+				DataPlaneMode: target,
 			})
 			for _, warning := range result.Warnings {
 				s.logLevel("⚠ "+warning, "warn")
 			}
-			s.logLevel("EdgeTunnel 部署完成："+result.URL, "ok")
+			s.logLevel("EdgeTunnel "+strings.ToUpper(target)+" 部署完成："+result.URL, "ok")
 			s.logLevel("后台地址："+result.URL+"/admin", "ok")
 			s.logLevel("后台密码："+result.Admin, "ok")
 			s.events.publish("deploy-status", payload)
@@ -1414,7 +1422,7 @@ func (s *Server) startEdgeTunnelDeploy(w http.ResponseWriter, req deployRequest,
 		s.events.publish("deploy-status", payload)
 	}()
 
-	response := map[string]any{"started": true, "note": "EdgeTunnel 部署已开始，进度会通过 SSE 实时推送"}
+	response := map[string]any{"started": true, "note": "EdgeTunnel "+strings.ToUpper(strings.TrimSpace(req.DataPlaneMode))+" 部署已开始，进度会通过 SSE 实时推送"}
 	if kvTitle != "" {
 		response["kvNamespaceId"] = kvID
 		response["kvTitle"] = kvTitle
