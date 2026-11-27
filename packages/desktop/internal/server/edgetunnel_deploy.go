@@ -143,8 +143,7 @@ func (s *Server) handleEdgeTunnelDeploy(w http.ResponseWriter, req deployRequest
 	if project == "" { project = "edgetunnel-" + shortRandom(6) }
 	admin := strings.TrimSpace(req.PanelPassword)
 	if admin == "" && hasManifest && !strings.EqualFold(req.Mode,"fresh") {
-		// EdgeTunnel ADMIN is a Cloudflare binding and cannot be read back reliably.
-		// Keep the saved local deployment password if the caller supplied it; otherwise generate a new one.
+		admin = old.AdminPassword
 	}
 	if admin == "" { admin = edgeTunnelRandomPassword() }
 
