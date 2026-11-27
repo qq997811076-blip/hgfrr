@@ -150,6 +150,14 @@ func (s *Server) handleEdgeTunnelDeploy(w http.ResponseWriter, req deployRequest
 	if kvTitle == "" {
 		if list,e:=client.ListKVNamespaces(ctx,profile.AccountID); e==nil { for _,ns:=range list { if ns.ID==kvID { kvTitle=ns.Title; break } } }
 	}
+	at := time.Now().UTC().Format(time.RFC3339)
+	s.rememberInstances(map[string]InstanceInfo{kvID:{
+		KVTitle:kvTitle,DataProject:project,DataSubdomain:publicURL,At:at,
+	}})
+	s.saveSnapshot(&DeploySnapshot{
+		KVNamespaceID:kvID,KVTitle:kvTitle,DataProject:project,DataSubdomain:publicURL,
+		AccountID:profile.AccountID,AccountName:profile.AccountName,DataPlaneMode:mode,At:at,
+	})
 	s.logLevel("EdgeTunnel 部署完成："+publicURL,"ok")
 	s.logLevel("EdgeTunnel 管理密码（ADMIN）："+admin,"ok")
 	result := map[string]any{
