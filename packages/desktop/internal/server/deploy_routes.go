@@ -1217,16 +1217,10 @@ func (s *Server) handleKvList(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			hasManifest := false
 			hasEdgeTunnel := false
-			cfpilotTouched := false
 			for _, key := range keys {
-				if key == deploy.ManifestKey { hasManifest = true }
 				if key == edgeTunnelManifestKey { hasEdgeTunnel = true }
-				if deploy.IsCfPilotKVKey(key) { cfpilotTouched = true }
 			}
-
-			// EdgeTunnel 实例以专用标记识别，不再把 CFPilot 清单当作本项目实例。
 			if hasEdgeTunnel {
 				if raw, ok := client.GetKVValue(ctx, accountID, ns.ID, edgeTunnelManifestKey); ok && strings.TrimSpace(raw) != "" {
 					var m edgeTunnelManifest
@@ -1238,35 +1232,8 @@ func (s *Server) handleKvList(w http.ResponseWriter, r *http.Request) {
 						return
 					}
 				}
-				opt.Ownership = "foreign"
-				return
 			}
-
-			// 2) 有清单 → instance（或清单损坏 → cfpilot 残留）
-			if hasManifest {
-				if raw, ok := client.GetKVValue(ctx, accountID, ns.ID, deploy.ManifestKey); ok && strings.TrimSpace(raw) != "" {
-					var m deploy.Manifest
-					if err := json.Unmarshal([]byte(raw), &m); err == nil {
-						opt.Ownership = "instance"
-						opt.ControlProject = m.ControlProject
-						opt.DataProject = m.DataProject
-						opt.At = m.At
-						opt.Build = m.Build
-						opt.ControlSubdomain = m.ControlSubdomain
-						opt.DataSubdomain = m.DataSubdomain
-						return
-					}
-				}
-				opt.Ownership = "cfpilot"
-				return
-			}
-
-			if cfpilotTouched {
-				opt.Ownership = "cfpilot"
-				return
-			}
-
-			// 3) 有键但一个都不是本项目的 → 被其它项目占着（界面禁用）
+			// 旧 CFPilot 命名空间和其他项目命名空间都不作为 EdgeTunnel 实例。
 			opt.Ownership = "foreign"
 		}(i)
 	}
