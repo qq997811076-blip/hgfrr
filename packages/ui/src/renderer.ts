@@ -387,7 +387,7 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
       const opt = document.createElement('option')
       opt.value = item.id
       if (item.ownership === 'instance') {
-        opt.textContent = `● ${item.title} — 实例 ${item.controlProject}/${item.dataProject}（${item.at ?? ''}）`
+        opt.textContent = `● ${item.title} — EdgeTunnel ${item.dataProject}（${item.at ?? ''}）`
       } else if (item.ownership === 'foreign') {
         // 被其他项目占用的命名空间：直接禁用，不给选中的机会。
         // 服务端 assertKvOwnership 也会硬拒绝，这里是第一道防线。
@@ -420,12 +420,10 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
     }
     if (item.ownership === 'instance') {
       hint.textContent =
-        `控制面 ${item.controlProject} / 数据面 ${item.dataProject}，部署于 ${item.at}。` + (kvGuidance ? ' ' + kvGuidance : '')
+        `EdgeTunnel 项目 ${item.dataProject}，部署于 ${item.at || '未知时间'}。` + (kvGuidance ? ' ' + kvGuidance : '')
     } else if (item.ownership === 'foreign') {
       hint.textContent =
-        '此命名空间已被其他项目占用，不能用于 CFPilot。' +
-        'CFPilot 的数据面已完全自研，两者不再共用同一 KV' +
-        '（会共享配额、混淆配置、让排查变难）。请到「部署」页新建一个实例。'
+        '此命名空间已被其他项目占用，不能用于 EdgeTunnel。请到「部署」页新建一个 KV 实例。'
     } else if (item.ownership === 'cfpilot') {
       hint.textContent =
         '此命名空间含 CFPilot 的 CONFIG 键但没有部署清单（残留配置）。' +
