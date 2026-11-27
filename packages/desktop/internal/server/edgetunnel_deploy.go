@@ -28,6 +28,7 @@ type edgeTunnelManifest struct {
 	URL string `json:"url"`
 	KVNamespaceID string `json:"kvNamespaceId"`
 	AdminSet bool `json:"adminSet"`
+	AdminPassword string `json:"adminPassword,omitempty"`
 	UpdatedAt string `json:"updatedAt"`
 }
 
@@ -141,7 +142,7 @@ func (s *Server) handleEdgeTunnelDeploy(w http.ResponseWriter, req deployRequest
 		publicURL = "https://"+project+".pages.dev"
 	}
 
-	manifest := edgeTunnelManifest{Project:project,Mode:mode,URL:publicURL,KVNamespaceID:kvID,AdminSet:true,UpdatedAt:time.Now().UTC().Format(time.RFC3339)}
+	manifest := edgeTunnelManifest{Project:project,Mode:mode,URL:publicURL,KVNamespaceID:kvID,AdminSet:true,AdminPassword:admin,UpdatedAt:time.Now().UTC().Format(time.RFC3339)}
 	encoded,_ := json.Marshal(manifest)
 	if err := client.SetKVValue(ctx,profile.AccountID,kvID,edgeTunnelManifestKey,string(encoded)); err != nil {
 		s.logLevel("部署已上传，但写入本地实例识别标记失败："+err.Error(),"warn")
