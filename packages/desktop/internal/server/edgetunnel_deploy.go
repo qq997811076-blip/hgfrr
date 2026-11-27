@@ -60,9 +60,9 @@ func detectEdgeTunnelBindings(ctx context.Context, client *cfapi.Client, account
 				}
 			}
 			if kvID != "" && hasAdmin {
-				host := name + ".workers.dev"
-				if sub != "" { host = name + "." + sub + ".workers.dev" }
-				found[kvID] = edgeTunnelBinding{Project:name,Mode:"workers",URL:"https://"+host,AdminPassword:adminPassword}
+				host := ""
+				if sub != "" { host = "https://" + name + "." + sub + ".workers.dev" }
+				found[kvID] = edgeTunnelBinding{Project:name,Mode:"workers",URL:host,AdminPassword:adminPassword}
 			}
 		}
 	}
@@ -170,8 +170,12 @@ func (s *Server) handleEdgeTunnelDeploy(w http.ResponseWriter, req deployRequest
 		if err := client.PutScriptSubdomain(ctx,profile.AccountID,project,true,false); err != nil {
 			s.logLevel("开启 workers.dev 访问入口失败："+err.Error(),"warn")
 		}
-		publicURL = "https://"+project+"."+strings.TrimSpace(sub)+".workers.dev"
-		if strings.TrimSpace(sub)=="" { publicURL = "https://"+project+".workers.dev" }
+		if strings.TrimSpace(sub) == "" {
+			s.logLevel("Worker 已上传，但该账号尚未设置 workers.dev 子域；请到 Cloudflare 控制台启用 workers.dev，或绑定自定义域名。","warn")
+			publicURL = ""
+		} else {
+			publicURL = "https://"+project+"."+strings.TrimSpace(sub)+".workers.dev"
+		}
 	} else {
 		existing, err := client.GetPagesProject(ctx,profile.AccountID,project)
 		if err != nil { writeJSON(w,http.StatusBadGateway,map[string]any{"error":"查询 Pages 项目失败："+err.Error()}); return }
