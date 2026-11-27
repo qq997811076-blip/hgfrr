@@ -32,6 +32,52 @@ type edgeTunnelManifest struct {
 	UpdatedAt string `json:"updatedAt"`
 }
 
+type edgeTunnelBinding struct {
+	Project string
+	Mode string
+	URL string
+}
+
+func detectEdgeTunnelBindings(ctx context.Context, client *cfapi.Client, accountID string) map[string]edgeTunnelBinding {
+	found := map[string]edgeTunnelBinding{}
+	// Workers：EdgeTunnel 使用名为 KV 的 KV namespace 和 ADMIN 环境变量。
+	if scripts, err := client.ListScripts(ctx, accountID); err == nil {
+		sub, _ := client.GetWorkersSubdomain(ctx, accountID)
+		for _, name := range scripts {
+			bindings, err := client.GetWorkerScriptSettings(ctx, accountID, name)
+			if err != nil { continue }
+			kvID, hasAdmin := "", false
+			for _, b := range bindings {
+				bindingName, _ := b["name"].(string)
+				bindingType, _ := b["type"].(string)
+				if bindingName == "KV" && bindingType == "kv_namespace" {
+					kvID, _ = b["namespace_id"].(string)
+				}
+				if bindingName == "ADMIN" { hasAdmin = true }
+			}
+			if kvID != "" && hasAdmin {
+				host := name + ".workers.dev"
+				if sub != "" { host = name + "." + sub + ".workers.dev" }
+				found[kvID] = edgeTunnelBinding{Project:name,Mode:"workers",URL:"https://"+host}
+			}
+		}
+	}
+	// Pages：同样通过 KV / ADMIN 绑定识别，不依赖本工具写入的私有标记。
+	if projects, err := client.ListPagesProjects(ctx, accountID); err == nil {
+		for _, project := range projects {
+			production := project.DeploymentConfigs.Production
+			kv := production.KVNamespaces["KV"]
+			_, hasAdmin := production.EnvVars["ADMIN"]
+			if kv.NamespaceID != "" && hasAdmin {
+				host := strings.TrimSpace(project.Subdomain)
+				if host == "" { host = project.Name + ".pages.dev" }
+				found[kv.NamespaceID] = edgeTunnelBinding{Project:project.Name,Mode:"pages",URL:"https://"+host}
+			}
+		}
+	}
+	return found
+}
+
 func edgeTunnelRandomPassword() string {
 	var b [18]byte
 	if _, err := rand.Read(b[:]); err != nil { return fmt.Sprintf("EDT-%d", time.Now().UnixNano()) }
