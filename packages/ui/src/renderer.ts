@@ -7709,9 +7709,12 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
         markDeploySettled()
         // 部署结束后运行状态会过时（版本、项目名都变了），静默刷新一次
         if (s.ok) {
-          const select = $sel('kvSelect')
-          void window.cfpilot
-            .checkDeployed(select.value || undefined)
+          // 全新部署可能由后端刚创建 KV；先刷新列表并同步已保存的 KV 选择，再检查线上状态。
+          void loadKvOptions()
+            .then(() => {
+              const select = $sel('kvSelect')
+              return window.cfpilot.checkDeployed(select.value || undefined)
+            })
             .then((st) => {
               if (applyDeployStatus) applyDeployStatus(st as DeployStatusLike)
               void loadRuntimeStatus()
