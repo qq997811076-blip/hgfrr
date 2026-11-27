@@ -206,7 +206,7 @@ func (s *Server) handleEdgeTunnelDeploy(w http.ResponseWriter, req deployRequest
 			}
 			// PATCH 会触发一次部署；现有 Pages 项目已运行同一份固定版本的 _worker.js，
 			// 因此只更新 ADMIN / KV 配置，不再重复提交第二次 Worker 部署。
-			if err := client.ConfigurePages(ctx,profile.AccountID,project,envVars,kvBindings); err != nil {
+			if err := client.ConfigureEdgeTunnelPages(ctx,profile.AccountID,project,envVars,kvBindings); err != nil {
 				writeJSON(w,http.StatusBadGateway,map[string]any{"error":"更新 Pages 的 ADMIN / KV 失败："+err.Error()}); return
 			}
 		}
