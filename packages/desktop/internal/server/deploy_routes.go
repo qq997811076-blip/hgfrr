@@ -887,6 +887,17 @@ func (s *Server) handleDeployCredentials(w http.ResponseWriter, r *http.Request)
 			return
 		}
 	}
+	bindCtx, cancelBind := context.WithTimeout(r.Context(), 18*time.Second)
+	if bound, ok := detectEdgeTunnelBindings(bindCtx, client, profile.AccountID)[kvID]; ok {
+		cancelBind()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":true,"panelUrl":bound.URL,"panelPath":"/admin",
+			"panelPassword":bound.AdminPassword,"uuid":"","wsPath":"",
+			"dataSubdomain":bound.URL,"build":"EdgeTunnel",
+		})
+		return
+	}
+	cancelBind()
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
 
