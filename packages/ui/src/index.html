@@ -713,7 +713,7 @@
     .warnbox b { color: var(--warn); }
 
     /* --------------------------------------------------------------
-       凭据页「醒目提示」：检测到 0 / 多个 CFPilot 实例时必须有存在感
+       凭据页「醒目提示」：检测到 0 / 多个 EdgeTunnel 实例时必须有存在感
        —— 多实例选错 KV 会让后续所有功能都作用到错的实例上
        -------------------------------------------------------------- */
     .cred-alert {
@@ -1813,7 +1813,7 @@
               · Account & Billing / Account API Tokens / <b>Read</b> —— 仅用于显示 Token 有效期<br>
               · Analytics & Logs / Account Analytics / <b>Read</b> —— 仅用于「用量/额度」面板（查已用量）<br>
               · DNS & Zone / Account DNS Settings / <b>Edit</b>（+ DNS View / <b>Read</b>）—— 仅绑定自定义域名时需要<br>
-			  <b>Workers 模式增加一项必需</b><br>
+			  <b>Workers 部署增加一项必需</b><br>
 			  · Developer Platform / Workers / Admin —— 建/删 Workers 项目、上传内核、绑 KV、配环境变量<br>
 			  <br>
 
@@ -1925,7 +1925,7 @@
             </div>
 
             <div class="field">
-              <label>数据面部署模式</label>
+              <label>部署方式</label>
               <!--
                 两段模式说明同样移进 title 气泡（文案是产品口径，原样保留）：
                   Pages   —— 深度集成 Git (GitHub/GitLab)，自动构建便利，开放流量，
@@ -1938,7 +1938,7 @@
                   悬浮气泡容易被漏看。
               -->
               <div class="radios">
-                <label class="chk" title="深度集成 Git (GitHub/GitLab)，自动构建便利，开放流量，适合静态网站和无自有域名部署；*.pages.dev 域名直连可访问，无需配置自定义域名！"><input type="radio" name="dataPlane" value="pages" checked /> Pages 模式（默认）</label>
+                <label class="chk" title="深度集成 Git (GitHub/GitLab)，自动构建便利，开放流量，适合静态网站和无自有域名部署；*.pages.dev 域名直连可访问，无需配置自定义域名！"><input type="radio" name="dataPlane" value="pages" checked /> Pages 部署（默认）</label>
                 <label class="chk" title="极致的动态与边缘控制，适合 API、代理、鉴权、重定向、SSR 渲染以及结合 D1、R2、KV 等全栈后端部署；*.workers.dev 域名直连无法访问，请登录 cloudflare 控制台配置自定义域名！"><input type="radio" name="dataPlane" value="workers" /> Workers 模式</label>
               </div>
               <div id="dataHostField" style="display:none;margin-top:10px">
@@ -1961,14 +1961,14 @@
             </div>
 
             <div class="field">
-              <label>面板密码（可选，首次部署建议手动填写）</label>
+              <label>EdgeTunnel 管理密码 ADMIN（可选）</label>
               <input
                 type="password"
                 id="deployPanelPassword"
-                placeholder="首次部署留空 = 由系统随机生成；更新部署留空 = 沿用原密码不变"
+                placeholder="首次部署留空 = 自动生成；更新部署留空 = 自动生成新密码"
               />
               <p class="tip">
-                部署完成后，密码会显示在日志中（面板密码在云端加密，事后无法再读取）。
+                部署完成后会在日志中显示 ADMIN 管理密码，也可在凭据查看中读取。
               </p>
             </div>
 
@@ -1977,25 +1977,25 @@
               <div class="fold-body">
                 <div class="row">
                   <div class="field">
-                    <label>控制面项目名</label>
+                    <label>控制面项目名（EdgeTunnel 不使用）</label>
                     <input type="text" id="controlProject" placeholder="留空 = 随机或按清单" />
                     <p class="tip">承载面板、订阅与探针，客户端不连接该项目</p>
                   </div>
                   <div class="field">
-                    <label>数据面项目名</label>
+                    <label>EdgeTunnel 项目名</label>
                     <input type="text" id="dataProject" placeholder="留空 = 随机或按清单" />
-                    <p class="tip">代理转发层，<b>客户端连接的是该项目</b></p>
+                    <p class="tip">EdgeTunnel Worker / Pages 项目的名称</p>
                   </div>
                 </div>
 
                 <div class="row">
                   <div class="field">
-                    <label>面板路径</label>
+                    <label>面板路径（EdgeTunnel 不使用）</label>
                     <input type="text" id="panelPath" placeholder="如 /p-a1b2c3d4" />
                     <p class="tip">面板访问路径，留空则随机生成或沿用已有值</p>
                   </div>
                   <div class="field">
-                    <label>WS 路径</label>
+                    <label>WS 路径（EdgeTunnel 不使用）</label>
                     <input type="text" id="wsPath" placeholder="如 /k7m2x9q4w8" />
                     <p class="tip">代理的 WebSocket 路径，留空则随机生成或沿用已有值</p>
                   </div>
