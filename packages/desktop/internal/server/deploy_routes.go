@@ -876,17 +876,6 @@ func (s *Server) handleDeployCredentials(w http.ResponseWriter, r *http.Request)
 	}
 
 	client := s.newCFClient(profile.CfToken)
-	if raw, state, err := client.GetKVValueState(r.Context(), profile.AccountID, kvID, edgeTunnelManifestKey); err == nil && state == cfapi.KVFound {
-		var m edgeTunnelManifest
-		if json.Unmarshal([]byte(raw), &m) == nil && m.Project != "" {
-			writeJSON(w, http.StatusOK, map[string]any{
-				"ok":true,"panelUrl":m.URL,"panelPath":"/admin",
-				"panelPassword":m.AdminPassword,"uuid":"","wsPath":"",
-				"dataSubdomain":m.URL,"build":"EdgeTunnel","at":m.UpdatedAt,
-			})
-			return
-		}
-	}
 	bindCtx, cancelBind := context.WithTimeout(r.Context(), 18*time.Second)
 	if bound, ok := detectEdgeTunnelBindings(bindCtx, client, profile.AccountID)[kvID]; ok {
 		cancelBind()
