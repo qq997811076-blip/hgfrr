@@ -199,9 +199,9 @@ jobs:
           printf "rootProject.name = 'wrap'\n" > /tmp/wrap/settings.gradle
           cd /tmp/wrap
           gradle wrapper --gradle-version 8.9 --distribution-type bin
-          cp -r gradle gradlew gradlew.bat /home/runner/work/CFPilot/CFPilot/packages/android/
-          chmod +x /home/runner/work/CFPilot/CFPilot/packages/android/gradlew
-          cd /home/runner/work/CFPilot/CFPilot/packages/android
+          cp -r gradle gradlew gradlew.bat "$GITHUB_WORKSPACE/packages/android"/
+          chmod +x "$GITHUB_WORKSPACE/packages/android"/gradlew
+          cd "$GITHUB_WORKSPACE/packages/android"
           ./gradlew --no-daemon :app:assembleRelease
           ls -la app/build/outputs/apk/release/
 
