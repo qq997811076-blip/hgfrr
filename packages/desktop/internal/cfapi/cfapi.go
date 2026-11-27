@@ -570,6 +570,11 @@ type PagesDeployConfigs struct {
 // PagesEnvConfig 是某个环境的配置。
 type PagesEnvConfig struct {
 	EnvVars map[string]PageVar `json:"env_vars"`
+	KVNamespaces map[string]PagesKVBinding `json:"kv_namespaces"`
+}
+
+type PagesKVBinding struct {
+	NamespaceID string `json:"namespace_id"`
 }
 
 // PagesDeployment 是 Pages 部署记录。
