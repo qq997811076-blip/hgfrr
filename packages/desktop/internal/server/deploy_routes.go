@@ -177,8 +177,11 @@ type deployRequest struct {
 	PanelPath      string `json:"panelPath"`
 	WSPath         string `json:"wsPath"`
 
-	// DataHost 是 Workers 数据面的节点域名（写进控制面 DATA_HOST，工具不绑定）
+	// DataHost 是 Workers 数据面的节点域名（写进控制面 DATA_HOST）。
 	DataHost string `json:"dataHost"`
+	// CustomDomainZoneID / CustomDomainPrefix 用于部署时自动绑定所选域名。
+	CustomDomainZoneID string `json:"customDomainZoneId"`
+	CustomDomainPrefix string `json:"customDomainPrefix"`
 	// DataPlaneMode 是数据面部署形态：pages / workers。
 	//
 	// 留空 = 沿用部署清单里记录的形态（没有清单则 pages）。
