@@ -1946,8 +1946,8 @@
                 <input type="text" id="dataHost" placeholder="如 w1.example.com" />
                 <p class="tip" id="dataHostHint">
                   域名会写进控制面的 <code>DATA_HOST</code>变量（订阅里的节点地址），
-                  <b>该部署不自动绑定域名</b>。部署成功后请到
-                  Cloudflare 控制台 → Workers 和 Pages → 该 Worker →「域」标签页 → 添加自定义域名（与上方填写值一致）。<br>
+                  此处填写值只用于控制面的 <code>DATA_HOST</code>。如需自动绑定自定义域名，
+                  请在下方「域名列表」中选择域名，并按需填写「自定义域前缀」；部署时会自动完成绑定。<br>
                   点「检查部署状态」会按平台上的**真实绑定**自动刷新。
                 </p>
                 <p class="tip">
