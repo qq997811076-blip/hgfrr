@@ -622,42 +622,19 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
   }
 
   /**
-   * 清空部署页的输入框。
-   *
-   * 单独抽出来是因为除了「切换账户」，「新建账户模式」也要清同一批框。
-   *
-   * ⚠️ 这里**必须包含「数据面域名」（dataHost）**：
-   * 它决定控制面 DATA_HOST（订阅里节点的 sni/host）。
-   * 漏清的后果（2026-11-02 真机事故）：
-   * 账号 A 更新部署 → 表单里留下 A 的数据面域名 → 切到账号 B →
-   * 点「检查部署状态」不会覆盖已填内容 → 直接点「更新部署」→
-   * **A 的域名被写进 B 的控制面 DATA_HOST** → B 的节点全部 -1。
-   *
-   * 同理，「数据面部署形态」也是账号相关的：A 选了 Workers，
-   * 切到 B 后 B 也被悄悄按 Workers 部署。
+   * 清空部署页中仍保留的可编辑字段，避免切换账户时沿用上一个账号的项目名或密码。
    */
   function clearDeployFormFields(): void {
-    for (const id of [
-      'controlProject',
-      'dataProject',
-      'panelPath',
-      'wsPath',
-      'deployPanelPassword',
-      // 数据面域名：跨账号残留会写坏 DATA_HOST（见上面的说明）
-      'dataHost',
-    ]) {
+    for (const id of ['dataProject', 'deployPanelPassword']) {
       const el = document.getElementById(id) as HTMLInputElement | null
       if (el) el.value = ''
     }
-    // 数据面部署形态：回到默认（Pages），并允许「检查部署状态」按新账号的清单回填。
+    // 数据面部署形态：回到默认（Pages），并允许检查状态按新账号的清单回填。
     dataPlaneTouched = false
     const planeRadio = document.querySelector(
       'input[name="dataPlane"][value="pages"]'
     ) as HTMLInputElement | null
-    if (planeRadio) {
-      planeRadio.checked = true
-      syncDataPlaneUI()
-    }
+    if (planeRadio) planeRadio.checked = true
   }
 
   /** 绑定账户管理相关事件 */
@@ -1323,18 +1300,6 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
   }
 
   /**
-   * 按当前选中的形态切换「自定义域名」输入框的可见性。
-   *
-   * 模式说明文案已移进各选项的 `title` 悬浮气泡（见 index.html），
-   * 这里不再往页面上写第二份 —— 两处文案必然漂移。
-   */
-  function syncDataPlaneUI(): void {
-    const mode = readDataPlane()
-    const field = document.getElementById('dataHostField')
-    if (field) field.style.display = mode === 'workers' ? 'block' : 'none'
-  }
-
-  /**
    * 统一的忙碌态开关。
    *
    * ⚠️ 不要用 `setAttribute('disabled', '')` 来「取消禁用」：
@@ -1442,14 +1407,12 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
     domainZone?.addEventListener('change', renderDeployDomainPreview)
     domainPrefix?.addEventListener('input', renderDeployDomainPreview)
 
-    // 数据面形态：切换时更新说明文案与「自定义域名」输入框
+    // 数据面形态：记录用户是否手动切换，避免检查状态时覆盖用户选择。
     document.querySelectorAll('input[name="dataPlane"]').forEach((el) => {
       el.addEventListener('change', () => {
         dataPlaneTouched = true
-        syncDataPlaneUI()
       })
     })
-    syncDataPlaneUI()
 
     // 「本次操作」切换时，按钮文案 / 可用性 / 提示必须立刻重新计算：
     // 不能停留在「检查部署状态」算出的那一次结果，否则按钮名与实际动作不符。
@@ -1565,16 +1528,10 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
           {
             mode,
             force: $('optForce').checked,
-            newCredentials: $('optNewCred').checked,
-            controlProject: $('controlProject').value.trim(),
             dataProject: $('dataProject').value.trim(),
-            panelPath: $('panelPath').value.trim(),
-            wsPath: $('wsPath').value.trim(),
             // 数据面形态：始终发送当前选中值。
             // 后端只有在「与清单不一致」时才当成形态切换（并自动清理旧数据面）。
             dataPlaneMode: readDataPlane(),
-            // 节点域名：只写进控制面 DATA_HOST。
-            dataHost: $('dataHost').value.trim(),
             // 可选自定义域名：后端按所选 Zone 的真实名称拼接并在部署后绑定。
             customDomainZoneId: (document.getElementById('deployDomainZone') as HTMLSelectElement | null)?.value || '',
             customDomainPrefix: (document.getElementById('deployDomainPrefix') as HTMLInputElement | null)?.value.trim() || '',
@@ -7554,30 +7511,6 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
         return
       }
 
-      // 回填节点域名：**用平台上的真实绑定覆盖**，不是"只在为空时填"。
-      //
-      // ⚠️ 真机事故（2026-11-02）：填的是**另一个账号**的域名，
-      // 用户根本没察觉填错 → 点「更新部署」→ 又写坏一次 DATA_HOST → 节点全 -1。
-      //
-      // 现在这个值来自后端对**当前账号**的实时查询（Worker 绑定 / workers.dev 兜底），
-      // 每次「检查部署状态」都会覆盖一次，用户看到的就是当前账号真实的节点域名。
-      const hostInput = document.getElementById('dataHost') as HTMLInputElement | null
-      const nodeHost = (status as { nodeHost?: string; nodeHostSource?: string; nodeHostWarning?: string }).nodeHost ?? ''
-      const nodeHostSource = (status as { nodeHostSource?: string }).nodeHostSource ?? ''
-      const nodeHostWarning = (status as { nodeHostWarning?: string }).nodeHostWarning ?? ''
-      if (hostInput && nodeHost) {
-        hostInput.value = nodeHost
-        const hostTip = document.getElementById('dataHostHint')
-        if (hostTip) {
-          hostTip.textContent = '来源：' + nodeHostSource + '（每次「检查部署状态」都会按平台实际绑定刷新）'
-        }
-      } else if (hostInput && nodeHostWarning) {
-        const hostTip = document.getElementById('dataHostHint')
-        if (hostTip) {
-          hostTip.textContent = '⚠ ' + nodeHostWarning.replace(/\n/g, ' ')
-        }
-      }
-
       // 回填数据面形态（只在用户本次没手动改过时）。
       //
       // 不回填的话，一个 Workers 实例被顺手更新一次就会被悄悄改成 Pages ——
@@ -7588,7 +7521,6 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
           `input[name="dataPlane"][value="${plane}"]`
         ) as HTMLInputElement | null
         if (radio) radio.checked = true
-        syncDataPlaneUI()
       }
 
       // 部署实例与内核版本统一渲染到「运行状态」卡片（见 renderDeployInstance / renderKernelInfo）。
@@ -7799,101 +7731,6 @@ import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from '
         if (p.source && p.source !== 'GitHub') parts.push(`镜像 ${p.source}`)
         if (p.attempt > 1) parts.push(`第 ${p.attempt} 次尝试`)
         text.textContent = parts.join(' · ')
-      }
-    })
-  }
-
-  /**
-   * 链式代理（自建落地节点）
-   *
-   * ## 为什么叫「链式」
-   *
-   * 链路形态是 客户端 → Worker（前置）→ 你的 VPS（落地）→ 目标站。
-   * 前半段负责抗封锁与就近接入，后半段决定目标站看到的出口 IP。
-   *
-   * ## 为什么需要它
-   *
-   * Cloudflare 的出口是机房 IP。流媒体与部分站点对机房 IP 的风控是
-   * 结构性的 —— 不是配置错了，是 IP 类型不对。换一个自己的出口，
-   * 比任何「解锁检测」都有效。
-   *
-   * ## 为什么要有「复制命令」这条路
-   *
-   * 桌面进程没有终端，ssh 读不到 /dev/tty，**无法提示输入密码**。
-   * 所以没配密钥的用户走「复制命令」：把整段脚本用 heredoc 包成一条命令，
-   * 粘到终端里执行 —— 那里 ssh 才能正常要密码。
-   */
-  function bindChain(): void {
-    const hostEl = $('chainHost')
-    const portEl = $('chainPort')
-    const outEl = $('chainOut')
-    const deployBtn = document.getElementById('btnChainDeploy') as HTMLButtonElement | null
-    const copyBtn = document.getElementById('btnChainCopy') as HTMLButtonElement | null
-    if (!hostEl || !portEl || !outEl || !deployBtn || !copyBtn) return
-
-    const showOut = (text: string): void => {
-      outEl.hidden = false
-      outEl.textContent = text
-      outEl.scrollTop = outEl.scrollHeight
-    }
-
-    const readPort = (): number => {
-      const n = Number.parseInt(portEl.value, 10)
-      return Number.isFinite(n) && n > 0 && n <= 65535 ? n : 1080
-    }
-
-    /** 把端口写进脚本（与 Go 端 withChainPort 同一套规则） */
-    const withPort = (script: string, port: number): string => {
-      if (port <= 0 || port === 1080) return script
-      return script.replace('\nPORT=1080\n', '\nPORT=' + port + '\n')
-    }
-
-    deployBtn.addEventListener('click', async () => {
-      const host = hostEl.value.trim()
-      if (!host) {
-        log('请先填写 VPS 地址（形如 root@203.0.113.10）', 'err')
-        hostEl.focus()
-        return
-      }
-      const label = deployBtn.textContent || '一键部署到 VPS'
-      deployBtn.disabled = true
-      deployBtn.textContent = '部署中…（最多 3 分钟）'
-      showOut('正在通过 ssh 在 ' + host + ' 上执行部署脚本…\n首次连接会确认主机指纹，需要 root 权限。\n')
-      try {
-        const r = await window.cfpilot.chainDeploy({ host, port: readPort() })
-        showOut(r.output || '(远端没有输出)')
-        if (r.ok) {
-          log('链式代理部署完成：把输出里的 socks5:// 粘到面板「出站与高级」→ SOCKS5', 'ok')
-        } else {
-          if (r.error) showOut((r.output || '') + '\n\n' + r.error)
-          log('链式代理部署失败：' + (r.error || '详见部署输出'), 'err')
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
-        showOut('调用失败：' + msg)
-        log('链式代理部署失败：' + msg, 'err')
-      } finally {
-        deployBtn.disabled = false
-        deployBtn.textContent = label
-      }
-    })
-
-    copyBtn.addEventListener('click', async () => {
-      try {
-        const info = await window.cfpilot.chainScript()
-        const host = hostEl.value.trim() || 'root@你的VPS_IP'
-        const script = withPort(info.script, readPort())
-        // 用 heredoc 把脚本和 ssh 包成一条命令：粘贴一次即可，不用先 scp 文件
-        const block =
-          "ssh -t " + host + " 'bash -s' <<'CFPILOT_EOF'\n" + script + '\nCFPILOT_EOF\n'
-        await navigator.clipboard.writeText(block)
-        showOut(
-          '已复制到剪贴板。\n\n在终端（Git Bash / WSL / macOS / Linux）里粘贴执行，' +
-            'ssh 会正常提示输入密码：\n\n' + block.slice(0, 600) + '\n…（完整内容已在剪贴板）'
-        )
-        log('已复制链式代理部署命令，请在终端里粘贴执行', 'ok')
-      } catch (err) {
-        log('复制失败：' + (err instanceof Error ? err.message : String(err)), 'err')
       }
     })
   }
